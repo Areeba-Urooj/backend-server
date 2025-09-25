@@ -1,0 +1,9 @@
+# FastAPI and server
+fastapi
+uvicorn
+python-multipart
+
+# Audio processing
+librosa
+numpy
+scipy 
