@@ -9,7 +9,7 @@ import librosa
 import numpy as np
 import scipy.signal as signal
 import redis
-from rq import Worker, Connection
+from rq import Worker, connections
 
 # --- Configuration (Must be consistent with main.py) ---
 UPLOAD_DIR = "uploads_simple"
