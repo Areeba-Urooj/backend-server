@@ -1,7 +1,8 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from loguru import logger
-from .models import UploadResponse
-from .file_upload_service import save_audio_file 
+# Use absolute imports now that 'app' is the package root
+from app.models import UploadResponse
+from app.file_upload_service import save_audio_file 
 
 # Initialize the FastAPI application
 app = FastAPI()
@@ -39,5 +40,4 @@ async def upload_audio(file: UploadFile = File(...)):
             detail=f"An unexpected error occurred during file upload: {str(e)}"
         )
 
-# --- 3. Placeholder for other endpoints (e.g., Analysis/Status) ---
-# Add your remaining endpoints below this line as you build them.
+# Add your remaining endpoints (like /submit, /status) below this line as you build them.
