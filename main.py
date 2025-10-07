@@ -14,8 +14,8 @@ from starlette.responses import JSONResponse # New Import for 202
 
 # --- New RQ/Redis Imports ---
 import redis
+from redis import Redis
 from rq import Queue
-from analysis_worker import perform_analysis_job # Import the heavy logic function
 
 # --- Configuration ---
 UPLOAD_DIR = "uploads_simple"
