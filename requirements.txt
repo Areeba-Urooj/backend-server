@@ -7,3 +7,6 @@ python-multipart
 librosa
 numpy
 scipy 
+# --- New Dependencies for Asynchronous Processing ---
+rq
+redis
