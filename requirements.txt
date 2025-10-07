@@ -1,0 +1,15 @@
+# FastAPI and server
+fastapi
+uvicorn
+python-multipart
+loguru
+pydantic 
+aiofiles
+
+# Audio processing
+librosa
+numpy
+scipy 
+# --- New Dependencies for Asynchronous Processing ---
+rq
+redis
