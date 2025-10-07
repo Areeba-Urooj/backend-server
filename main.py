@@ -6,36 +6,42 @@ import shutil
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 
-import librosa
-import numpy as np
-import scipy.signal as signal
+# REMOVED: librosa, numpy, scipy, signal imports (now in analysis_worker.py)
+
 from fastapi import FastAPI, File, UploadFile, HTTPException, status, Depends
 from pydantic import BaseModel, Field
+from starlette.responses import JSONResponse # New Import for 202
+
+# --- New RQ/Redis Imports ---
+import redis
+from rq import Queue
+from analysis_worker import perform_analysis_job # Import the heavy logic function
 
 # --- Configuration ---
-# In a real app, this would be in a .env file or other config management
 UPLOAD_DIR = "uploads_simple"
 ALLOWED_AUDIO_TYPES = [
     ".wav", ".mp3", ".m4a", ".aac"
 ]
-FILLER_WORDS = [
-    "ah", "actually", "almighty", "almost", "and", "anyways", "basically",
-    "believe me", "er", "erm", "essentially", "etc", "exactly",
-    "for what it's worth", "fwiw", "gosh", "i mean", "i guess", "i suppose",
-    "i think", "innit", "isn't it", "just", "like", "literally", "look", "man",
-    "my gosh", "oh", "ok", "okay", "see", "so", "tbh", "to be honest",
-    "totally", "truly", "uh", "uh-huh", "uhm", "um", "well", "whatever",
-    "you know", "you see"
-]
+# FILLER_WORDS list is now ONLY needed in analysis_worker.py
 
 # --- Logging ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# --- Redis/RQ Setup ---
+REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379')
+try:
+    redis_conn = redis.from_url(REDIS_URL)
+    task_queue = Queue(connection=redis_conn) # RQ Queue
+    logger.info("Successfully connected to Redis for RQ.")
+except Exception as e:
+    logger.error(f"Failed to connect to Redis: {e}. Check REDIS_URL environment variable.")
+    # App will continue, but analysis submission will fail if Redis is dead
+
 # --- FastAPI App ---
 app = FastAPI(
     title="PodiumPal Simple Analysis API",
-    description="A simplified, single-file version of the speech analysis backend.",
+    description="A simplified, asynchronous version of the speech analysis backend.",
     version="1.0.0"
 )
 
@@ -45,6 +51,7 @@ class AnalysisRequest(BaseModel):
     file_id: str = Field(..., description="ID of the uploaded audio file to analyze")
     transcript: Optional[str] = Field(None, description="Optional transcript text if already available")
 
+# The following schemas must remain here to validate the response from the worker via the /status endpoint
 class AudioFeatures(BaseModel):
     duration_seconds: float
     sample_rate: int
@@ -86,225 +93,16 @@ class UploadResponse(BaseModel):
     upload_time: datetime
     status: str = "success"
 
+class JobResponse(BaseModel):
+    job_id: str
+    status: str
+    result: Optional[SpeechAnalysisResponse] = None
+    detail: Optional[str] = None
+
 # --- Audio Analysis Service Logic ---
+# REMOVED: class AudioAnalysisService (moved to analysis_worker.py)
 
-class AudioAnalysisService:
-    def __init__(self):
-        self.filler_word_pattern = re.compile(
-            r'\b(' + '|'.join(re.escape(word) for word in FILLER_WORDS) + r')\b',
-            re.IGNORECASE
-        )
-
-    async def analyze_audio(self, file_path: str, transcript: Optional[str] = None) -> Dict[str, Any]:
-        try:
-            y, sr = librosa.load(file_path, sr=None)
-            duration = librosa.get_duration(y=y, sr=sr)
-
-            audio_features = self._extract_audio_features(y, sr)
-
-            transcript_analysis = {}
-            if transcript:
-                transcript_analysis = self._analyze_transcript(transcript)
-                total_words = transcript_analysis.get('total_words', 0)
-                speaking_pace = (total_words / duration) * 60 if duration > 0 else 0
-                audio_features['speaking_pace'] = speaking_pace
-            else:
-                audio_features['speaking_pace'] = self._estimate_speaking_pace(y, sr)
-
-            confidence_score = self._calculate_confidence_score(
-                audio_features,
-                transcript_analysis.get('filler_word_analysis', {})
-            )
-            emotion = self._determine_emotion(audio_features)
-            recommendations = self._generate_recommendations(
-                audio_features,
-                transcript_analysis.get('filler_word_analysis', {}),
-                confidence_score,
-                emotion
-            )
-
-            # Manually create the nested dictionary structure for the response
-            return {
-                "duration_seconds": duration,
-                "audio_features": {
-                    "duration_seconds": duration,
-                    "sample_rate": audio_features.get('sample_rate', 0),
-                    "channels": audio_features.get('channels', 0),
-                    "rms_mean": audio_features.get('rms_mean', 0.0),
-                    "rms_std": audio_features.get('rms_std', 0.0),
-                    "pitch_mean": audio_features.get('pitch_mean', 0.0),
-                    "pitch_std": audio_features.get('pitch_std', 0.0),
-                    "pitch_min": audio_features.get('pitch_min', 0.0),
-                    "pitch_max": audio_features.get('pitch_max', 0.0),
-                    "speaking_pace": audio_features.get('speaking_pace', 0.0),
-                    "silence_ratio": audio_features.get('silence_ratio', 0.0),
-                    "zcr_mean": audio_features.get('zcr_mean', 0.0),
-                },
-                "filler_word_analysis": transcript_analysis.get('filler_word_analysis', {}),
-                "repetition_count": transcript_analysis.get('repetition_count', 0),
-                "long_pause_count": transcript_analysis.get('long_pause_count', 0),
-                "total_words": transcript_analysis.get('total_words', 0),
-                "confidence_score": confidence_score,
-                "emotion": emotion,
-                "pitch_variation_score": audio_features.get('pitch_variation_score', 0.0),
-                "recommendations": recommendations,
-                "analyzed_at": datetime.now()
-            }
-
-        except Exception as e:
-            logger.error(f"Error analyzing audio: {e}", exc_info=True)
-            raise
-
-    def _extract_audio_features(self, y: np.ndarray, sr: int) -> Dict[str, float]:
-        features = {'sample_rate': sr, 'channels': 1 if y.ndim == 1 else y.shape[0]}
-        frame_length, hop_length = 2048, 512
-        rms = librosa.feature.rms(y=y, frame_length=frame_length, hop_length=hop_length)[0]
-        features['rms_mean'] = float(np.mean(rms))
-        features['rms_std'] = float(np.std(rms))
-        features['silence_ratio'] = float(np.sum(rms < 0.02) / len(rms) if len(rms) > 0 else 0)
-        zcr = librosa.feature.zero_crossing_rate(y, frame_length=frame_length, hop_length=hop_length)[0]
-        features['zcr_mean'] = float(np.mean(zcr))
-        pitches, magnitudes = librosa.piptrack(y=y, sr=sr, fmin=75, fmax=400)
-        pitch_values = [pitches[magnitudes[:, i].argmax(), i] for i in range(pitches.shape[1]) if pitches[magnitudes[:, i].argmax(), i] > 0]
-        if pitch_values:
-            features['pitch_mean'] = float(np.mean(pitch_values))
-            features['pitch_std'] = float(np.std(pitch_values))
-            features['pitch_min'] = float(np.min(pitch_values))
-            features['pitch_max'] = float(np.max(pitch_values))
-            pitch_range = features['pitch_max'] - features['pitch_min']
-            features['pitch_variation_score'] = float(min(100, (pitch_range / 50) * 100))
-        else:
-            features.update({'pitch_mean': 0.0, 'pitch_std': 0.0, 'pitch_min': 0.0, 'pitch_max': 0.0, 'pitch_variation_score': 0.0})
-        return features
-
-    def _analyze_transcript(self, transcript: str) -> Dict[str, Any]:
-        words = re.findall(r'\b\w+\b', transcript.lower())
-        total_words = len(words)
-        filler_matches = self.filler_word_pattern.findall(transcript.lower())
-        filler_word_count = len(filler_matches)
-        filler_words_dict = {}
-        for word in filler_matches:
-            filler_words_dict[word] = filler_words_dict.get(word, 0) + 1
-        repetition_count = sum(1 for i in range(1, len(words)) if words[i] == words[i-1])
-        long_pause_count = len(re.findall(r'\.\.\.|\.\.', transcript))
-        return {
-            'total_words': total_words,
-            'filler_word_analysis': {
-                'filler_word_count': filler_word_count,
-                'filler_words': filler_words_dict,
-                'filler_word_ratio': filler_word_count / total_words if total_words > 0 else 0
-            },
-            'repetition_count': repetition_count,
-            'long_pause_count': long_pause_count
-        }
-
-    def _estimate_speaking_pace(self, y: np.ndarray, sr: int) -> float:
-        energy = librosa.feature.rms(y=y)[0]
-        peaks, _ = signal.find_peaks(energy, height=0.1*np.max(energy), distance=sr//4)
-        estimated_syllables = len(peaks)
-        duration = librosa.get_duration(y=y, sr=sr)
-        estimated_words = estimated_syllables / 1.5
-        return (estimated_words / duration) * 60 if duration > 0 else 0
-
-    def _calculate_confidence_score(self, audio_features: Dict[str, float], filler_analysis: Dict[str, Any], repetition_count: int) -> float:
-        score = 100.0
-        
-        # Penalty for filler words
-        score -= min(30, filler_analysis.get('filler_word_ratio', 0) * 150) # Increased penalty
-        
-        # Penalty for long silences
-        if audio_features.get('silence_ratio', 0) > 0.3:
-            score -= min(20, (audio_features.get('silence_ratio', 0) - 0.3) * 100)
-            
-        # Bonus for good pitch variation, penalty for monotone
-        pitch_variation_score = audio_features.get('pitch_variation_score', 0)
-        score += min(15, (pitch_variation_score - 50) / 5) if pitch_variation_score > 50 else -min(20, (50 - pitch_variation_score) / 4) # Increased penalty for monotone
-        
-        # Penalty for speaking too fast or too slow
-        pace_deviation = abs(audio_features.get('speaking_pace', 150) - 150) / 150
-        score -= min(20, pace_deviation * 60) # Increased penalty
-        
-        # Penalty for unstable energy (shaky voice)
-        rms_std = audio_features.get('rms_std', 0)
-        if rms_std > 0.05: # Heuristic threshold for shakiness
-            score -= min(15, (rms_std - 0.05) * 200)
-            
-        # Penalty for repetitions
-        score -= min(15, repetition_count * 2)
-
-        return max(0, min(100, score))
-
-    def _determine_emotion(self, audio_features: Dict[str, float]) -> str:
-        pitch_std = audio_features.get('pitch_std', 0)
-        rms_mean = audio_features.get('rms_mean', 0)
-        speaking_pace = audio_features.get('speaking_pace', 150)
-
-        if rms_mean > 0.1:
-            if pitch_std > 40:
-                if speaking_pace > 170:
-                    return "excited"
-                else:
-                    return "energetic"
-            elif pitch_std < 15:
-                return "monotone"
-            else:
-                return "neutral"
-        elif rms_mean < 0.05:
-            if audio_features.get('silence_ratio', 0) > 0.4:
-                return "tense"
-            else:
-                return "calm"
-        else:
-            if pitch_std > 30:
-                return "animated"
-            else:
-                return "neutral"
-
-    def _generate_recommendations(self, audio_features: Dict[str, float], filler_analysis: Dict[str, Any], confidence_score: float, emotion: str, repetition_count: int) -> List[str]:
-        recs = []
-        
-        # Filler words
-        filler_word_count = filler_analysis.get('filler_word_count', 0)
-        if filler_word_count > 5:
-            common_fillers = sorted(filler_analysis.get('filler_words', {}).items(), key=lambda item: item[1], reverse=True)
-            top_fillers = [f'"{item[0]}"' for item in common_fillers[:3]]
-            recs.append(f"You used {filler_word_count} filler words. Try to reduce using {', '.join(top_fillers)} to sound more confident.")
-
-        # Repetitions
-        if repetition_count > 2:
-            recs.append(f"You repeated words {repetition_count} times. Pause and gather your thoughts to avoid repetitions.")
-
-        # Pitch
-        pitch_variation_score = audio_features.get('pitch_variation_score', 0)
-        if pitch_variation_score < 30:
-            recs.append("Your pitch is monotone. Try to vary your tone to keep your audience engaged. Emphasize key words.")
-        elif pitch_variation_score > 80:
-            recs.append("Your pitch variation is high, which is great for engagement! Keep it up.")
-
-        # Pace
-        speaking_pace = audio_features.get('speaking_pace', 150)
-        if speaking_pace > 180:
-            recs.append(f"Your pace is very fast ({int(speaking_pace)} WPM). Slow down to ensure your audience can follow your message.")
-        elif speaking_pace < 120 and speaking_pace > 0:
-            recs.append(f"Your pace is a bit slow ({int(speaking_pace)} WPM). Try speaking a bit faster to maintain energy and engagement.")
-
-        # Pauses and Silence
-        if audio_features.get('silence_ratio', 0) > 0.4:
-            recs.append("You have long or frequent pauses. While strategic pauses are good, too many can disrupt the flow.")
-
-        # Confidence and Emotion
-        if confidence_score < 60:
-            recs.append("Your confidence score is a bit low. Practice more to feel more comfortable and speak with authority.")
-        
-        if emotion == 'tense':
-            recs.append("You sound tense. Take deep breaths before speaking and try to relax your body.")
-        
-        if audio_features.get('rms_std', 0) > 0.05:
-            recs.append("Your volume is a bit shaky. Project your voice from your diaphragm for a more stable and confident sound.")
-
-        return recs if recs else ["Excellent delivery! Your speech patterns are clear and confident. Keep up the great work!"]
-
-# --- File Upload Service Logic ---
+# --- File Upload Service Logic (Kept here for file management) ---
 
 class FileUploadService:
     def __init__(self):
@@ -321,7 +119,8 @@ class FileUploadService:
         file_path = os.path.join(UPLOAD_DIR, f"{file_id}{file_extension}")
 
         with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+            # Use chunks for large files, though shutil.copyfileobj is fine for smaller ones
+            shutil.copyfileobj(file.file, buffer) 
         
         saved_size = os.path.getsize(file_path)
         logger.info(f"Saved file size: {saved_size}")
@@ -343,12 +142,11 @@ class FileUploadService:
 
 # --- API Endpoints ---
 
-audio_analysis_service = AudioAnalysisService()
 file_upload_service = FileUploadService()
 
 @app.get("/")
 async def read_root():
-    return {"message": "PodiumPal Simple Analysis API is running!"}
+    return {"message": "PodiumPal Simple Analysis API is running! (Asynchronous Enabled)"}
 
 @app.on_event("startup")
 async def startup_event():
@@ -366,31 +164,94 @@ async def upload_audio(file: UploadFile = File(...)):
         logger.error(f"Error uploading file: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/process", response_model=SpeechAnalysisResponse)
-async def analyze_speech(request: AnalysisRequest):
+# ----------------------------------------------------
+# NEW ENDPOINTS FOR ASYNCHRONOUS PROCESSING
+# ----------------------------------------------------
+
+@app.post("/api/v1/analysis/submit", status_code=status.HTTP_202_ACCEPTED)
+async def submit_analysis_job(request: AnalysisRequest):
+    """
+    Submits the analysis to the background queue and immediately returns a Job ID.
+    (Fast Response - HTTP 202 Accepted)
+    """
     try:
+        # 1. Get the file path (Must succeed, otherwise File Not Found)
+        # Note: File is stored on the Web Service's disk for the worker to pick up
         file_path = file_upload_service.get_file_path(request.file_id)
-        analysis_result = await audio_analysis_service.analyze_audio(
-            file_path=file_path,
-            transcript=request.transcript
+        
+        # 2. Enqueue the heavy task
+        # IMPORTANT: The worker will delete the file upon completion/failure.
+        job = task_queue.enqueue(
+            perform_analysis_job, 
+            request.file_id, 
+            file_path, 
+            request.transcript,
+            job_timeout='30m' # Allow the job up to 30 minutes to finish
         )
-        analysis_result["file_id"] = request.file_id
-        # The file name is not available here without storing it.
-        # For simplicity, we'll return the file_id as the name.
-        analysis_result["file_name"] = request.file_id
-        return analysis_result
+        
+        logger.info(f"Analysis job submitted: {job.id}")
+
+        # 3. Return the fast response
+        return JSONResponse(
+            status_code=status.HTTP_202_ACCEPTED,
+            content={
+                "job_id": job.id,
+                "status": "queued",
+                "detail": "Analysis job submitted to background worker."
+            }
+        )
+        
     except HTTPException as e:
         raise e
     except Exception as e:
-        logger.error(f"Error analyzing speech: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Error submitting analysis job: {e}", exc_info=True)
+        # Check if Redis is the issue
+        if 'connection' in str(e).lower() or 'redis' in str(e).lower():
+            raise HTTPException(status_code=503, detail="Service Unavailable: Redis connection failed. Check background worker setup.")
+        raise HTTPException(status_code=500, detail=f"Failed to submit job: {str(e)}")
+
+
+@app.get("/api/v1/analysis/status/{job_id}", response_model=JobResponse)
+async def get_analysis_status(job_id: str):
+    """
+    Checks the status of an ongoing or completed analysis job.
+    (Polling Endpoint)
+    """
+    job = task_queue.fetch_job(job_id)
+
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job ID {job_id} not found.")
+
+    if job.is_finished:
+        # The job.result is the dictionary returned by perform_analysis_job
+        return {
+            "job_id": job_id,
+            "status": "complete",
+            "result": job.result
+        }
+    
+    if job.is_failed:
+        # Check the failure details and log
+        error_detail = job.exc_info.splitlines()[-1] if job.exc_info else 'Unknown error'
+        logger.error(f"Job {job_id} failed. Reason: {job.exc_info}")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Analysis failed in worker: {error_detail}"
+        )
+
+    # Job is currently 'queued' or 'started'
+    return {
+        "job_id": job_id,
+        "status": job.get_status(),
+        "detail": f"Job status: {job.get_status()}"
+    }
 
 @app.get("/health")
 async def health_check():
     return {"status": "ok"}
 
+# REMOVED: The old synchronous /process endpoint
+
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
     import uvicorn
     uvicorn.run(app, host="127.0.0.1", port=8000)
