@@ -9,7 +9,9 @@ import librosa
 import numpy as np
 import scipy.signal as signal
 import redis
-from rq import Worker, connections
+from rq import Worker, connections # The 'connections' import is correct
+# NOTE: The Worker process does not need to import Queue or Connection here,
+# it only needs Worker and the helper 'connections' if you were using it.
 
 # --- Configuration (Must be consistent with main.py) ---
 UPLOAD_DIR = "uploads_simple"
@@ -294,11 +296,12 @@ def perform_analysis_job(file_id: str, file_path: str, transcript: str) -> dict:
             logger.warning(f"[WORKER] Failed to delete file {file_path}: {e}")
         
 
-# --- RQ Worker Startup Script ---
+# ----------------------------------------------------
+# --- CORRECTED RQ Worker Startup Script ---
+# ----------------------------------------------------
 if __name__ == '__main__':
     # Get Redis connection string from environment variable
-    # Render provides this via the internal Redis URL
-    redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379') 
+    redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379')
     
     # Simple check for Redis connection before starting worker
     try:
@@ -309,7 +312,7 @@ if __name__ == '__main__':
         print(f"[WORKER] FATAL: Could not connect to Redis: {e}")
         exit(1) # Exit if Redis is unreachable
 
-    with Connection(conn):
-        # The 'default' queue is the one used by main.py
-        worker = Worker(['default'], connection=conn)
-        worker.work()
+    # FIX: Removed 'with Connection(conn):' which caused the NameError
+    # We pass the connection directly to the Worker constructor
+    worker = Worker(['default'], connection=conn)
+    worker.work()
