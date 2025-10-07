@@ -2,6 +2,9 @@
 fastapi
 uvicorn
 python-multipart
+loguru
+pydantic 
+aiofiles
 
 # Audio processing
 librosa
