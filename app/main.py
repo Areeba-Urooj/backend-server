@@ -7,15 +7,14 @@ import os
 import redis
 from rq import Queue, Retry
 
-# CRITICAL FIX: Changed relative imports to simpler, absolute imports
-from models import UploadResponse, AnalysisRequest, AnalysisStatusResponse
-from file_upload_service import save_audio_file 
-from analysis_worker import perform_analysis_job 
+# CRITICAL FIX: Reverting to correct RELATIVE imports for files in the same package (app)
+from .models import UploadResponse, AnalysisRequest, AnalysisStatusResponse
+from .file_upload_service import save_audio_file 
+from .analysis_worker import perform_analysis_job 
 
 # --- Configuration & Initialization ---
 app = FastAPI()
 
-# CRITICAL FIX: Define the shared UPLOAD_DIR (must match file_upload_service.py)
 UPLOAD_DIR = "uploads" 
 
 # 1. Initialize Redis connection and RQ Queue
@@ -30,7 +29,6 @@ except Exception as e:
 
 # 2. Dependency Injection for the Queue
 def get_analysis_queue():
-    """Provides the RQ queue instance."""
     if redis_conn is None:
         raise HTTPException(status_code=503, detail="Analysis service is unavailable (Redis connection failed).")
     return Queue('default', connection=redis_conn)
@@ -38,51 +36,45 @@ def get_analysis_queue():
 # --- 1. Root Endpoint (Health Check) ---
 @app.get("/")
 def read_root():
-    """Simple root endpoint to verify the service is running."""
     return {"status": "ok", "message": "PodiumAI backend is running."}
 
-# --- 2. File Upload Endpoint (Existing) ---
+# --- 2. File Upload Endpoint ---
 @app.post("/upload", response_model=UploadResponse)
 async def upload_audio(file: UploadFile = File(...)):
-    """Receives an audio file, saves it, and returns a file_id."""
     try:
+        # Note: Must use the imported function name now
         result = await save_audio_file(file)
         return result 
     except Exception as e:
         logger.error(f"Error uploading file: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
 
-# --- 3. Submit Analysis Job Endpoint (Fixes 404 and File Path) ---
+# --- 3. Submit Analysis Job Endpoint ---
 @app.post("/api/v1/analysis/submit", response_model=AnalysisStatusResponse)
 async def submit_analysis_job(
     request: AnalysisRequest, 
     queue: Queue = Depends(get_analysis_queue)
 ):
-    """Submits a long-running analysis job to the worker queue."""
-    
-    # 1. Reconstruct the full file path. 
-    # NOTE: Assumes the file extension is .m4a based on past logs.
     file_path = os.path.join(UPLOAD_DIR, f"{request.file_id}.m4a")
     
     if not os.path.exists(file_path):
         logger.error(f"File not found during submission: {file_path}")
         raise HTTPException(status_code=404, detail=f"File associated with ID {request.file_id} not found on server.")
     
-    # 2. Enqueue the job with the required parameters
     try:
         job = queue.enqueue(
-            perform_analysis_job, 
+            perform_analysis_job, # Note: Must use the imported function name now
             request.file_id, 
             file_path, 
             request.transcript,
-            job_id=f"analysis-{request.file_id}", # Consistent job ID
-            retry=Retry(max=3) # Retry up to 3 times on failure
+            job_id=f"analysis-{request.file_id}", 
+            retry=Retry(max=3) 
         )
         logger.info(f"Analysis job submitted for {request.file_id}. Job ID: {job.id}")
         
         return AnalysisStatusResponse(
             job_id=job.id,
-            status=job.get_status(), # 'queued'
+            status=job.get_status(), 
             result=None
         )
         
@@ -93,14 +85,12 @@ async def submit_analysis_job(
             detail=f"Failed to submit analysis job to the queue: {str(e)}"
         )
 
-# --- 4. Check Job Status Endpoint (Existing) ---
+# --- 4. Check Job Status Endpoint ---
 @app.get("/api/v1/analysis/status/{job_id}", response_model=AnalysisStatusResponse)
 def get_analysis_status(
     job_id: str, 
     queue: Queue = Depends(get_analysis_queue)
 ):
-    """Checks the status of an analysis job and returns the result if finished."""
-    
     job = queue.fetch_job(job_id)
     
     if not job:
@@ -112,7 +102,7 @@ def get_analysis_status(
         result_data = job.result
         return AnalysisStatusResponse(
             job_id=job.id,
-            status=status, 
+            status=status,
             result=result_data, 
             error=None
         )
@@ -124,7 +114,6 @@ def get_analysis_status(
             error=str(job.exc_info) if job.exc_info else "Job failed for an unknown reason."
         )
 
-    # For 'queued', 'started', or 'deferred'
     return AnalysisStatusResponse(
         job_id=job.id,
         status=status,
