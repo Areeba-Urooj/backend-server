@@ -26,7 +26,7 @@ FILLER_WORDS = [
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- Audio Analysis Service Logic (Unchanged, all private methods included below) ---
+# --- Audio Analysis Service Logic (Unchanged) ---
 
 class AudioAnalysisService:
     def __init__(self):
@@ -37,7 +37,6 @@ class AudioAnalysisService:
 
     # NOTE: This is a synchronous function in the worker, which is fine!
     def analyze_audio(self, file_path: str, transcript: Optional[str] = None) -> Dict[str, Any]:
-        # NOTE: Made this method synchronous, as it runs in a synchronous worker.
         try:
             y, sr = librosa.load(file_path, sr=None)
             duration = librosa.get_duration(y=y, sr=sr)
@@ -68,7 +67,6 @@ class AudioAnalysisService:
             )
 
             # Manually create the nested dictionary structure for the response
-            # This must match the Pydantic schema in main.py for successful return
             return {
                 "duration_seconds": duration,
                 "audio_features": {
@@ -100,7 +98,7 @@ class AudioAnalysisService:
             logger.error(f"Error analyzing audio in worker: {e}", exc_info=True)
             raise
 
-    # --- START OF COPIED PRIVATE METHODS ---
+    # --- Private methods are unchanged and follow below ---
     def _extract_audio_features(self, y: np.ndarray, sr: int) -> Dict[str, float]:
         features = {'sample_rate': sr, 'channels': 1 if y.ndim == 1 else y.shape[0]}
         frame_length, hop_length = 2048, 512
@@ -249,8 +247,7 @@ class AudioAnalysisService:
             recs.append("Your volume is a bit shaky. Project your voice from your diaphragm for a more stable and confident sound.")
 
         return recs if recs else ["Excellent delivery! Your speech patterns are clear and confident. Keep up the great work!"]
-    # --- END OF COPIED PRIVATE METHODS ---
-
+    # --- END OF PRIVATE METHODS ---
 
 def perform_analysis_job(file_id: str, file_path: str, transcript: str) -> dict:
     """
@@ -269,20 +266,17 @@ def perform_analysis_job(file_id: str, file_path: str, transcript: str) -> dict:
         
         # 2. Add file_id for client reference
         analysis_result["file_id"] = file_id
-        # NOTE: file_name should ideally contain the extension if the client needs it
-        analysis_result["file_name"] = file_id # Keeping this consistent with your original data flow
+        analysis_result["file_name"] = file_id 
         
         return analysis_result
     
     except Exception as e:
         logger.error(f"[WORKER] Job {file_id} failed: {e}", exc_info=True)
-        # RQ automatically marks the job as failed and stores the traceback
-        raise # Re-raise to ensure RQ marks it as failed
+        raise 
 
     finally:
         # 3. Cleanup the file *after* analysis (success or failure)
         try:
-            # We assume the file_path passed from main.py is correct
             if os.path.exists(file_path):
                 os.remove(file_path)
                 logger.info(f"[WORKER] Cleaned up file: {file_path}")
@@ -291,22 +285,18 @@ def perform_analysis_job(file_id: str, file_path: str, transcript: str) -> dict:
         
 
 # ----------------------------------------------------
-# --- CORRECTED RQ Worker Startup Script (Unchanged, already correct) ---
+# --- RQ Worker Startup Script ---
 # ----------------------------------------------------
 if __name__ == '__main__':
-    # Get Redis connection string from environment variable
     redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379')
     
-    # Simple check for Redis connection before starting worker
     try:
         conn = redis.from_url(redis_url)
         conn.ping()
         print(f"[WORKER] Connected to Redis at: {redis_url}. Starting worker...")
     except Exception as e:
         print(f"[WORKER] FATAL: Could not connect to Redis: {e}")
-        exit(1) # Exit if Redis is unreachable
+        exit(1)
 
-    # FIX: Removed 'with Connection(conn):' which caused the NameError
-    # We pass the connection directly to the Worker constructor
     worker = Worker(['default'], connection=conn)
     worker.work()
