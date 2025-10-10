@@ -8,7 +8,7 @@ import librosa
 import numpy as np
 import scipy.signal as signal
 import redis
-from rq import Worker, Connection 
+from rq import Worker
 from rq.job import Job
 
 # --- Configuration (CRITICAL: Must be consistent with file_upload_service.py and main.py) ---
@@ -226,7 +226,5 @@ if __name__ == '__main__':
         print(f"[WORKER] FATAL: Could not connect to Redis: {e}")
         exit(1)
 
-    # Use Connection context manager for safety, though Worker handles connection
-    with Connection(conn):
         worker = Worker(['default'], connection=conn)
         worker.work()
