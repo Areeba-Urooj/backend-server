@@ -7,17 +7,15 @@ import os
 import redis
 from rq import Queue, Retry
 
-# Import models and service
-from .models import UploadResponse, AnalysisRequest, AnalysisStatusResponse
-from .file_upload_service import save_audio_file 
-from .analysis_worker import perform_analysis_job # Import the worker function
+# CRITICAL FIX: Changed relative imports to simpler, absolute imports
+from models import UploadResponse, AnalysisRequest, AnalysisStatusResponse
+from file_upload_service import save_audio_file 
+from analysis_worker import perform_analysis_job 
 
 # --- Configuration & Initialization ---
 app = FastAPI()
 
-# CRITICAL: Define the shared UPLOAD_DIR (must match file_upload_service.py)
-# We use the absolute path for safety, but if your setup requires a relative path,
-# you must ensure the worker and main process run from the same CWD.
+# CRITICAL FIX: Define the shared UPLOAD_DIR (must match file_upload_service.py)
 UPLOAD_DIR = "uploads" 
 
 # 1. Initialize Redis connection and RQ Queue
@@ -25,11 +23,9 @@ REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379/0')
 logger.info(f"Connecting to Redis at: {REDIS_URL}")
 try:
     redis_conn = redis.from_url(REDIS_URL)
-    # Ping to check connection immediately
     redis_conn.ping() 
 except Exception as e:
     logger.error(f"FATAL: Could not connect to Redis: {e}")
-    # Set to None if connection fails
     redis_conn = None 
 
 # 2. Dependency Injection for the Queue
@@ -37,7 +33,6 @@ def get_analysis_queue():
     """Provides the RQ queue instance."""
     if redis_conn is None:
         raise HTTPException(status_code=503, detail="Analysis service is unavailable (Redis connection failed).")
-    # We use the 'default' queue, which the worker listens to
     return Queue('default', connection=redis_conn)
 
 # --- 1. Root Endpoint (Health Check) ---
@@ -46,7 +41,7 @@ def read_root():
     """Simple root endpoint to verify the service is running."""
     return {"status": "ok", "message": "PodiumAI backend is running."}
 
-# --- 2. File Upload Endpoint (Existing, unchanged) ---
+# --- 2. File Upload Endpoint (Existing) ---
 @app.post("/upload", response_model=UploadResponse)
 async def upload_audio(file: UploadFile = File(...)):
     """Receives an audio file, saves it, and returns a file_id."""
@@ -57,7 +52,7 @@ async def upload_audio(file: UploadFile = File(...)):
         logger.error(f"Error uploading file: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
 
-# --- 3. Submit Analysis Job Endpoint (FIXED FILE PATH LOGIC) ---
+# --- 3. Submit Analysis Job Endpoint (Fixes 404 and File Path) ---
 @app.post("/api/v1/analysis/submit", response_model=AnalysisStatusResponse)
 async def submit_analysis_job(
     request: AnalysisRequest, 
@@ -65,14 +60,10 @@ async def submit_analysis_job(
 ):
     """Submits a long-running analysis job to the worker queue."""
     
-    # 1. Reconstruct the full file path 
-    # CRITICAL FIX: Use the 'uploads' directory and assume the extension based on previous logs (.m4a)
-    # NOTE: The actual file name is UUID.extension. If you want true accuracy, you must 
-    # modify UploadResponse to include the full file_name (e.g., UUID.m4a) and use that.
-    # For now, relying on the .m4a assumption from your log 'recording_2025-10-10T155121591304.m4a'
+    # 1. Reconstruct the full file path. 
+    # NOTE: Assumes the file extension is .m4a based on past logs.
     file_path = os.path.join(UPLOAD_DIR, f"{request.file_id}.m4a")
     
-    # Check if the file exists before enqueueing
     if not os.path.exists(file_path):
         logger.error(f"File not found during submission: {file_path}")
         raise HTTPException(status_code=404, detail=f"File associated with ID {request.file_id} not found on server.")
@@ -102,7 +93,7 @@ async def submit_analysis_job(
             detail=f"Failed to submit analysis job to the queue: {str(e)}"
         )
 
-# --- 4. Check Job Status Endpoint (Existing, unchanged) ---
+# --- 4. Check Job Status Endpoint (Existing) ---
 @app.get("/api/v1/analysis/status/{job_id}", response_model=AnalysisStatusResponse)
 def get_analysis_status(
     job_id: str, 
@@ -118,15 +109,11 @@ def get_analysis_status(
     status = job.get_status()
 
     if status == 'finished':
-        # Result is guaranteed to be the dictionary returned by analysis_worker.py
         result_data = job.result
-        
-        # FastAPI will automatically validate and convert result_data 
-        # into the AnalysisResultResponse Pydantic model
         return AnalysisStatusResponse(
             job_id=job.id,
             status=status,
-            result=result_data, # This is the full analysis data
+            result=result_data, 
             error=None
         )
     
