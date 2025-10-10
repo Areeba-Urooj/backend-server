@@ -112,7 +112,7 @@ def get_analysis_status(
         result_data = job.result
         return AnalysisStatusResponse(
             job_id=job.id,
-            status=status,
+            status=status, 
             result=result_data, 
             error=None
         )
