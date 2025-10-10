@@ -1,4 +1,3 @@
-# analysis_worker.py
 import os
 import logging
 import re
@@ -9,12 +8,10 @@ import librosa
 import numpy as np
 import scipy.signal as signal
 import redis
-from rq import Worker, connections # The 'connections' import is correct
-# NOTE: The Worker process does not need to import Queue or Connection here,
-# it only needs Worker and the helper 'connections' if you were using it.
+from rq import Worker, connections 
 
-# --- Configuration (Must be consistent with main.py) ---
-UPLOAD_DIR = "uploads_simple"
+# --- Configuration (FIXED: Must be consistent with file_upload_service.py) ---
+UPLOAD_DIR = "uploads" # FIXED from "uploads_simple"
 FILLER_WORDS = [
     "ah", "actually", "almighty", "almost", "and", "anyways", "basically",
     "believe me", "er", "erm", "essentially", "etc", "exactly",
@@ -29,7 +26,7 @@ FILLER_WORDS = [
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- Audio Analysis Service Logic (Copied from main.py) ---
+# --- Audio Analysis Service Logic (Unchanged, all private methods included below) ---
 
 class AudioAnalysisService:
     def __init__(self):
@@ -103,9 +100,6 @@ class AudioAnalysisService:
             logger.error(f"Error analyzing audio in worker: {e}", exc_info=True)
             raise
 
-    # Copy all private methods: _extract_audio_features, _analyze_transcript, 
-    # _estimate_speaking_pace, _calculate_confidence_score, _determine_emotion, 
-    # _generate_recommendations from main.py and paste them here.
     # --- START OF COPIED PRIVATE METHODS ---
     def _extract_audio_features(self, y: np.ndarray, sr: int) -> Dict[str, float]:
         features = {'sample_rate': sr, 'channels': 1 if y.ndim == 1 else y.shape[0]}
@@ -268,7 +262,6 @@ def perform_analysis_job(file_id: str, file_path: str, transcript: str) -> dict:
     
     try:
         # 1. Perform the heavy analysis
-        # Note: The result is a dictionary that RQ will serialize/store in Redis
         analysis_result = audio_analysis_service.analyze_audio(
             file_path=file_path,
             transcript=transcript
@@ -276,7 +269,8 @@ def perform_analysis_job(file_id: str, file_path: str, transcript: str) -> dict:
         
         # 2. Add file_id for client reference
         analysis_result["file_id"] = file_id
-        analysis_result["file_name"] = file_id 
+        # NOTE: file_name should ideally contain the extension if the client needs it
+        analysis_result["file_name"] = file_id # Keeping this consistent with your original data flow
         
         return analysis_result
     
@@ -288,7 +282,7 @@ def perform_analysis_job(file_id: str, file_path: str, transcript: str) -> dict:
     finally:
         # 3. Cleanup the file *after* analysis (success or failure)
         try:
-            # We assume FileUploadService in main.py saved the file to UPLOAD_DIR
+            # We assume the file_path passed from main.py is correct
             if os.path.exists(file_path):
                 os.remove(file_path)
                 logger.info(f"[WORKER] Cleaned up file: {file_path}")
@@ -297,7 +291,7 @@ def perform_analysis_job(file_id: str, file_path: str, transcript: str) -> dict:
         
 
 # ----------------------------------------------------
-# --- CORRECTED RQ Worker Startup Script ---
+# --- CORRECTED RQ Worker Startup Script (Unchanged, already correct) ---
 # ----------------------------------------------------
 if __name__ == '__main__':
     # Get Redis connection string from environment variable
