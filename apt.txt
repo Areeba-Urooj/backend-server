@@ -1,2 +1,4 @@
 ffmpeg
-libsndfile1  # ← ADD THIS (required by soundfile)
+gfortran
+libopenblas-dev
+pkg-config
