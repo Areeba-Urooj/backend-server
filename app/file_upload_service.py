@@ -5,15 +5,16 @@ import uuid
 import shutil
 from fastapi import UploadFile
 from datetime import datetime
+from . import models  # Import models to create UploadResponse instance
 
 # --- IMPORTANT: Define the upload directory ---
 UPLOAD_DIR = "uploads" 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
-async def save_audio_file(file: UploadFile):
+async def save_audio_file(file: UploadFile) -> models.UploadResponse:
     """
-    Saves the uploaded audio file and returns a dictionary with metadata.
+    Saves the uploaded audio file and returns an UploadResponse model instance.
     """
     
     # 1. Generate a unique ID (This is the critical 'file_id')
@@ -41,12 +42,12 @@ async def save_audio_file(file: UploadFile):
         # Re-raise the exception to be caught in main.py
         raise e 
         
-    # 4. CRITICAL: Return a dictionary that matches the UploadResponse model
-    return {
-        "status": "success",
-        "file_id": file_id,
-        "file_name": file.filename, 
-        "file_size": file_size,
-        "content_type": file.content_type,
-        "upload_time": datetime.utcnow().isoformat()
-    }
+    # 4. CRITICAL FIX: Return an UploadResponse instance, not a dict
+    return models.UploadResponse(
+        status="success",
+        file_id=file_id,
+        file_name=file.filename, 
+        file_size=file_size,
+        content_type=file.content_type or "application/octet-stream",
+        upload_time=datetime.utcnow().isoformat()
+    )
