@@ -1,4 +1,6 @@
 ffmpeg
 gfortran
 libopenblas-dev
+libblas-dev
+liblapack-dev
 pkg-config
