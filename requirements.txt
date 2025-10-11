@@ -1,17 +1,30 @@
-# FastAPI and server
-fastapi
-uvicorn
-python-multipart
-loguru
-pydantic 
-aiofiles
+# Core FastAPI dependencies
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+python-multipart==0.0.20
+pydantic==2.10.0
 
-# Audio processing
-soundfile
-librosa
-numpy
-scipy 
-# --- New Dependencies for Asynchronous Processing ---
-rq
-redis
-python-dotenv  # ← ADD THIS (for env var handling)
+# File handling
+aiofiles==25.1.0
+
+# Logging
+loguru==0.7.3
+
+# Audio processing - using older, more stable versions
+librosa==0.10.2.post1
+soundfile==0.12.1
+audioread==3.0.1
+
+# Scientific computing - pinned versions to avoid conflicts
+numpy==1.26.4
+scipy==1.13.1
+scikit-learn==1.5.2
+
+# Redis and RQ
+redis==5.2.0
+rq==2.3.0
+
+# Required for librosa but not always auto-installed
+numba==0.60.0
+decorator==5.1.1
+joblib==1.4.2
