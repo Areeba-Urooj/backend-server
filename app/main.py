@@ -7,23 +7,22 @@ import os
 import redis
 from rq import Queue, Retry
 
-# CRITICAL FIX: Retaining relative imports, but we'll try to explicitly use the full path
-# This structure is necessary when running uvicorn app.main:app
+# CRITICAL FIX: Do NOT import analysis_worker module to avoid execution issues
 from . import models 
 from . import file_upload_service
-from . import analysis_worker 
 
 # --- Configuration & Initialization ---
 app = FastAPI()
 
 UPLOAD_DIR = "uploads" 
 
-# 1. Initialize Redis connection and RQ Queue (Unchanged)
+# Initialize Redis connection and RQ Queue
 REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379/0')
 logger.info(f"Connecting to Redis at: {REDIS_URL}")
 try:
     redis_conn = redis.from_url(REDIS_URL)
     redis_conn.ping() 
+    logger.info("Successfully connected to Redis")
 except Exception as e:
     logger.error(f"FATAL: Could not connect to Redis: {e}")
     redis_conn = None 
@@ -39,7 +38,7 @@ def read_root():
     return {"status": "ok", "message": "PodiumAI backend is running."}
 
 # --- 2. File Upload Endpoint ---
-@app.post("/upload", response_model=models.UploadResponse) # Use models.ModelName
+@app.post("/upload", response_model=models.UploadResponse)
 async def upload_audio(file: UploadFile = File(...)):
     try:
         result = await file_upload_service.save_audio_file(file)
@@ -48,10 +47,10 @@ async def upload_audio(file: UploadFile = File(...)):
         logger.error(f"Error uploading file: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
 
-# --- 3. Submit Analysis Job Endpoint (Uses models.AnalysisRequest in the signature) ---
-@app.post("/api/v1/analysis/submit", response_model=models.AnalysisStatusResponse) # Use models.ModelName
+# --- 3. Submit Analysis Job Endpoint ---
+@app.post("/api/v1/analysis/submit", response_model=models.AnalysisStatusResponse)
 async def submit_analysis_job(
-    request: models.AnalysisRequest, # Use models.ModelName
+    request: models.AnalysisRequest,
     queue: Queue = Depends(get_analysis_queue)
 ):
     file_path = os.path.join(UPLOAD_DIR, f"{request.file_id}.m4a")
@@ -61,13 +60,16 @@ async def submit_analysis_job(
         raise HTTPException(status_code=404, detail=f"File associated with ID {request.file_id} not found on server.")
     
     try:
+        # ✅ CRITICAL FIX: Use string-based function reference instead of importing the module
+        # RQ will import the function in the worker process, not in the web service
         job = queue.enqueue(
-            analysis_worker.perform_analysis_job, 
+            'app.analysis_worker.perform_analysis_job',  # String reference
             request.file_id, 
             file_path, 
             request.transcript,
             job_id=f"analysis-{request.file_id}", 
-            retry=Retry(max=3) 
+            retry=Retry(max=3),
+            job_timeout='10m'  # Add timeout to prevent hanging jobs
         )
         logger.info(f"Analysis job submitted for {request.file_id}. Job ID: {job.id}")
         
