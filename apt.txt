@@ -1,2 +1,2 @@
-# apt.txt
 ffmpeg
+libsndfile1  # ← ADD THIS (required by soundfile)
