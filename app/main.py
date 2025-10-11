@@ -3,6 +3,7 @@ from loguru import logger
 from typing import Optional
 import os
 import sys
+import traceback
 
 # RQ/Redis imports
 import redis
@@ -124,6 +125,25 @@ async def submit_analysis_job(
             status_code=500, 
             detail=f"Failed to submit analysis job to the queue: {str(e)}"
         )
+
+# --- DEBUG: Test worker function import ---
+@app.get("/debug/test-worker-import")
+def test_worker_import():
+    """Test if we can import the worker function"""
+    try:
+        from . import analysis_worker
+        return {
+            "status": "success",
+            "function_exists": hasattr(analysis_worker, 'perform_analysis_job'),
+            "function_path": "app.analysis_worker.perform_analysis_job",
+            "module_file": analysis_worker.__file__ if hasattr(analysis_worker, '__file__') else "unknown"
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }
 
 # --- 4. Check Job Status Endpoint ---
 @app.get("/api/v1/analysis/status/{job_id}", response_model=models.AnalysisStatusResponse)
