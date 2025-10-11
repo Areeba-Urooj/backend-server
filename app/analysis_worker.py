@@ -222,9 +222,11 @@ if __name__ == '__main__':
         conn = redis.from_url(redis_url)
         conn.ping()
         print(f"[WORKER] Connected to Redis at: {redis_url}. Starting worker...")
+        
+        # ✅ CORRECT: Initialize worker AFTER successful connection
+        worker = Worker(['default'], connection=conn)
+        worker.work()
+        
     except Exception as e:
         print(f"[WORKER] FATAL: Could not connect to Redis: {e}")
         exit(1)
-
-        worker = Worker(['default'], connection=conn)
-        worker.work()
