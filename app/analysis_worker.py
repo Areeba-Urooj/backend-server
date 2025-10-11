@@ -11,7 +11,7 @@ import redis
 from rq import Worker
 from rq.job import Job
 
-# --- Configuration (CRITICAL: Must be consistent with file_upload_service.py and main.py) ---
+# --- Configuration ---
 UPLOAD_DIR = "uploads"
 FILLER_WORDS = [
     "ah", "actually", "almighty", "almost", "and", "anyways", "basically",
@@ -42,29 +42,25 @@ class AudioAnalysisService:
             y, sr = librosa.load(file_path, sr=None)
             duration = librosa.get_duration(y=y, sr=sr)
 
-            # 1. Call feature extraction method (now defined)
+            # Extract audio features
             audio_features = self._extract_audio_features(y, sr)
 
             transcript_analysis = {}
             if transcript:
-                # 2. Call transcript analysis method (now defined)
                 transcript_analysis = self._analyze_transcript(transcript)
                 total_words = transcript_analysis.get('total_words', 0)
                 speaking_pace = (total_words / duration) * 60 if duration > 0 else 0
                 audio_features['speaking_pace'] = speaking_pace
             else:
-                # 3. Call pace estimation method (now defined)
                 audio_features['speaking_pace'] = self._estimate_speaking_pace(y, sr)
 
-            # 4. Call confidence score method (now defined)
+            # Calculate metrics
             confidence_score = self._calculate_confidence_score(
                 audio_features,
                 transcript_analysis.get('filler_word_analysis', {}),
                 transcript_analysis.get('repetition_count', 0)
             )
-            # 5. Call emotion determination method (now defined)
             emotion = self._determine_emotion(audio_features)
-            # 6. Call recommendations generation method (now defined)
             recommendations = self._generate_recommendations(
                 audio_features,
                 transcript_analysis.get('filler_word_analysis', {}),
@@ -73,14 +69,13 @@ class AudioAnalysisService:
                 transcript_analysis.get('repetition_count', 0)
             )
 
-            # Manually create the nested dictionary structure for the response
+            # Build response structure
             return {
                 "duration_seconds": duration,
                 "audio_features": {
                     "duration_seconds": duration,
-                    # NOTE: Placing placeholder/default values for all features
                     "sample_rate": sr, 
-                    "channels": y.ndim, # 1 for mono, 2 for stereo
+                    "channels": y.ndim,
                     "rms_mean": audio_features.get('rms_mean', 0.1),
                     "rms_std": audio_features.get('rms_std', 0.05),
                     "pitch_mean": audio_features.get('pitch_mean', 120.0),
@@ -104,20 +99,12 @@ class AudioAnalysisService:
 
         except Exception as e:
             logger.error(f"Error analyzing audio in worker: {e}", exc_info=True)
-            # CRITICAL: Re-raise the exception so RQ marks the job as FAILED
             raise
-
-
-    # --------------------------------------------------------------------------
-    # CRITICAL FIX: Placeholder methods to ensure the code executes successfully
-    # --------------------------------------------------------------------------
 
     def _extract_audio_features(self, y: np.ndarray, sr: int) -> Dict[str, float]:
         """Placeholder for actual feature extraction logic."""
         logger.info("Running placeholder _extract_audio_features.")
         
-        # In a real implementation, you would calculate: rms_mean, pitch_mean, silence_ratio, etc.
-        # For now, we return default/dummy values to avoid an AttributeError.
         return {
             'rms_mean': 0.1,
             'rms_std': 0.05,
@@ -131,34 +118,32 @@ class AudioAnalysisService:
         }
 
     def _analyze_transcript(self, transcript: str) -> Dict[str, Any]:
-        """Placeholder for transcript analysis (filler words, word count)."""
+        """Placeholder for transcript analysis."""
         logger.info("Running placeholder _analyze_transcript.")
         
         words = transcript.split()
         total_words = len(words)
         
-        # Simple filler word count
         filler_matches = self.filler_word_pattern.findall(transcript)
         filler_counts = {word.lower(): filler_matches.count(word.lower()) for word in set(filler_matches)}
         filler_counts['total'] = len(filler_matches)
 
         return {
             'filler_word_analysis': filler_counts,
-            'repetition_count': 0, # Placeholder
-            'long_pause_count': 0, # Placeholder (This should be from audio features)
+            'repetition_count': 0,
+            'long_pause_count': 0,
             'total_words': total_words
         }
 
     def _estimate_speaking_pace(self, y: np.ndarray, sr: int) -> float:
         """Placeholder for pace estimation without a transcript."""
         logger.info("Running placeholder _estimate_speaking_pace.")
-        return 150.0 # Default WPM
+        return 150.0
 
     def _calculate_confidence_score(self, audio_features: Dict[str, float], filler_analysis: Dict[str, Any], repetition_count: int) -> float:
-        """Placeholder for the final confidence calculation."""
+        """Placeholder for confidence calculation."""
         logger.info("Running placeholder _calculate_confidence_score.")
-        # Logic would involve weighting metrics (e.g., filler words, pace, pitch)
-        return 85.0 # High default score
+        return 85.0
 
     def _determine_emotion(self, audio_features: Dict[str, float]) -> str:
         """Placeholder for emotion detection."""
@@ -172,16 +157,14 @@ class AudioAnalysisService:
 
 
 def perform_analysis_job(file_id: str, file_path: str, transcript: str) -> dict:
-    # ... (rest of the perform_analysis_job function is correct) ...
     """
     The main job function executed by the RQ worker.
     """
     audio_analysis_service = AudioAnalysisService()
     
-    # Check for file existence *just before* running the analysis
+    # Check for file existence before analysis
     if not os.path.exists(file_path):
         logger.error(f"[WORKER] CRITICAL: File not found at {file_path}. Job failed.")
-        # Raise a specific error to help diagnosis
         raise FileNotFoundError(f"Audio file not found for analysis: {file_path}")
 
     logger.info(f"[WORKER] Starting analysis for file_id: {file_id}. File size: {os.path.getsize(file_path)} bytes.")
@@ -192,41 +175,53 @@ def perform_analysis_job(file_id: str, file_path: str, transcript: str) -> dict:
             transcript=transcript
         )
         
-        # Note: Added file_name here to match the expected AnalysisStatusResponse.result structure if needed
         analysis_result["file_id"] = file_id
         analysis_result["file_name"] = os.path.basename(file_path)
         
+        logger.info(f"[WORKER] Successfully completed analysis for {file_id}")
         return analysis_result
     
     except Exception as e:
-        logger.error(f"[WORKER] Job {file_id} failed with an unhandled exception: {e}", exc_info=True)
-        raise # Re-raise the exception so RQ marks the job as FAILED
+        logger.error(f"[WORKER] Job {file_id} failed with exception: {e}", exc_info=True)
+        raise
     
     finally:
-        # Cleanup the file *after* analysis (success or failure)
+        # Cleanup the file after analysis
         try:
             if os.path.exists(file_path):
                 os.remove(file_path)
                 logger.info(f"[WORKER] Cleaned up file: {file_path}")
         except Exception as e:
             logger.warning(f"[WORKER] Failed to delete file {file_path}: {e}")
-        
+
 
 # ----------------------------------------------------
 # --- RQ Worker Startup Script ---
 # ----------------------------------------------------
 if __name__ == '__main__':
+    import sys
+    
     redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379')
+    print(f"[WORKER] Attempting to connect to Redis at: {redis_url}")
     
     try:
         conn = redis.from_url(redis_url)
         conn.ping()
-        print(f"[WORKER] Connected to Redis at: {redis_url}. Starting worker...")
+        print(f"[WORKER] ✓ Connected to Redis successfully")
+        print(f"[WORKER] ✓ Initializing worker for 'default' queue...")
         
-        # ✅ CORRECT: Initialize worker AFTER successful connection
+        # ✅ CRITICAL FIX: Initialize and start worker AFTER successful Redis connection
         worker = Worker(['default'], connection=conn)
-        worker.work()
+        print(f"[WORKER] ✓ Worker initialized, starting to listen for jobs...")
         
+        # This is the blocking call that keeps the worker running
+        worker.work(logging_level='INFO')
+        
+    except KeyboardInterrupt:
+        print("\n[WORKER] Worker stopped by user (Ctrl+C).")
+        sys.exit(0)
     except Exception as e:
-        print(f"[WORKER] FATAL: Could not connect to Redis: {e}")
-        exit(1)
+        print(f"[WORKER] ✗ FATAL ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
