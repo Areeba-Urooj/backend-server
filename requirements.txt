@@ -10,17 +10,16 @@ loguru==0.7.3
 redis==5.2.0
 rq==2.3.0
 
-# Audio processing - versions with guaranteed binary wheels
-librosa==0.10.1
-soundfile==0.12.1
-audioread==3.0.1
+# Audio processing - Allow latest stable versions on Python 3.11
+librosa
+soundfile
+audioread
 
-# Scientific stack - CRITICAL: These versions have wheels for Python 3.11
-# DO NOT change these versions
-numpy==1.24.3
-scipy==1.10.1
-scikit-learn==1.3.0
-numba==0.57.1
-llvmlite==0.40.1
-decorator==5.1.1
-joblib==1.3.2
+# Scientific stack - Allow modern, compatible versions on Python 3.11
+numpy
+scipy
+scikit-learn
+numba
+llvmlite
+decorator
+joblib
