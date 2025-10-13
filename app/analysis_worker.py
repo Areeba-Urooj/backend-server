@@ -8,9 +8,8 @@ import time
 import boto3
 from botocore.exceptions import ClientError
 from redis import Redis
-# ✅ FIX 1 APPLIED: Corrected import to get Connection from the connections submodule
-from rq.connections import Connection
-from rq import Worker 
+# ✅ FIX 1: Revert import to the lowercase 'connections' submodule name
+from rq import connections, Worker 
 
 # --- Configuration ---
 S3_BUCKET_NAME = os.environ.get('S3_BUCKET_NAME')
@@ -62,7 +61,7 @@ def perform_analysis_job(
         s3_client.download_file(S3_BUCKET_NAME, s3_key, temp_audio_file)
         logger.info("✅ Download complete.")
 
-        # --- 2. Perform Placeholder Analysis (Keep this for successful run, replace with your actual logic later) ---
+        # --- 2. Perform Placeholder Analysis ---
         total_words = len(transcript.split())
         speaking_pace = total_words / max(1, (time.time() - job_start_time))
         
@@ -120,10 +119,11 @@ if __name__ == '__main__':
         redis_conn.ping()
         logger.info("Redis connection established.")
         
-        # ✅ FIX 2 APPLIED: Use the imported 'Connection' class (uppercase) as the context manager.
-        with Connection(redis_conn): 
-            worker = Worker(['default'])
-            worker.work()
+        # ✅ FIX 2: Set the default connection explicitly before starting the worker.
+        connections.set_default_connection(redis_conn)
+        
+        worker = Worker(['default'])
+        worker.work()
 
     except Exception as e:
         logger.error(f"❌ Worker failed to start or connect to Redis: {e}", exc_info=True)
