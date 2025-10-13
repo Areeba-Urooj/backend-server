@@ -8,8 +8,9 @@ import time
 import boto3
 from botocore.exceptions import ClientError
 from redis import Redis
-# ✅ REAL FIX: Corrected import from 'Connection' to 'connections'
-from rq import connections, Worker 
+# ✅ FIX 1: Change import to correctly get Connection from the connections submodule
+from rq.connections import Connection
+from rq import Worker 
 
 # --- Configuration ---
 S3_BUCKET_NAME = os.environ.get('S3_BUCKET_NAME')
@@ -119,8 +120,9 @@ if __name__ == '__main__':
         redis_conn.ping()
         logger.info("Redis connection established.")
         
-        # Use connections (lowercase) as a context manager
-        with connections(redis_conn): 
+        # ✅ FIX 2: Use the imported 'Connection' class (uppercase) as the context manager.
+        # This tells RQ to use the specified redis_conn for its worker.
+        with Connection(redis_conn): 
             worker = Worker(['default'])
             worker.work()
 
