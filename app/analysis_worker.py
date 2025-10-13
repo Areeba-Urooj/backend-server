@@ -8,13 +8,13 @@ import time
 import boto3
 from botocore.exceptions import ClientError
 from redis import Redis
-# ✅ FIX 1: Change import to correctly get Connection from the connections submodule
+# ✅ FIX 1 APPLIED: Corrected import to get Connection from the connections submodule
 from rq.connections import Connection
 from rq import Worker 
 
 # --- Configuration ---
 S3_BUCKET_NAME = os.environ.get('S3_BUCKET_NAME')
-AWS_REGION = os.environ.get('AWS_REGION', 'eu-north-1') # Corrected Region
+AWS_REGION = os.environ.get('AWS_REGION', 'eu-north-1') 
 
 # --- Logging Setup ---
 logging.basicConfig(
@@ -64,7 +64,7 @@ def perform_analysis_job(
 
         # --- 2. Perform Placeholder Analysis (Keep this for successful run, replace with your actual logic later) ---
         total_words = len(transcript.split())
-        speaking_pace = total_words / max(1, (time.time() - job_start_time)) # Avoid division by zero
+        speaking_pace = total_words / max(1, (time.time() - job_start_time))
         
         analysis_result = {
             "duration_seconds": 15.5,
@@ -120,8 +120,7 @@ if __name__ == '__main__':
         redis_conn.ping()
         logger.info("Redis connection established.")
         
-        # ✅ FIX 2: Use the imported 'Connection' class (uppercase) as the context manager.
-        # This tells RQ to use the specified redis_conn for its worker.
+        # ✅ FIX 2 APPLIED: Use the imported 'Connection' class (uppercase) as the context manager.
         with Connection(redis_conn): 
             worker = Worker(['default'])
             worker.work()
