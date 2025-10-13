@@ -8,8 +8,9 @@ import time
 import boto3
 from botocore.exceptions import ClientError
 from redis import Redis
-# ✅ FIX 1: Revert import to the lowercase 'connections' submodule name
-from rq import connections, Worker 
+from rq import Worker 
+import numpy as np
+import librosa
 
 # --- Configuration ---
 S3_BUCKET_NAME = os.environ.get('S3_BUCKET_NAME')
@@ -47,56 +48,79 @@ def perform_analysis_job(
 ) -> Dict[str, Any]:
     """
     Worker function to fetch audio, perform analysis, and return the results.
+    Includes placeholder analysis logic using librosa and numpy.
     """
     job_start_time = time.time()
     logger.info(f"🚀 Starting analysis for file_id: {file_id}, s3_key: {s3_key}")
     if user_id:
         logger.info(f"User ID: {user_id}")
 
-    temp_audio_file = f"/tmp/{file_id}.m4a"
+    temp_audio_file = f"/tmp/{file_id}_{os.path.basename(s3_key)}"
+    duration_seconds = 0
+    total_words = len(transcript.split())
 
     try:
         # 1. Download the file from S3
         logger.info(f"⬇️ Downloading s3://{S3_BUCKET_NAME}/{s3_key} to {temp_audio_file}")
         s3_client.download_file(S3_BUCKET_NAME, s3_key, temp_audio_file)
         logger.info("✅ Download complete.")
-
-        # --- 2. Perform Placeholder Analysis ---
-        total_words = len(transcript.split())
-        speaking_pace = total_words / max(1, (time.time() - job_start_time))
         
+        # 2. Perform Audio Analysis using librosa (Example Logic)
+        y, sr = librosa.load(temp_audio_file, sr=None)
+        duration_seconds = librosa.get_duration(y=y, sr=sr)
+        
+        # Calculate RMS (Root Mean Square Energy)
+        rms = librosa.feature.rms(y=y)[0]
+        
+        # Simple placeholder for silence/pauses (e.g., RMS below a threshold)
+        rms_threshold = np.mean(rms) * 0.2  # 20% of mean RMS
+        silence_ratio = np.sum(rms < rms_threshold) / len(rms)
+        long_pause_count = int(silence_ratio * 10) # Placeholder metric
+        
+        # Simple Placeholder for Pitch (F0)
+        pitches, magnitudes = librosa.core.piptrack(y=y, sr=sr, fmin=75, fmax=300)
+        pitch_valid = pitches[magnitudes > np.quantile(magnitudes, 0.9)]
+        pitch_mean = np.mean(pitch_valid) if len(pitch_valid) > 0 else 0
+        pitch_std = np.std(pitch_valid) if len(pitch_valid) > 0 else 0
+        
+        # Speaking Pace (words per minute)
+        speaking_pace_wpm = (total_words / max(1, duration_seconds)) * 60
+
+        # Placeholder for filler words and repetitions (requires NLP/transcript processing)
+        filler_word_count = transcript.lower().count('um') + transcript.lower().count('uh')
+        repetition_count = 2 # Hardcoded placeholder
+
+        # 3. Compile Results
         analysis_result = {
-            "duration_seconds": 15.5,
+            "duration_seconds": round(duration_seconds, 2),
             "total_words": total_words,
-            "repetition_count": 2,
-            "long_pause_count": 1,
-            "confidence_score": 0.95,
-            "emotion": "calm",
-            "recommendations": ["Speak slightly faster.", "Vary your pitch."],
+            "repetition_count": repetition_count,
+            "long_pause_count": long_pause_count,
+            "confidence_score": round(np.random.uniform(0.9, 0.99), 2), # Random confidence
+            "emotion": "calm", # Hardcoded placeholder
+            "recommendations": ["Ensure clear articulation.", "Try to reduce filler words."] if filler_word_count > 0 else ["Excellent pace and clarity."],
             "audio_features": {
-                "rms_mean": 0.05,
-                "silence_ratio": 0.10,
-                "speaking_pace": speaking_pace,
-                "pitch_mean": 120.0,
-                "pitch_std": 10.0,
-                "pitch_min": 80.0,
-                "pitch_max": 180.0,
-                "rms_std": 0.015,
+                "rms_mean": round(np.mean(rms), 4),
+                "rms_std": round(np.std(rms), 4),
+                "silence_ratio": round(silence_ratio, 2),
+                "speaking_pace_wpm": round(speaking_pace_wpm, 1),
+                "pitch_mean": round(pitch_mean, 1),
+                "pitch_std": round(pitch_std, 1),
             },
             "filler_word_analysis": {
-                "filler_word_count": 5,
-                "filler_word_rate": 0.05,
+                "filler_word_count": filler_word_count,
+                "filler_word_rate": round(filler_word_count / total_words, 3) if total_words > 0 else 0,
             },
             "transcript": transcript,
         }
 
         logger.info("✅ Analysis complete.")
         
-        # 3. Clean up the temporary file
+        # 4. Clean up the temporary file
         os.remove(temp_audio_file)
         logger.info(f"🗑️ Cleaned up temp file: {temp_audio_file}")
         
-        # 4. Return the full result structure
+        # 5. Return the full result structure
         return analysis_result
 
     except ClientError as e:
@@ -106,6 +130,7 @@ def perform_analysis_job(
         logger.error(f"❌ General Analysis Error: {e}", exc_info=True)
         raise
     finally:
+        # Final cleanup attempt
         if os.path.exists(temp_audio_file):
              os.remove(temp_audio_file)
 
@@ -119,10 +144,8 @@ if __name__ == '__main__':
         redis_conn.ping()
         logger.info("Redis connection established.")
         
-        # ✅ FIX 2: Set the default connection explicitly before starting the worker.
-        connections.set_default_connection(redis_conn)
-        
-        worker = Worker(['default'])
+        # ✅ FINAL FIX: Pass the connection object directly to the Worker constructor
+        worker = Worker(['default'], connection=redis_conn)
         worker.work()
 
     except Exception as e:
