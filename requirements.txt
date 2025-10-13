@@ -5,6 +5,7 @@ python-multipart==0.0.20
 pydantic==2.10.0
 aiofiles==25.1.0
 loguru==0.7.3
+boto3
 
 # Redis and RQ
 redis==5.2.0
