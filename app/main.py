@@ -28,7 +28,7 @@ app = FastAPI()
 # --- AWS S3 Configuration ---
 # 💡 NEW: Environment variables for S3 connection
 S3_BUCKET_NAME = os.environ.get('S3_BUCKET_NAME')
-AWS_REGION = os.environ.get('AWS_REGION', 'us-east-1') # Default to a common region
+AWS_REGION = os.environ.get('AWS_REGION', 'eu-north-1') # Default to a common region
 
 def get_s3_client():
     """Initializes and returns the S3 client using environment credentials."""
