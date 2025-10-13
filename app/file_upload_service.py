@@ -1,53 +1,86 @@
-# backend/file_upload_service.py
+# app-folder/file_upload_service.py
 
 import os
 import uuid
-import shutil
+import boto3
+from botocore.exceptions import ClientError
 from fastapi import UploadFile
 from datetime import datetime
-from . import models  # Import models to create UploadResponse instance
+from loguru import logger # 💡 NEW: Import logger for better error handling
+from . import models
 
-# --- IMPORTANT: Define the upload directory ---
-UPLOAD_DIR = "uploads" 
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+# --- AWS S3 Configuration ---
+# 💡 NEW: Get S3 config from environment variables
+S3_BUCKET_NAME = os.environ.get('S3_BUCKET_NAME')
+AWS_REGION = os.environ.get('AWS_REGION', 'us-east-1')
+
+# ❌ REMOVED: Local directory management is no longer needed
+# UPLOAD_DIR = "uploads" 
+# os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+
+def get_s3_client():
+    """Initializes and returns the S3 client."""
+    if not S3_BUCKET_NAME:
+        logger.error("[S3_SERVICE] ❌ S3_BUCKET_NAME environment variable is not set.")
+        raise EnvironmentError("S3_BUCKET_NAME is not configured.")
+    
+    # Boto3 automatically uses AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
+    return boto3.client('s3', region_name=AWS_REGION)
 
 
 async def save_audio_file(file: UploadFile) -> models.UploadResponse:
-    """
-    Saves the uploaded audio file and returns an UploadResponse model instance.
-    """
+    """
+    Uploads the audio file directly to AWS S3 and returns an UploadResponse with the S3 Key.
+    """
+    s3_client = get_s3_client()
     
-    # 1. Generate a unique ID (This is the critical 'file_id')
-    file_id = str(uuid.uuid4())
-    
-    # 2. Define the file path
-    # We use the file_id for a unique, safe name on the server
+    # 1. Generate a unique ID (This is the critical 'S3 Key')
+    # Use UUID to ensure keys don't clash, and keep the original file extension
+    file_id = str(uuid.uuid4())
     file_extension = os.path.splitext(file.filename)[1]
-    safe_filename = f"{file_id}{file_extension}"
-    file_path = os.path.join(UPLOAD_DIR, safe_filename)
-    
-    # 3. Save the file contents
-    try:
-        # Use a more robust asynchronous write for large files
-        content = await file.read()
-        with open(file_path, "wb") as buffer:
-            buffer.write(content)
-            
-        file_size = os.path.getsize(file_path)
-
-    except Exception as e:
-        # Clean up any partial file if saving failed
-        if os.path.exists(file_path):
-            os.remove(file_path)
-        # Re-raise the exception to be caught in main.py
-        raise e 
+    # 💡 NEW: The S3 Key defines the path inside the bucket, e.g., 'uploads/a7b1c2d3.m4a'
+    s3_key = f"uploads/{file_id}{file_extension}" 
+    
+    # 2. UPLOAD the file object directly to S3
+    try:
+        # file.file is a file-like object that boto3 can read from
+        # file.read() is awaited in your original code, which is fine, but upload_fileobj is better
+        # as it uses the file-like object directly without reading the whole thing into memory first
         
-    # 4. CRITICAL FIX: Return an UploadResponse instance, not a dict
-    return models.UploadResponse(
-        status="success",
-        file_id=file_id,
-        file_name=file.filename, 
-        file_size=file_size,
-        content_type=file.content_type or "application/octet-stream",
-        upload_time=datetime.utcnow().isoformat()
-    )
+        # 💡 NOTE: We read the entire file into memory (content = await file.read()) to get the size later.
+        # For very large files, stream it directly with upload_fileobj(Fileobj=file.file, ...)
+        # We'll use your original method to simplify the transition and get the size.
+        content = await file.read()
+        file_size = len(content)
+        
+        # Rewind the file stream for S3 (important if it was read previously)
+        # We use io.BytesIO to turn the content (bytes) into a file-like object for upload_fileobj
+        import io
+        file_stream = io.BytesIO(content) 
+
+        s3_client.upload_fileobj(
+            Fileobj=file_stream,
+            Bucket=S3_BUCKET_NAME,
+            Key=s3_key
+        )
+        
+    except ClientError as e:
+        logger.error(f"[S3_SERVICE] ❌ S3 Upload failed for key {s3_key}: {e}")
+        # Re-raise the exception to be caught in main.py
+        raise e
+    except Exception as e:
+        logger.error(f"[S3_SERVICE] ❌ Unknown error during upload: {e}")
+        # Re-raise the exception to be caught in main.py
+        raise e 
+        
+    # 3. Return the response model
+    return models.UploadResponse(
+        status="success",
+        # 💡 CRITICAL: The file_id is now the S3 Key
+        file_id=s3_key, 
+        file_name=file.filename, 
+        file_size=file_size,
+        content_type=file.content_type or "application/octet-stream",
+        upload_time=datetime.utcnow().isoformat()
+    )
