@@ -1,231 +1,184 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException, Depends
-from loguru import logger
-from typing import Optional
 import os
 import sys
-import traceback
-import uuid # 💡 NEW: Import uuid for S3 key generation, though file_upload_service might handle it.
-import boto3 # 💡 NEW: Import boto3, required for S3 access
-from botocore.exceptions import ClientError # 💡 NEW: Import ClientError
+import logging
+from uuid import uuid4
+from datetime import datetime
+from typing import Dict, Any
 
-# RQ/Redis imports
+from fastapi import FastAPI, File, UploadFile, HTTPException, Depends
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+
+import boto3
+from botocore.exceptions import ClientError
+
 import redis
-from rq import Queue, Retry
+from rq import Queue
 from rq.job import Job
+from pydantic import BaseModel
 
-# Add the app directory to the Python path to help with imports
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Add proper path handling for imports
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from . import models 
-from . import file_upload_service # This service will be updated to handle S3 uploads.
+# --- Configuration ---
 
-# --- Configuration & Initialization ---
-app = FastAPI()
-
-# ❌ REMOVED: UPLOAD_DIR is no longer relevant for S3
-# UPLOAD_DIR = "uploads" 
-
-# --- AWS S3 Configuration ---
-# 💡 NEW: Environment variables for S3 connection
+# 💡 NEW: AWS S3 Configuration
 S3_BUCKET_NAME = os.environ.get('S3_BUCKET_NAME')
-AWS_REGION = os.environ.get('AWS_REGION', 'eu-north-1') # Default to a common region
+AWS_REGION = os.environ.get('AWS_REGION', 'eu-north-1')
+S3_URL_PREFIX = f"https://{S3_BUCKET_NAME}.s3.{AWS_REGION}.amazonaws.com/"
 
+# --- Logging Setup ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)s | %(name)s:%(lineno)d - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# --- Redis & RQ Setup ---
+def get_redis_connection():
+    """Initializes and returns the Redis connection."""
+    redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379')
+    logger.info(f"[MAIN] Connecting to Redis at: {redis_url}")
+    try:
+        conn = redis.from_url(redis_url)
+        conn.ping()
+        logger.info("[MAIN] ✅ Successfully connected to Redis")
+        return conn
+    except Exception as e:
+        logger.error(f"[MAIN] ❌ Failed to connect to Redis: {e}", exc_info=True)
+        # 💡 CRITICAL CHANGE: Re-raise the exception to prevent startup if Redis fails
+        raise RuntimeError("Failed to connect to Redis for RQ.") from e
+
+
+redis_conn = get_redis_connection()
+queue = Queue('default', connection=redis_conn)
+
+# --- S3 Client Initialization ---
 def get_s3_client():
-    """Initializes and returns the S3 client using environment credentials."""
+    """Initializes and returns the S3 client."""
     if not S3_BUCKET_NAME:
         logger.error("[MAIN] ❌ S3_BUCKET_NAME environment variable is not set.")
-        raise HTTPException(status_code=500, detail="S3 configuration missing.")
-    try:
-        # Boto3 automatically uses AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY from env vars
-        return boto3.client('s3', region_name=AWS_REGION)
-    except Exception as e:
-        logger.error(f"[MAIN] ❌ Failed to initialize S3 client: {e}")
-        raise HTTPException(status_code=500, detail="AWS S3 service failed to initialize.")
+        raise ValueError("S3_BUCKET_NAME is not configured.")
+    # Boto3 automatically uses AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY from env vars
+    return boto3.client('s3', region_name=AWS_REGION)
 
+s3_client = get_s3_client()
 
-# Initialize Redis connection and RQ Queue (NO CHANGE)
-REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379/0')
-logger.info(f"[MAIN] Connecting to Redis at: {REDIS_URL}")
-try:
-    redis_conn = redis.from_url(REDIS_URL)
-    redis_conn.ping() 
-    logger.info("[MAIN] ✅ Successfully connected to Redis")
-except Exception as e:
-    logger.error(f"[MAIN] ❌ FATAL: Could not connect to Redis: {e}")
-    redis_conn = None 
+# --- FastAPI App Initialization ---
+app = FastAPI(
+    title="Audio Analysis API",
+    version="1.0.0",
+    description="API for uploading audio and queuing analysis jobs."
+)
 
-def get_analysis_queue():
-    if redis_conn is None:
-        raise HTTPException(status_code=503, detail="Analysis service is unavailable (Redis connection failed).")
-    return Queue('default', connection=redis_conn)
+# CORS configuration to allow frontend access
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods
+    allow_headers=["*"],  # Allows all headers
+)
 
-# --- 1. Root Endpoint (Health Check) ---
-# ... (NO CHANGE to / and /health endpoints) ...
+# Pydantic model for the response structure
+class AnalysisJobResponse(BaseModel):
+    file_id: str
+    s3_key: str
+    job_id: str
+    message: str
+
+# --- API Endpoints ---
+
 @app.get("/")
-def read_root():
-    redis_status = "connected" if redis_conn else "disconnected"
-    return {
-        "status": "ok", 
-        "message": "PodiumAI backend is running.",
-        "redis": redis_status
-    }
-
-# --- Health check endpoint ---
-@app.get("/health")
 def health_check():
-    try:
-        if redis_conn:
-            redis_conn.ping()
-            queue = Queue('default', connection=redis_conn)
-            queue_length = len(queue)
-            return {
-                "status": "healthy", 
-                "redis": "connected",
-                "queue_length": queue_length
-            }
-        else:
-            return {"status": "unhealthy", "redis": "disconnected"}
-    except Exception as e:
-        return {"status": "unhealthy", "redis": str(e)}
+    """Basic health check."""
+    return {"status": "ok", "message": "Audio Analysis API is running."}
 
-
-# --- 2. File Upload Endpoint (Minor Change) ---
-# This endpoint now saves to S3 via the service and returns the S3 Key.
-@app.post("/upload", response_model=models.UploadResponse)
-async def upload_audio(file: UploadFile = File(...)):
-    try:
-        logger.info(f"[MAIN] 📤 Receiving file upload: {file.filename}")
-        # 💡 CHANGE: file_upload_service.save_audio_file must now return the S3 key/ID, not a local file path/ID.
-        result = await file_upload_service.save_audio_file(file)
-        logger.info(f"[MAIN] ✅ File uploaded to S3 with Key: {result.file_id}")
-        return result 
-    except ClientError as e: # Catch S3-specific errors
-        logger.error(f"[MAIN] ❌ S3 Upload failed: {e}")
-        raise HTTPException(status_code=500, detail=f"S3 Upload Error: {e.response['Error']['Message']}")
-    except Exception as e:
-        logger.error(f"[MAIN] ❌ Error uploading file: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
-
-# --- 3. Submit Analysis Job Endpoint (MAJOR Change) ---
-# The path variable will now hold the S3 key, and local file checks are removed.
-@app.post("/api/v1/analysis/submit", response_model=models.AnalysisStatusResponse)
-async def submit_analysis_job(
-    request: models.AnalysisRequest,
-    queue: Queue = Depends(get_analysis_queue)
+@app.post("/upload-and-analyze/", response_model=AnalysisJobResponse)
+async def upload_and_analyze(
+    file: UploadFile = File(...),
+    transcript: str = ""
 ):
-    # 💡 CHANGE: We assume file_id is the S3 Key.
-    logger.info(f"[MAIN] 🚀 Received analysis submission for S3 Key: {request.file_id}")
-    s3_key = request.file_id # Rename for clarity, this is the S3 Key/Path
-    
-    # ❌ REMOVED: No more local file path check. The worker handles S3 download and not-found errors.
-    # file_path = os.path.join(UPLOAD_DIR, f"{request.file_id}.m4a")
-    
-    # if not os.path.exists(file_path):
-    #     logger.error(f"[MAIN] ❌ File not found during submission: {file_path}")
-    #     raise HTTPException(status_code=404, detail=f"File associated with ID {request.file_id} not found on server.")
-    
-    # ❌ REMOVED: No more local file size check.
-    # file_size = os.path.getsize(file_path)
-    # logger.info(f"[MAIN] 📁 File exists: {file_path} ({file_size} bytes)")
-    logger.info(f"[MAIN] 📝 Transcript length: {len(request.transcript)} chars")
-    
+    """
+    Receives an audio file, uploads it to S3, and queues an analysis job.
+    """
+    logger.info(f"[API] ➡️ Received upload request for file: {file.filename}")
+
+    file_extension = os.path.splitext(file.filename)[1] or ".m4a" # Default to m4a
+    file_id = str(uuid4())
+    s3_key = f"uploads/{file_id}{file_extension}"
+
     try:
-        # Enqueue the job with the S3 key as the 'file_path' argument
+        # 1. Upload to S3
+        logger.info(f"[API] ⬆️ Starting S3 upload to key: {s3_key}")
+        file_content = await file.read()
+        
+        s3_client.put_object(
+            Bucket=S3_BUCKET_NAME,
+            Key=s3_key,
+            Body=file_content,
+            ContentType=file.content_type
+        )
+        logger.info(f"[API] ✅ S3 upload complete for file_id: {file_id}")
+
+        # 2. Enqueue the analysis job
+        # IMPORTANT: The worker needs the full path to the analysis function
+        from . import analysis_worker 
+
         job = queue.enqueue(
-            'app.analysis_worker.perform_analysis_job',
-            request.file_id, 
-            s3_key, # 💡 CHANGE: Pass the S3 Key instead of the local file_path
-            request.transcript,
-            job_id=f"analysis-{request.file_id}", 
-            retry=Retry(max=3),
-            job_timeout='10m',
-            result_ttl=3600,  # Keep results for 1 hour
-            failure_ttl=3600  # Keep failure info for 1 hour
+            analysis_worker.perform_analysis_job,
+            file_id=file_id,
+            s3_key=s3_key,
+            transcript=transcript,
+            job_timeout='30m'  # Set timeout for long analysis jobs
         )
         
-        logger.info(f"[MAIN] ✅ Job enqueued successfully")
-        logger.info(f"[MAIN]    Job ID: {job.id}")
-        logger.info(f"[MAIN]    Initial status: {job.get_status()}")
-        logger.info(f"[MAIN]    Function: {job.func_name}")
-        
-        return models.AnalysisStatusResponse(
-            job_id=job.id,
-            status=job.get_status(), 
-            result=None
-        )
-        
-    except Exception as e:
-        logger.error(f"[MAIN] ❌ Failed to enqueue analysis job: {e}", exc_info=True)
+        logger.info(f"[API] 📝 Job enqueued successfully. Job ID: {job.id}")
+
+        return JSONResponse(content={
+            "file_id": file_id,
+            "s3_key": s3_key,
+            "job_id": job.id,
+            "message": "Upload successful. Analysis job queued."
+        }, status_code=202)
+
+    except ClientError as e:
+        logger.error(f"[API] ❌ S3 Error during upload: {e}", exc_info=True)
         raise HTTPException(
-            status_code=500, 
-            detail=f"Failed to submit analysis job to the queue: {str(e)}"
+            status_code=500,
+            detail=f"S3 Upload Failed: {e.response['Error'].get('Message', 'Unknown S3 error')}"
+        )
+    except Exception as e:
+        logger.error(f"[API] ❌ General Error during upload/enqueue: {e}", exc_info=True)
+        # This will catch Redis/RQ errors too
+        raise HTTPException(
+            status_code=500,
+            detail=f"An error occurred while processing the request: {str(e)}"
         )
 
-# ... (NO CHANGE to /debug/test-worker-import and /api/v1/analysis/status/{job_id} endpoints) ...
-@app.get("/debug/test-worker-import")
-def test_worker_import():
-    """Test if we can import the worker function"""
-    try:
-        from . import analysis_worker
-        return {
-            "status": "success",
-            "function_exists": hasattr(analysis_worker, 'perform_analysis_job'),
-            "function_path": "app.analysis_worker.perform_analysis_job",
-            "module_file": analysis_worker.__file__ if hasattr(analysis_worker, '__file__') else "unknown"
-        }
-    except Exception as e:
-        return {
-            "status": "error",
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }
+# ... (Job status and result endpoints would typically follow here) ...
 
-@app.get("/api/v1/analysis/status/{job_id}", response_model=models.AnalysisStatusResponse)
-def get_analysis_status(
-    job_id: str, 
-    queue: Queue = Depends(get_analysis_queue)
-):
-    logger.info(f"[MAIN] 🔍 Checking status for job: {job_id}")
-    
+@app.get("/job-status/{job_id}")
+def get_job_status(job_id: str):
+    """Retrieves the status of an RQ job."""
     try:
-        job = queue.fetch_job(job_id)
-        
-        if not job:
-            logger.warning(f"[MAIN] ⚠️  Job not found: {job_id}")
-            raise HTTPException(status_code=404, detail="Job not found.")
-        
+        job = Job.fetch(job_id, connection=redis_conn)
         status = job.get_status()
-        logger.info(f"[MAIN] 📊 Job {job_id} status: {status}")
         
+        result_data: Dict[str, Any] = {
+            "job_id": job_id,
+            "status": status,
+            "enqueued_at": job.enqueued_at.isoformat() if job.enqueued_at else None
+        }
+
         if status == 'finished':
-            result_data = job.result
-            logger.info(f"[MAIN] ✅ Job completed successfully")
-            return models.AnalysisStatusResponse(
-                job_id=job.id,
-                status=status,
-                result=result_data, 
-                error=None
-            )
-        
+            result_data["result"] = job.result
         elif status == 'failed':
-            error_message = str(job.exc_info) if job.exc_info else "Job failed for an unknown reason."
-            logger.error(f"[MAIN] ❌ Job failed: {error_message}")
-            return models.AnalysisStatusResponse(
-                job_id=job.id,
-                status=status,
-                error=error_message
-            )
+            result_data["error"] = job.exc_info
+            
+        return JSONResponse(content=result_data)
         
-        # Job is still queued or started
-        return models.AnalysisStatusResponse(
-            job_id=job.id,
-            status=status,
-            result=None,
-            error=None
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"[MAIN] ❌ Error checking job status: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Error checking job status: {str(e)}")
+    except redis.exceptions.ConnectionError:
+        raise HTTPException(status_code=500, detail="Could not connect to Redis.")
+    except Exception:
+        raise HTTPException(status_code=404, detail=f"Job with ID {job_id} not found.")
