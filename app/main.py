@@ -20,7 +20,7 @@ from pydantic import BaseModel
 
 # Ensure analysis_worker can be imported
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import analysis_worker 
+import analysis_worker  # Worker module is now correctly imported
 
 # --- Configuration ---
 S3_BUCKET_NAME = os.environ.get('S3_BUCKET_NAME')
@@ -49,7 +49,8 @@ def get_redis_connection():
 
 try:
     redis_conn = get_redis_connection()
-    queue = Queue('default', connection=redis_conn)
+    # Use the established connection for the Queue
+    queue = Queue('default', connection=redis_conn) 
 except RuntimeError:
     # If connection fails, allow FastAPI to start, but job submission will fail
     redis_conn = None
@@ -65,6 +66,7 @@ def get_s3_client():
 
 try:
     s3_client = get_s3_client()
+    logger.info(f"[MAIN] ✅ S3 Client initialized for bucket: {S3_BUCKET_NAME} in region: {AWS_REGION}")
 except ValueError:
     s3_client = None
 
@@ -84,16 +86,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Pydantic model for submission response
+# --- Pydantic Models ---
 class SubmissionResponse(BaseModel):
     file_id: str
     job_id: str
     message: str
 
-# Pydantic model for upload response
 class UploadResponse(BaseModel):
-    file_id: str
-    s3_key: str
+    file_id: str # This should be the S3 Key (e.g., "uploads/uuid.m4a")
+    s3_key: str # Redundant, but kept for compatibility with original logs
     message: str
 
 # --- API Endpoints ---
@@ -111,13 +112,16 @@ async def upload_audio_file(
     if not s3_client or not S3_BUCKET_NAME:
         raise HTTPException(status_code=503, detail="S3 storage service is unavailable.")
     
+    # Generate S3 key based on file extension
     file_extension = os.path.splitext(file.filename)[1] or ".m4a"
-    file_id = str(uuid4())
-    s3_key = f"uploads/{file_id}{file_extension}"
+    file_uuid = str(uuid4())
+    s3_key = f"uploads/{file_uuid}{file_extension}"
 
     try:
         logger.info(f"[API] ⬆️ Starting S3 upload to key: {s3_key}")
-        file_content = await file.read()
+        
+        # Read file content into memory. For large files, use upload_fileobj with a temporary file.
+        file_content = await file.read() 
         
         s3_client.put_object(
             Bucket=S3_BUCKET_NAME,
@@ -125,11 +129,11 @@ async def upload_audio_file(
             Body=file_content,
             ContentType=file.content_type
         )
-        logger.info(f"[API] ✅ S3 upload complete for file_id: {file_id}")
+        logger.info(f"[API] ✅ S3 upload complete for S3 Key: {s3_key}")
 
         return JSONResponse(content={
-            "file_id": file_id,
-            "s3_key": s3_key,
+            "file_id": file_uuid, # Return UUID for simple reference
+            "s3_key": s3_key,     # Return full S3 Key for job submission
             "message": "File uploaded successfully."
         }, status_code=200)
 
@@ -148,28 +152,23 @@ async def upload_audio_file(
 
 @app.post("/api/v1/analysis/submit", response_model=SubmissionResponse)
 async def submit_analysis_job(
-    file_id: str = Form(..., description="The ID of the file previously uploaded to S3."),
+    s3_key: str = Form(..., description="The S3 Key (path/filename) of the file returned by the /upload endpoint."),
     transcript: str = Form(..., description="The full transcription of the audio file."),
     user_id: str = Form(..., description="The ID of the authenticated user.")
 ):
-    """Queues an audio analysis job using file_id and transcript."""
+    """Queues an audio analysis job using s3_key and transcript."""
     if not queue:
         raise HTTPException(status_code=503, detail="RQ/Redis service is unavailable.")
 
-    # In a real app, you would fetch the s3_key from a database using file_id
-    # For this architecture, we must assume the s3_key format is derivable or known. 
-    # Since the frontend only sends file_id, this endpoint is problematic.
-    # We will assume a simple key structure for now.
-    s3_key_placeholder = f"uploads/{file_id}.m4a" 
-    logger.warning(f"[API] ⚠️ Using placeholder s3_key: {s3_key_placeholder} - This needs to be fetched from a database in a production environment.")
-
+    # Extract file_id (UUID) from s3_key for internal tracking/logging
+    file_id = os.path.splitext(os.path.basename(s3_key))[0]
 
     try:
-        # Enqueue the analysis job
+        # Enqueue the analysis job, passing the full S3 key
         job = queue.enqueue(
             analysis_worker.perform_analysis_job,
             file_id=file_id,
-            s3_key=s3_key_placeholder,
+            s3_key=s3_key, # Pass the full S3 key
             transcript=transcript,
             user_id=user_id,
             job_timeout='30m'
@@ -203,11 +202,13 @@ def get_job_status(job_id: str):
         result_data: Dict[str, Any] = {
             "job_id": job_id,
             "status": status,
-            "enqueued_at": job.enqueued_at.isoformat() if job.enqueued_at else None
+            "enqueued_at": job.enqueued_at.isoformat() if job.enqueued_at else None,
+            "started_at": job.started_at.isoformat() if job.started_at else None,
         }
 
         if status == 'finished':
             result_data["result"] = job.result 
+            result_data["ended_at"] = job.ended_at.isoformat() if job.ended_at else None
         elif status == 'failed':
             result_data["error"] = job.exc_info
             
