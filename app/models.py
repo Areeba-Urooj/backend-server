@@ -5,28 +5,24 @@ from typing import Optional, Dict, Any, List
 class UploadResponse(BaseModel):
     """
     Defines the expected JSON structure after a successful file upload.
-    The file_id field contains the full S3 Key (path within the bucket).
+    The file_id field contains the generated UUID, and s3_key contains the full path.
     """
-    status: str
-    file_id: str = Field(..., description="The S3 Key (path/filename) of the uploaded object.")
-    file_name: str
-    file_size: int
-    content_type: str
-    upload_time: Optional[str] = None
+    file_id: str = Field(..., description="The UUID of the uploaded file.")
+    s3_key: str = Field(..., description="The S3 Key (path/filename) of the uploaded object. Use this for analysis submission.")
+    message: str
 
-# --- 2. Analysis Submission Model (Input) ---
-class AnalysisRequest(BaseModel):
-    """
-    Defines the expected JSON structure for submitting a job.
-    """
-    # 💡 UPDATED DESCRIPTION
-    file_id: str = Field(..., description="The S3 Key of the audio file returned by the /upload endpoint.")
-    transcript: str = Field(..., description="The full, unedited transcript of the audio.")
+# --- 2. Analysis Submission Model (Output) ---
+class SubmissionResponse(BaseModel):
+    file_id: str
+    job_id: str
+    message: str
 
 # --- 3. Analysis Status/Result Model (Output) ---
 class AnalysisStatusResponse(BaseModel):
-# ... (No change required) ...
     job_id: str
     status: str = Field(..., description="Job status: 'queued', 'started', 'finished', or 'failed'.")
+    enqueued_at: Optional[str] = None
+    started_at: Optional[str] = None
+    ended_at: Optional[str] = None
     result: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
