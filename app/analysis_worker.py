@@ -8,7 +8,8 @@ import time
 import boto3
 from botocore.exceptions import ClientError
 from redis import Redis
-from rq import Connection, Worker
+# ✅ REAL FIX: Corrected import from 'Connection' to 'connections'
+from rq import connections, Worker 
 
 # --- Configuration ---
 S3_BUCKET_NAME = os.environ.get('S3_BUCKET_NAME')
@@ -30,13 +31,11 @@ def get_s3_client():
     # Use the explicitly set AWS_REGION
     return boto3.client('s3', region_name=AWS_REGION)
 
-# NOTE: This client is only created once per worker process startup
 try:
     s3_client = get_s3_client()
     logger.info(f"[WORKER] ✅ S3 Client initialized for bucket: {S3_BUCKET_NAME} in region: {AWS_REGION}")
 except ValueError as e:
     logger.error(f"[WORKER] ❌ Configuration Error: {e}")
-    # Re-raise the error so the worker deployment fails if essential config is missing
     raise
 
 # --- Core Analysis Function ---
@@ -62,19 +61,12 @@ def perform_analysis_job(
         s3_client.download_file(S3_BUCKET_NAME, s3_key, temp_audio_file)
         logger.info("✅ Download complete.")
 
-        # --- 2. Perform Placeholder Analysis (REPLACE WITH REAL LOGIC) ---
-        
-        # In a real app, this is where you would call:
-        # - Librosa to extract features from temp_audio_file
-        # - Text analysis libraries (like NLTK/SpaCy) on the transcript
-        # - A separate ML model for emotional analysis
-        
-        # Placeholder for actual analysis logic
+        # --- 2. Perform Placeholder Analysis (Keep this for successful run, replace with your actual logic later) ---
         total_words = len(transcript.split())
-        speaking_pace = total_words / (time.time() - job_start_time) # Approximate pace
+        speaking_pace = total_words / max(1, (time.time() - job_start_time)) # Avoid division by zero
         
         analysis_result = {
-            "duration_seconds": 15.5, # Placeholder value
+            "duration_seconds": 15.5,
             "total_words": total_words,
             "repetition_count": 2,
             "long_pause_count": 1,
@@ -95,7 +87,7 @@ def perform_analysis_job(
                 "filler_word_count": 5,
                 "filler_word_rate": 0.05,
             },
-            "transcript": transcript, # Include the transcript in the final result
+            "transcript": transcript,
         }
 
         logger.info("✅ Analysis complete.")
@@ -109,14 +101,11 @@ def perform_analysis_job(
 
     except ClientError as e:
         logger.error(f"❌ S3 Error during worker processing: {e}", exc_info=True)
-        # Log the error details for RQ to record the job failure
         raise
     except Exception as e:
         logger.error(f"❌ General Analysis Error: {e}", exc_info=True)
-        # Log the error details for RQ to record the job failure
         raise
     finally:
-        # Ensure cleanup even if analysis failed, if possible
         if os.path.exists(temp_audio_file):
              os.remove(temp_audio_file)
 
@@ -126,17 +115,15 @@ if __name__ == '__main__':
     logger.info(f"Starting worker and connecting to Redis at: {redis_url}")
     
     try:
-        # Ensure the connection is established before starting the worker
         redis_conn = Redis.from_url(redis_url)
         redis_conn.ping()
         logger.info("Redis connection established.")
         
-        with Connection(redis_conn):
-            # Create a worker for the 'default' queue
+        # Use connections (lowercase) as a context manager
+        with connections(redis_conn): 
             worker = Worker(['default'])
             worker.work()
 
     except Exception as e:
         logger.error(f"❌ Worker failed to start or connect to Redis: {e}", exc_info=True)
-        # Exit with a non-zero status code to indicate failure
         exit(1)
