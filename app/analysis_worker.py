@@ -25,7 +25,7 @@ from rq.job import Job
 
 # 💡 NEW: AWS S3 Configuration
 S3_BUCKET_NAME = os.environ.get('S3_BUCKET_NAME')
-AWS_REGION = os.environ.get('AWS_REGION', 'us-east-1')
+AWS_REGION = os.environ.get('AWS_REGION', 'eu-north-1')
 
 FILLER_WORDS = [
 # ... (FILLER_WORDS list remains the same) ...
