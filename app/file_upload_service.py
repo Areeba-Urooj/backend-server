@@ -12,7 +12,7 @@ from . import models
 # --- AWS S3 Configuration ---
 # 💡 NEW: Get S3 config from environment variables
 S3_BUCKET_NAME = os.environ.get('S3_BUCKET_NAME')
-AWS_REGION = os.environ.get('AWS_REGION', 'us-east-1')
+AWS_REGION = os.environ.get('AWS_REGION', 'eu-north-1')
 
 # ❌ REMOVED: Local directory management is no longer needed
 # UPLOAD_DIR = "uploads" 
@@ -84,4 +84,5 @@ async def save_audio_file(file: UploadFile) -> models.UploadResponse:
         content_type=file.content_type or "application/octet-stream",
         upload_time=datetime.utcnow().isoformat()
     )
+
 
