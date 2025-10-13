@@ -15,7 +15,7 @@ S3_BUCKET_NAME = os.environ.get('S3_BUCKET_NAME')
 AWS_REGION = os.environ.get('AWS_REGION', 'us-east-1')
 
 # ❌ REMOVED: Local directory management is no longer needed
-# UPLOAD_DIR = "uploads" 
+# UPLOAD_DIR = "uploads" 
 # os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
@@ -30,20 +30,20 @@ def get_s3_client():
 
 
 async def save_audio_file(file: UploadFile) -> models.UploadResponse:
-    """
-    Uploads the audio file directly to AWS S3 and returns an UploadResponse with the S3 Key.
-    """
+    """
+    Uploads the audio file directly to AWS S3 and returns an UploadResponse with the S3 Key.
+    """
     s3_client = get_s3_client()
     
-    # 1. Generate a unique ID (This is the critical 'S3 Key')
+    # 1. Generate a unique ID (This is the critical 'S3 Key')
     # Use UUID to ensure keys don't clash, and keep the original file extension
-    file_id = str(uuid.uuid4())
+    file_id = str(uuid.uuid4())
     file_extension = os.path.splitext(file.filename)[1]
     # 💡 NEW: The S3 Key defines the path inside the bucket, e.g., 'uploads/a7b1c2d3.m4a'
     s3_key = f"uploads/{file_id}{file_extension}" 
-    
-    # 2. UPLOAD the file object directly to S3
-    try:
+    
+    # 2. UPLOAD the file object directly to S3
+    try:
         # file.file is a file-like object that boto3 can read from
         # file.read() is awaited in your original code, which is fine, but upload_fileobj is better
         # as it uses the file-like object directly without reading the whole thing into memory first
@@ -64,23 +64,24 @@ async def save_audio_file(file: UploadFile) -> models.UploadResponse:
             Bucket=S3_BUCKET_NAME,
             Key=s3_key
         )
-        
+        
     except ClientError as e:
         logger.error(f"[S3_SERVICE] ❌ S3 Upload failed for key {s3_key}: {e}")
         # Re-raise the exception to be caught in main.py
         raise e
-    except Exception as e:
+    except Exception as e:
         logger.error(f"[S3_SERVICE] ❌ Unknown error during upload: {e}")
-        # Re-raise the exception to be caught in main.py
-        raise e 
-        
-    # 3. Return the response model
-    return models.UploadResponse(
-        status="success",
-        # 💡 CRITICAL: The file_id is now the S3 Key
-        file_id=s3_key, 
-        file_name=file.filename, 
-        file_size=file_size,
-        content_type=file.content_type or "application/octet-stream",
-        upload_time=datetime.utcnow().isoformat()
-    )
+        # Re-raise the exception to be caught in main.py
+        raise e 
+        
+    # 3. Return the response model
+    return models.UploadResponse(
+        status="success",
+        # 💡 CRITICAL: The file_id is now the S3 Key
+        file_id=s3_key, 
+        file_name=file.filename, 
+        file_size=file_size,
+        content_type=file.content_type or "application/octet-stream",
+        upload_time=datetime.utcnow().isoformat()
+    )
+
