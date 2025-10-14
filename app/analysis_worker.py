@@ -47,9 +47,6 @@ except ValueError as e:
     raise
 
 # Initialize emotion classification model
-# emotion_scaler is returned but not used directly in this worker logic, 
-# relying on classify_emotion to handle any necessary scaling internally or 
-# assuming simple unscaled features for now.
 try:
     emotion_model, _, model_created = initialize_emotion_model()
     if model_created:
@@ -58,8 +55,6 @@ try:
         logger.info("[WORKER] ✅ Loaded existing emotion classification model from disk.")
 except Exception as e:
     logger.error(f"[WORKER] ❌ CRITICAL: Error initializing emotion model: {e}", exc_info=True)
-    # Re-raise or let the worker fail if model is critical.
-    # For now, we continue but use a robust fallback in classify_emotion.
 
 # --- Core Analysis Function (No changes needed) ---
 def perform_analysis_job(
@@ -76,7 +71,8 @@ def perform_analysis_job(
     if user_id:
         logger.info(f"User ID: {user_id}")
 
-    temp_audio_file = f"/tmp/{file_id}_{os.path.basename(s3_key)}"
+    # FIX: Use a secure, standardized location for temp files on Render
+    temp_audio_file = f"/tmp/{file_id}_{os.path.basename(s3_key)}" 
     duration_seconds = 0
     total_words = len(transcript.split())
 
@@ -150,21 +146,25 @@ def perform_analysis_job(
         if not recommendations:
             recommendations = ["Excellent speech clarity and delivery!"]
 
-        # 3. Compile Results to match AnalysisResult Pydantic model
+        # 3. Compile Results to match AnalysisResult Pydantic model (FLAT STRUCTURE)
         analysis_result = {
             "confidence_score": confidence_score,
-            "speaking_pace": int(round(speaking_pace_wpm)),
+            "speaking_pace": int(round(speaking_pace_wpm)), # Mapped to Pydantic
             "filler_word_count": filler_word_count,
             "repetition_count": repetition_count,
             "long_pause_count": float(long_pause_count),
             "silence_ratio": round(silence_ratio, 2),
-            "avg_amplitude": round(np.mean(rms), 4),
+            "avg_amplitude": round(np.mean(rms), 4), # Mapped to Pydantic (avg_amplitude)
             "pitch_mean": round(pitch_mean, 1),
             "pitch_std": round(pitch_std, 1),
             "emotion": emotion,
-            "energy_std": round(np.std(rms), 4),
+            "energy_std": round(np.std(rms), 4), # Mapped to Pydantic
             "recommendations": recommendations,
             "transcript": transcript,
+            # Add total_words for the client to use
+            "total_words": total_words, 
+            # Add duration_seconds as well
+            "duration_seconds": round(duration_seconds, 2)
         }
 
         logger.info("✅ Analysis complete.")
@@ -197,7 +197,6 @@ if __name__ == '__main__':
         redis_conn.ping()
         logger.info("Redis connection established.")
         
-        # The FIX was applied in the Render start command: 'python -m app.analysis_worker'
         worker = Worker(['default'], connection=redis_conn)
         worker.work()
 
