@@ -23,3 +23,7 @@ numba
 llvmlite
 decorator
 joblib
+
+# --- FIX: Add AWS S3 Dependencies ---
+boto3
+botocore
