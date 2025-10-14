@@ -1,11 +1,12 @@
 # app/analysis_worker.py
 
 import os
+# ----------------------------------------------------------------------
 # --- CRITICAL FIX: DISABLE NUMBA JIT TO PREVENT CRASHES IN CONTAINER ENVIRONMENTS ---
 os.environ['NUMBA_DISABLE_JIT'] = '1'
-# Also enforce native decoding to bypass other potential audio library crashes
+# Also enforce native decoding to bypass other potential audio library crashes in librosa
 os.environ['LIBROSA_USE_NATIVE_MPG123'] = '1'
-# -----------------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 
 import logging
 from typing import Dict, Any, Optional
