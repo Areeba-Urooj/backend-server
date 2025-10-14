@@ -22,6 +22,9 @@ from pydantic import BaseModel
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import analysis_worker  # Worker module is now correctly imported
 
+# Import models
+from app.models import AnalysisStatusResponse, AnalysisResult
+
 # --- Configuration ---
 S3_BUCKET_NAME = os.environ.get('S3_BUCKET_NAME')
 AWS_REGION = os.environ.get('AWS_REGION', 'eu-north-1') 
@@ -189,30 +192,56 @@ async def submit_analysis_job(
             detail=f"Failed to submit analysis job: {str(e)}"
         )
 
-@app.get("/api/v1/analysis/status/{job_id}")
-def get_job_status(job_id: str):
+@app.get("/api/v1/analysis/status/{job_id}", response_model=AnalysisStatusResponse)
+def get_analysis_status(job_id: str):
     """Retrieves the status and result of an RQ job."""
     if not redis_conn:
         raise HTTPException(status_code=503, detail="RQ/Redis service is unavailable.")
         
     try:
+        # Fetch the job from Redis
         job = Job.fetch(job_id, connection=redis_conn)
         status = job.get_status()
         
-        result_data: Dict[str, Any] = {
-            "job_id": job_id,
-            "status": status,
-            "enqueued_at": job.enqueued_at.isoformat() if job.enqueued_at else None,
-            "started_at": job.started_at.isoformat() if job.started_at else None,
-        }
+        # Create the base response
+        response_data = AnalysisStatusResponse(
+            job_id=job_id,
+            status=status,
+            enqueued_at=job.enqueued_at.isoformat() if job.enqueued_at else None,
+            started_at=job.started_at.isoformat() if job.started_at else None,
+        )
 
+        # If job is finished, retrieve and validate the result
         if status == 'finished':
-            result_data["result"] = job.result 
-            result_data["ended_at"] = job.ended_at.isoformat() if job.ended_at else None
-        elif status == 'failed':
-            result_data["error"] = job.exc_info
+            response_data.ended_at = job.ended_at.isoformat() if job.ended_at else None
             
-        return JSONResponse(content=result_data)
+            # Get the result from the job
+            job_result = job.result
+            
+            # Transform the worker result to match the AnalysisResult model
+            if job_result and isinstance(job_result, dict):
+                # Map the worker's result structure to the AnalysisResult model
+                analysis_result = AnalysisResult(
+                    confidence_score=job_result.get('confidence_score', 0.0),
+                    speaking_pace=int(job_result.get('audio_features', {}).get('speaking_pace_wpm', 0)),
+                    filler_word_count=job_result.get('filler_word_analysis', {}).get('filler_word_count', 0),
+                    repetition_count=job_result.get('repetition_count', 0),
+                    long_pause_count=float(job_result.get('long_pause_count', 0)),
+                    silence_ratio=float(job_result.get('audio_features', {}).get('silence_ratio', 0)),
+                    avg_amplitude=float(job_result.get('audio_features', {}).get('rms_mean', 0)),
+                    pitch_mean=float(job_result.get('audio_features', {}).get('pitch_mean', 0)),
+                    pitch_std=float(job_result.get('audio_features', {}).get('pitch_std', 0)),
+                    emotion=job_result.get('emotion', 'neutral'),
+                    energy_std=float(job_result.get('audio_features', {}).get('rms_std', 0)),
+                    recommendations=job_result.get('recommendations', []),
+                    transcript=job_result.get('transcript', '')
+                )
+                response_data.result = analysis_result
+                
+        elif status == 'failed':
+            response_data.error = job.exc_info
+            
+        return response_data
         
     except redis.exceptions.ConnectionError:
         raise HTTPException(status_code=500, detail="Could not connect to Redis.")
