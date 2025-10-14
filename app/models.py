@@ -17,12 +17,28 @@ class SubmissionResponse(BaseModel):
     job_id: str
     message: str
 
-# --- 3. Analysis Status/Result Model (Output) ---
+# --- 3. Analysis Result Model ---
+class AnalysisResult(BaseModel):
+    confidence_score: float
+    speaking_pace: int
+    filler_word_count: int
+    repetition_count: int
+    long_pause_count: float
+    silence_ratio: float
+    avg_amplitude: float
+    pitch_mean: float
+    pitch_std: float
+    emotion: str
+    energy_std: float
+    recommendations: List[str]
+    transcript: str
+
+# --- 4. Analysis Status/Result Model (Output) ---
 class AnalysisStatusResponse(BaseModel):
     job_id: str
     status: str = Field(..., description="Job status: 'queued', 'started', 'finished', or 'failed'.")
     enqueued_at: Optional[str] = None
     started_at: Optional[str] = None
     ended_at: Optional[str] = None
-    result: Optional[Dict[str, Any]] = None
+    result: Optional[AnalysisResult] = None
     error: Optional[str] = None
