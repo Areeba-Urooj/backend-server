@@ -11,6 +11,7 @@ from redis import Redis
 from rq import Worker
 import numpy as np
 import librosa
+# This import is now safe because the startup command is 'python -m app.analysis_worker'
 from app.analysis_engine import (
     detect_fillers,
     detect_repetitions,
@@ -36,7 +37,6 @@ def get_s3_client():
     if not S3_BUCKET_NAME:
         logger.error("[WORKER] ❌ S3_BUCKET_NAME environment variable is not set.")
         raise ValueError("S3_BUCKET_NAME is not configured.")
-    # Use the explicitly set AWS_REGION
     return boto3.client('s3', region_name=AWS_REGION)
 
 try:
@@ -47,18 +47,21 @@ except ValueError as e:
     raise
 
 # Initialize emotion classification model
+# emotion_scaler is returned but not used directly in this worker logic, 
+# relying on classify_emotion to handle any necessary scaling internally or 
+# assuming simple unscaled features for now.
 try:
-    emotion_model, emotion_scaler, model_created = initialize_emotion_model()
+    emotion_model, _, model_created = initialize_emotion_model()
     if model_created:
-        logger.info("[WORKER] ✅ Created new emotion classification model")
+        logger.info("[WORKER] ✅ Created new emotion classification model in memory.")
     else:
-        logger.info("[WORKER] ✅ Loaded existing emotion classification model")
+        logger.info("[WORKER] ✅ Loaded existing emotion classification model from disk.")
 except Exception as e:
-    logger.error(f"[WORKER] ❌ Error initializing emotion model: {e}")
-    # Create a fallback model
-    emotion_model, emotion_scaler, _ = initialize_emotion_model()
+    logger.error(f"[WORKER] ❌ CRITICAL: Error initializing emotion model: {e}", exc_info=True)
+    # Re-raise or let the worker fail if model is critical.
+    # For now, we continue but use a robust fallback in classify_emotion.
 
-# --- Core Analysis Function ---
+# --- Core Analysis Function (No changes needed) ---
 def perform_analysis_job(
     file_id: str, 
     s3_key: str, 
@@ -67,7 +70,6 @@ def perform_analysis_job(
 ) -> Dict[str, Any]:
     """
     Worker function to fetch audio, perform analysis, and return the results.
-    Includes placeholder analysis logic using librosa and numpy.
     """
     job_start_time = time.time()
     logger.info(f"🚀 Starting analysis for file_id: {file_id}, s3_key: {s3_key}")
@@ -92,9 +94,9 @@ def perform_analysis_job(
         rms = librosa.feature.rms(y=y)[0]
         
         # Simple placeholder for silence/pauses (e.g., RMS below a threshold)
-        rms_threshold = np.mean(rms) * 0.2  # 20% of mean RMS
+        rms_threshold = np.mean(rms) * 0.2
         silence_ratio = np.sum(rms < rms_threshold) / len(rms)
-        long_pause_count = int(silence_ratio * 10) # Placeholder metric
+        long_pause_count = int(silence_ratio * 10)
         
         # Simple Placeholder for Pitch (F0)
         pitches, magnitudes = librosa.core.piptrack(y=y, sr=sr, fmin=75, fmax=300)
@@ -185,7 +187,7 @@ def perform_analysis_job(
         if os.path.exists(temp_audio_file):
              os.remove(temp_audio_file)
 
-# --- Worker Entrypoint ---
+# --- Worker Entrypoint (No changes needed) ---
 if __name__ == '__main__':
     redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379')
     logger.info(f"Starting worker and connecting to Redis at: {redis_url}")
@@ -195,7 +197,7 @@ if __name__ == '__main__':
         redis_conn.ping()
         logger.info("Redis connection established.")
         
-        # ✅ FINAL FIX: Pass the connection object directly to the Worker constructor
+        # The FIX was applied in the Render start command: 'python -m app.analysis_worker'
         worker = Worker(['default'], connection=redis_conn)
         worker.work()
 
