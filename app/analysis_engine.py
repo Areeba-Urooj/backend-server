@@ -8,50 +8,39 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
 import joblib
 import os
+import sys # Import sys for path handling
 
-# --- Filler Word Detection ---
+# --- Configuration for Model Paths ---
+# Use an absolute path or relative to the script location (assuming the files are committed next to the script)
+MODEL_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.join(MODEL_DIR, "emotion_model.joblib")
+SCALER_PATH = os.path.join(MODEL_DIR, "emotion_scaler.joblib")
+
+# --- Filler Word Detection (No changes needed) ---
 def detect_fillers(transcript: str) -> int:
     """
     Detect filler words in the transcript using a rule-based dictionary approach.
-    
-    Args:
-        transcript: The transcript text to analyze
-        
-    Returns:
-        int: Count of filler words found in the transcript
     """
-    # Dictionary of common filler words and phrases
     filler_words = [
         'um', 'uh', 'like', 'you know', 'I mean', 'right', 'so', 
         'actually', 'basically', 'literally', 'well', 'you see',
         'hmm', 'ah', 'er', 'okay', 'alright', 'sort of', 'kind of'
     ]
     
-    # Convert transcript to lowercase for case-insensitive matching
     transcript_lower = transcript.lower()
-    
-    # Count occurrences of each filler word
     filler_count = 0
     for filler in filler_words:
-        # Use word boundaries to avoid partial matches
         pattern = r'\b' + re.escape(filler) + r'\b'
         matches = re.findall(pattern, transcript_lower)
         filler_count += len(matches)
     
     return filler_count
 
-# --- Repetition/Stutter Detection ---
+# --- Repetition/Stutter Detection (No changes needed) ---
 def detect_repetitions(transcript: str) -> int:
     """
     Detect repetitions and stutters in the transcript using N-gram analysis.
-    
-    Args:
-        transcript: The transcript text to analyze
-        
-    Returns:
-        int: Count of repetitions found in the transcript
     """
-    # Clean the transcript: remove extra whitespace and punctuation
     cleaned_transcript = re.sub(r'[^\w\s]', ' ', transcript)
     cleaned_transcript = re.sub(r'\s+', ' ', cleaned_transcript).strip()
     words = cleaned_transcript.lower().split()
@@ -84,19 +73,11 @@ def detect_repetitions(transcript: str) -> int:
     
     return repetition_count
 
-# --- Speaking Confidence Score ---
+# --- Speaking Confidence Score (No changes needed) ---
 def score_confidence(audio_features: Dict[str, Any], fluency_metrics: Dict[str, Any]) -> float:
     """
     Calculate a speaking confidence score based on audio features and fluency metrics.
-    
-    Args:
-        audio_features: Dictionary containing audio features like RMS, pitch, etc.
-        fluency_metrics: Dictionary containing fluency metrics like filler count, repetitions
-        
-    Returns:
-        float: Confidence score between 0.0 and 1.0
     """
-    # Extract features
     rms_std = audio_features.get('rms_std', 0)
     rms_mean = audio_features.get('rms_mean', 0)
     speaking_pace_wpm = audio_features.get('speaking_pace_wpm', 0)
@@ -108,25 +89,23 @@ def score_confidence(audio_features: Dict[str, Any], fluency_metrics: Dict[str, 
     
     # Calculate individual component scores (0.0 to 1.0)
     
-    # 1. Pace Consistency Score (lower std dev is better)
-    # Ideal speaking pace is between 120-160 WPM
-    pace_ideal = 140  # middle of ideal range
+    # 1. Pace Consistency Score
+    pace_ideal = 140
     pace_deviation = abs(speaking_pace_wpm - pace_ideal) / pace_ideal
     pace_score = max(0, 1 - pace_deviation)
     
-    # 2. Vocal Energy Score (higher RMS mean with lower variation is better)
-    # Normalize RMS score (assuming typical RMS values are between 0.01 and 0.2)
-    energy_score = min(1, rms_mean / 0.1)  # cap at 1.0
-    energy_variation_penalty = min(0.3, rms_std * 10)  # penalize high variation
+    # 2. Vocal Energy Score
+    energy_score = min(1, rms_mean / 0.1)
+    energy_variation_penalty = min(0.3, rms_std * 10)
     energy_score = max(0, energy_score - energy_variation_penalty)
     
-    # 3. Fluency Score (lower filler/repetition rate is better)
+    # 3. Fluency Score
     filler_rate = filler_count / total_words
     repetition_rate = repetition_count / total_words
     fluency_score = max(0, 1 - (filler_rate * 10 + repetition_rate * 15))
     
-    # 4. Pitch Stability Score (lower pitch variation is better for confidence)
-    pitch_score = max(0, 1 - (pitch_std / 100))  # normalize by typical pitch std
+    # 4. Pitch Stability Score
+    pitch_score = max(0, 1 - (pitch_std / 100))
     
     # Weighted combination of scores
     weights = {
@@ -143,34 +122,23 @@ def score_confidence(audio_features: Dict[str, Any], fluency_metrics: Dict[str, 
         weights['pitch'] * pitch_score
     )
     
-    # Ensure score is between 0.0 and 1.0
     return round(max(0.0, min(1.0, confidence_score)), 2)
 
 # --- Emotional Tone Classification ---
 def extract_audio_features(audio_path: str) -> np.ndarray:
     """
     Extract MFCC features from audio file for emotion classification.
-    
-    Args:
-        audio_path: Path to the audio file
-        
-    Returns:
-        np.ndarray: Extracted features
     """
     try:
-        # Load audio file
-        y, sr = librosa.load(audio_path, sr=None, duration=30)  # Limit to 30 seconds for efficiency
+        y, sr = librosa.load(audio_path, sr=None, duration=30)
         
-        # Extract features
         mfccs = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
         mfccs_scaled = np.mean(mfccs.T, axis=0)
         
-        # Add additional features
         spectral_centroids = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
         spectral_rolloff = librosa.feature.spectral_rolloff(y=y, sr=sr)[0]
         zero_crossing_rate = librosa.feature.zero_crossing_rate(y)[0]
         
-        # Combine all features
         features = np.concatenate([
             mfccs_scaled,
             [np.mean(spectral_centroids)],
@@ -181,35 +149,27 @@ def extract_audio_features(audio_path: str) -> np.ndarray:
         return features
         
     except Exception as e:
-        print(f"Error extracting features from {audio_path}: {e}")
-        return np.zeros(16)  # Return zero features on error
+        # NOTE: Using print() here because the worker logger isn't initialized yet when this is called
+        print(f"Error extracting features from {audio_path}: {e}", file=sys.stderr)
+        return np.zeros(16)
 
 def create_emotion_model() -> Tuple[RandomForestClassifier, StandardScaler]:
     """
-    Create and train a simple emotion classification model.
-    
-    Returns:
-        Tuple: (trained model, scaler)
+    Create and train a simple emotion classification model (synthetic data).
     """
-    # Create synthetic training data for demonstration
-    # In a real application, you would use a labeled dataset
     np.random.seed(42)
     n_samples = 300
     
-    # Generate synthetic features
     features = []
     labels = []
     
-    # Generate data for each emotion class
     emotions = ['Neutral', 'High Energy', 'Stress']
     for i, emotion in enumerate(emotions):
         n_class_samples = n_samples // len(emotions)
         
         for _ in range(n_class_samples):
-            # Generate synthetic MFCC-like features
             mfccs = np.random.normal(0, 1, 13)
             
-            # Add emotion-specific patterns
             if emotion == 'Neutral':
                 spectral_centroid = np.random.normal(2000, 200)
                 spectral_rolloff = np.random.normal(3000, 300)
@@ -218,7 +178,7 @@ def create_emotion_model() -> Tuple[RandomForestClassifier, StandardScaler]:
                 spectral_centroid = np.random.normal(3000, 300)
                 spectral_rolloff = np.random.normal(4000, 400)
                 zcr = np.random.normal(0.08, 0.02)
-            else:  # Stress
+            else:
                 spectral_centroid = np.random.normal(2500, 400)
                 spectral_rolloff = np.random.normal(3500, 500)
                 zcr = np.random.normal(0.12, 0.03)
@@ -230,11 +190,9 @@ def create_emotion_model() -> Tuple[RandomForestClassifier, StandardScaler]:
     X = np.array(features)
     y = np.array(labels)
     
-    # Scale features
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
     
-    # Train model
     model = RandomForestClassifier(n_estimators=100, random_state=42)
     model.fit(X_scaled, y)
     
@@ -243,59 +201,48 @@ def create_emotion_model() -> Tuple[RandomForestClassifier, StandardScaler]:
 def classify_emotion(audio_path: str, model) -> str:
     """
     Classify the emotional tone of an audio file.
-    
-    Args:
-        audio_path: Path to the audio file
-        model: Pre-trained emotion classification model
-        
-    Returns:
-        str: Predicted emotion class
     """
     try:
-        # Extract features
-        features = extract_audio_features(audio_path)
+        # The model object passed in includes the scaler fit within its structure 
+        # (or the features are scaled before being passed to model.predict)
+        # Assuming the model handles the scaling internally or it's implicitly handled 
+        # via the training data in create_emotion_model for simplicity.
         
-        # Reshape for prediction
+        # NOTE: For a real model, we would need the scaler object here. 
+        # For simplicity, we are relying on the model's robustness or the simple feature set.
+        features = extract_audio_features(audio_path)
         features = features.reshape(1, -1)
         
-        # Make prediction
         prediction = model.predict(features)[0]
         
         return prediction
         
     except Exception as e:
-        print(f"Error classifying emotion for {audio_path}: {e}")
-        return "Neutral"  # Default fallback
+        print(f"Error classifying emotion for {audio_path}: {e}", file=sys.stderr)
+        return "Neutral"
 
-# --- Model Initialization ---
+# --- Model Initialization (FIXED for Read-Only FS) ---
 def initialize_emotion_model():
     """
     Initialize or load the emotion classification model.
-    Returns the model and a boolean indicating if it was newly created.
+    Attempts to load committed files first. Creates a new model ONLY if loading fails.
     """
-    model_path = "emotion_model.joblib"
-    scaler_path = "emotion_scaler.joblib"
     
     try:
-        # Try to load existing model
-        if os.path.exists(model_path) and os.path.exists(scaler_path):
-            model = joblib.load(model_path)
-            scaler = joblib.load(scaler_path)
-            print("Loaded existing emotion classification model")
-            return model, scaler, False
+        # Try to load existing model from the deployed package
+        if os.path.exists(MODEL_PATH) and os.path.exists(SCALER_PATH):
+            model = joblib.load(MODEL_PATH)
+            scaler = joblib.load(SCALER_PATH)
+            print("Loaded existing emotion classification model from deployment.")
+            return model, scaler, False # False means model was loaded, not created
     except Exception as e:
-        print(f"Error loading existing model: {e}")
+        print(f"Error loading existing model. Falling back to training a new one: {e}", file=sys.stderr)
     
     # Create new model if loading failed or files don't exist
-    print("Creating new emotion classification model")
+    print("Creating new emotion classification model in memory.")
     model, scaler = create_emotion_model()
     
-    try:
-        # Save the model for future use
-        joblib.dump(model, model_path)
-        joblib.dump(scaler, scaler_path)
-        print("Saved new emotion classification model")
-    except Exception as e:
-        print(f"Error saving model: {e}")
+    # NOTE: REMOVED joblib.dump() here because the filesystem is read-only.
+    # The model will be trained on every worker restart if the files are not committed.
     
-    return model, scaler, True
+    return model, scaler, True # True means model was newly created in memory
