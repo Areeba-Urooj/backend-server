@@ -8,9 +8,16 @@ import time
 import boto3
 from botocore.exceptions import ClientError
 from redis import Redis
-from rq import Worker 
+from rq import Worker
 import numpy as np
 import librosa
+from app.analysis_engine import (
+    detect_fillers,
+    detect_repetitions,
+    score_confidence,
+    classify_emotion,
+    initialize_emotion_model
+)
 
 # --- Configuration ---
 S3_BUCKET_NAME = os.environ.get('S3_BUCKET_NAME')
@@ -38,6 +45,18 @@ try:
 except ValueError as e:
     logger.error(f"[WORKER] ❌ Configuration Error: {e}")
     raise
+
+# Initialize emotion classification model
+try:
+    emotion_model, emotion_scaler, model_created = initialize_emotion_model()
+    if model_created:
+        logger.info("[WORKER] ✅ Created new emotion classification model")
+    else:
+        logger.info("[WORKER] ✅ Loaded existing emotion classification model")
+except Exception as e:
+    logger.error(f"[WORKER] ❌ Error initializing emotion model: {e}")
+    # Create a fallback model
+    emotion_model, emotion_scaler, _ = initialize_emotion_model()
 
 # --- Core Analysis Function ---
 def perform_analysis_job(
@@ -86,31 +105,63 @@ def perform_analysis_job(
         # Speaking Pace (words per minute)
         speaking_pace_wpm = (total_words / max(1, duration_seconds)) * 60
 
-        # Placeholder for filler words and repetitions (requires NLP/transcript processing)
-        filler_word_count = transcript.lower().count('um') + transcript.lower().count('uh')
-        repetition_count = 2 # Hardcoded placeholder
-
-        # 3. Compile Results
-        analysis_result = {
-            "duration_seconds": round(duration_seconds, 2),
-            "total_words": total_words,
+        # Use new analysis engine functions
+        filler_word_count = detect_fillers(transcript)
+        repetition_count = detect_repetitions(transcript)
+        
+        # Prepare audio features for confidence scoring
+        audio_features = {
+            "rms_mean": np.mean(rms),
+            "rms_std": np.std(rms),
+            "speaking_pace_wpm": speaking_pace_wpm,
+            "pitch_std": pitch_std
+        }
+        
+        # Prepare fluency metrics for confidence scoring
+        fluency_metrics = {
+            "filler_word_count": filler_word_count,
             "repetition_count": repetition_count,
-            "long_pause_count": long_pause_count,
-            "confidence_score": round(np.random.uniform(0.9, 0.99), 2), # Random confidence
-            "emotion": "calm", # Hardcoded placeholder
-            "recommendations": ["Ensure clear articulation.", "Try to reduce filler words."] if filler_word_count > 0 else ["Excellent pace and clarity."],
-            "audio_features": {
-                "rms_mean": round(np.mean(rms), 4),
-                "rms_std": round(np.std(rms), 4),
-                "silence_ratio": round(silence_ratio, 2),
-                "speaking_pace_wpm": round(speaking_pace_wpm, 1),
-                "pitch_mean": round(pitch_mean, 1),
-                "pitch_std": round(pitch_std, 1),
-            },
-            "filler_word_analysis": {
-                "filler_word_count": filler_word_count,
-                "filler_word_rate": round(filler_word_count / total_words, 3) if total_words > 0 else 0,
-            },
+            "total_words": total_words
+        }
+        
+        # Calculate confidence score using new algorithm
+        confidence_score = score_confidence(audio_features, fluency_metrics)
+        
+        # Classify emotion using the ML model
+        emotion = classify_emotion(temp_audio_file, emotion_model)
+        
+        # Generate recommendations based on analysis
+        recommendations = []
+        if filler_word_count > 0:
+            recommendations.append(f"Try to reduce filler words (detected: {filler_word_count}).")
+        if repetition_count > 0:
+            recommendations.append(f"Work on avoiding repetitions (detected: {repetition_count}).")
+        if speaking_pace_wpm < 120:
+            recommendations.append("Consider speaking a bit faster to maintain engagement.")
+        elif speaking_pace_wpm > 160:
+            recommendations.append("Try to slow down your speaking pace for better clarity.")
+        if silence_ratio > 0.3:
+            recommendations.append("Reduce long pauses for better flow.")
+        if confidence_score < 0.7:
+            recommendations.append("Work on vocal consistency and energy to improve confidence.")
+        
+        if not recommendations:
+            recommendations = ["Excellent speech clarity and delivery!"]
+
+        # 3. Compile Results to match AnalysisResult Pydantic model
+        analysis_result = {
+            "confidence_score": confidence_score,
+            "speaking_pace": int(round(speaking_pace_wpm)),
+            "filler_word_count": filler_word_count,
+            "repetition_count": repetition_count,
+            "long_pause_count": float(long_pause_count),
+            "silence_ratio": round(silence_ratio, 2),
+            "avg_amplitude": round(np.mean(rms), 4),
+            "pitch_mean": round(pitch_mean, 1),
+            "pitch_std": round(pitch_std, 1),
+            "emotion": emotion,
+            "energy_std": round(np.std(rms), 4),
+            "recommendations": recommendations,
             "transcript": transcript,
         }
 
