@@ -1,2 +1,3 @@
 # apt.txt
 ffmpeg
+libsndfile1
