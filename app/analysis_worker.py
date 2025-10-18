@@ -17,7 +17,12 @@ from botocore.exceptions import ClientError
 from redis import Redis
 from rq import Worker
 import numpy as np
-import librosa
+# ------------------ DEBUG START ------------------
+import audioread
+# Note: librosa will use audioread which tries soundfile, ffmpeg, then mpg123
+# We ensure ffmpeg is installed via apt.txt. libsndfile is now added to apt.txt as well.
+# ------------------ DEBUG END --------------------
+import librosa 
 # This import is now safe because the startup command is 'python -m app.analysis_worker'
 from app.analysis_engine import (
     detect_fillers,
@@ -253,7 +258,8 @@ def perform_analysis_job(
         raise
     finally:
         # Final cleanup attempt
-        if os.path.exists(temp_audio_file):
+        # Ensure temp_audio_file exists before trying to access it in finally block
+        if 'temp_audio_file' in locals() and os.path.exists(temp_audio_file):
              os.remove(temp_audio_file)
 
 # --- Worker Entrypoint (No changes needed) ---
