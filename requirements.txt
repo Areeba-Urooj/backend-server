@@ -1,4 +1,3 @@
-# Core FastAPI dependencies
 fastapi==0.115.0
 uvicorn[standard]==0.32.0
 python-multipart==0.0.20
@@ -16,12 +15,12 @@ soundfile==0.12.1
 audioread==3.0.1
 
 # Scientific stack - PINNED TO FORCE WHEEL USAGE
-# NumPy and SciPy 1.26/1.12 are often built with modern, accessible wheels.
+# The versions below are compatible with Python 3.13.4
 numpy>=2.3.4
 scipy>=1.13.0
 scikit-learn>=1.5.0
-numba==0.59.1
-llvmlite==0.42.0
+numba>=0.63.0
+llvmlite>=0.40.1
 
 # Dependencies of the pinned libraries (kept for explicit clarity)
 decorator==5.1.1
@@ -32,6 +31,4 @@ boto3==1.34.137
 botocore==1.34.137
 jmespath==1.0.1
 s3transfer==0.10.1
-scipy --only-binary :all:
-
 
