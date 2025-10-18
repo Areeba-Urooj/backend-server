@@ -75,33 +75,45 @@ def perform_analysis_job(
     """
     Worker function to fetch audio, perform analysis, and return the results.
     """
-    job_start_time = time.time()
-    logger.info(f"🚀 Starting analysis for file_id: {file_id}, s3_key: {s3_key}")
-    if user_id:
-        logger.info(f"User ID: {user_id}")
+    
+    # CRITICAL DEBUG LOG 1: The absolute first line of execution
+    logger.info(f"****** DEBUG LOG: Job {file_id} FUNCTION ENTRY POINT REACHED ******") 
 
     temp_audio_file = f"/tmp/{file_id}_{os.path.basename(s3_key)}" 
-    y, sr = None, None
-    duration_seconds = 0
-    total_words = len(transcript.split())
     
-    # Default metrics in case of audio processing failure
-    default_metrics = {
-        "rms_mean": 0.0, "rms_std": 0.0, "silence_ratio": 1.0, 
-        "pitch_mean": 0.0, "pitch_std": 0.0, "speaking_pace_wpm": 0.0,
-        "emotion": "calm"
-    }
-
     try:
-        # 1. Download the file from S3
-        logger.info(f"⬇️ Downloading s3://{S3_BUCKET_NAME}/{s3_key} to {temp_audio_file}")
-        s3_client.download_file(S3_BUCKET_NAME, s3_key, temp_audio_file)
-        logger.info("✅ Download complete.")
+        job_start_time = time.time()
+        logger.info(f"🚀 Starting analysis for file_id: {file_id}, s3_key: {s3_key}")
+        if user_id:
+            logger.info(f"User ID: {user_id}")
+
+        y, sr = None, None
+        duration_seconds = 0
+        total_words = len(transcript.split())
         
-        # 2. Perform Audio Analysis using librosa
+        # Default metrics in case of audio processing failure
+        default_metrics = {
+            "rms_mean": 0.0, "rms_std": 0.0, "silence_ratio": 1.0, 
+            "pitch_mean": 0.0, "pitch_std": 0.0, "speaking_pace_wpm": 0.0,
+            "emotion": "calm"
+        }
+
         try:
+            # 1. Download the file from S3
+            logger.info(f"⬇️ Downloading s3://{S3_BUCKET_NAME}/{s3_key} to {temp_audio_file}")
+            s3_client.download_file(S3_BUCKET_NAME, s3_key, temp_audio_file)
+            logger.info("✅ Download complete.")
+            
+            # CRITICAL DEBUG LOG 2: Immediately before librosa.load()
+            logger.info("****** DEBUG LOG: Attempting librosa.load() ******")
+
+            # 2. Perform Audio Analysis using librosa
             # Load the audio file (sr=None to use native sample rate)
             y, sr = librosa.load(temp_audio_file, sr=None)
+            
+            # CRITICAL DEBUG LOG 3: Immediately after librosa.load()
+            logger.info("****** DEBUG LOG: librosa.load() SUCCESSFUL ******")
+
             duration_seconds = librosa.get_duration(y=y, sr=sr)
             
             if duration_seconds < 0.5:
@@ -235,9 +247,9 @@ def perform_analysis_job(
         logger.error(f"❌ S3 Error during worker processing: {e}", exc_info=True)
         raise # Re-raise S3 errors
     except Exception as e:
-        logger.error(f"❌ CRITICAL Analysis Error: {e}", exc_info=True)
-        # If a CRITICAL error occurs (e.g., permission issue, major corruption)
-        # The job fails, but we ensure cleanup.
+        # CRITICAL DEBUG LOG 3: Catch-all for any functional error
+        logger.error(f"❌ CRITICAL Analysis Error - TOP LEVEL CATCH: {e}", exc_info=True)
+        # If a CRITICAL error occurs, the job will fail and be marked as such by RQ
         raise
     finally:
         # Final cleanup attempt
