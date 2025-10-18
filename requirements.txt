@@ -10,14 +10,13 @@ loguru==0.7.3
 redis==5.2.0
 rq==2.3.0
 
-# Audio processing - Pinning librosa to a known version for stability
-# The issue is likely in numba/llvmlite, but pinning librosa helps lock the stack.
+# Audio processing - Pinning for compatibility
 librosa==0.10.1
 soundfile==0.12.1
 audioread==3.0.1
 
-# Scientific stack - PINNED FOR PYTHON 3.11/LIBROSA COMPATIBILITY
-# These specific pins resolve the numba/llvmlite/librosa runtime errors.
+# Scientific stack - PINNED TO FORCE WHEEL USAGE
+# NumPy and SciPy 1.26/1.12 are often built with modern, accessible wheels.
 numpy==1.26.4
 scipy==1.12.0
 scikit-learn==1.4.1
