@@ -168,8 +168,10 @@ async def submit_analysis_job(
 
     try:
         # Enqueue the analysis job, passing the full S3 key
+        # 🚨 FIX: We explicitly use the fully qualified path string 
+        # 'app.analysis_worker.perform_analysis_job' to ensure the worker finds it.
         job = queue.enqueue(
-            analysis_worker.perform_analysis_job,
+            'app.analysis_worker.perform_analysis_job',
             file_id=file_id,
             s3_key=s3_key, # Pass the full S3 key
             transcript=transcript,
@@ -223,16 +225,16 @@ def get_analysis_status(job_id: str):
                 # Map the worker's result structure to the AnalysisResult model
                 analysis_result = AnalysisResult(
                     confidence_score=job_result.get('confidence_score', 0.0),
-                    speaking_pace=int(job_result.get('audio_features', {}).get('speaking_pace_wpm', 0)),
-                    filler_word_count=job_result.get('filler_word_analysis', {}).get('filler_word_count', 0),
+                    speaking_pace=int(job_result.get('speaking_pace', 0)),
+                    filler_word_count=job_result.get('filler_word_count', 0),
                     repetition_count=job_result.get('repetition_count', 0),
                     long_pause_count=float(job_result.get('long_pause_count', 0)),
-                    silence_ratio=float(job_result.get('audio_features', {}).get('silence_ratio', 0)),
-                    avg_amplitude=float(job_result.get('audio_features', {}).get('rms_mean', 0)),
-                    pitch_mean=float(job_result.get('audio_features', {}).get('pitch_mean', 0)),
-                    pitch_std=float(job_result.get('audio_features', {}).get('pitch_std', 0)),
+                    silence_ratio=float(job_result.get('silence_ratio', 0)),
+                    avg_amplitude=float(job_result.get('avg_amplitude', 0)),
+                    pitch_mean=float(job_result.get('pitch_mean', 0)),
+                    pitch_std=float(job_result.get('pitch_std', 0)),
                     emotion=job_result.get('emotion', 'neutral'),
-                    energy_std=float(job_result.get('audio_features', {}).get('rms_std', 0)),
+                    energy_std=float(job_result.get('energy_std', 0)),
                     recommendations=job_result.get('recommendations', []),
                     transcript=job_result.get('transcript', '')
                 )
