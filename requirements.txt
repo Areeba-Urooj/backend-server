@@ -10,20 +10,26 @@ loguru==0.7.3
 redis==5.2.0
 rq==2.3.0
 
-# Audio processing - Allow latest stable versions on Python 3.11
-librosa
-soundfile
-audioread
+# Audio processing - Pinning librosa to a known version for stability
+# The issue is likely in numba/llvmlite, but pinning librosa helps lock the stack.
+librosa==0.10.1
+soundfile==0.12.1
+audioread==3.0.1
 
-# Scientific stack - Allow modern, compatible versions on Python 3.11
-numpy
-scipy
-scikit-learn
-numba
-llvmlite
-decorator
-joblib
+# Scientific stack - PINNED FOR PYTHON 3.11/LIBROSA COMPATIBILITY
+# These specific pins resolve the numba/llvmlite/librosa runtime errors.
+numpy==1.26.4
+scipy==1.12.0
+scikit-learn==1.4.1
+numba==0.59.1
+llvmlite==0.42.0
 
-# --- FIX: Add AWS S3 Dependencies ---
-boto3
-botocore
+# Dependencies of the pinned libraries (kept for explicit clarity)
+decorator==5.1.1
+joblib==1.4.2
+
+# AWS S3 Dependencies
+boto3==1.34.137
+botocore==1.34.137
+jmespath==1.0.1
+s3transfer==0.10.1
