@@ -10,20 +10,21 @@ loguru==0.7.3
 redis==5.2.0
 rq==2.3.0
 
-# Audio processing - Allow latest stable versions on Python 3.11
-librosa
-soundfile
-audioread
+# Audio processing - Pinned compatible versions for Python 3.11
+librosa==0.10.1
+soundfile==0.12.1
+audioread==3.0.1
+soxr==0.3.7
 
-# Scientific stack - Allow modern, compatible versions on Python 3.11
-numpy
-scipy
-scikit-learn
-numba
-llvmlite
-decorator
-joblib
+# Scientific stack - Compatible versions for Python 3.11
+numpy==1.24.3
+scipy==1.11.4
+scikit-learn==1.3.2
+numba==0.58.1
+llvmlite==0.41.1
+decorator==5.1.1
+joblib==1.3.2
 
-# --- FIX: Add AWS S3 Dependencies ---
-boto3
-botocore
+# AWS S3 Dependencies
+boto3==1.40.55
+botocore==1.40.55
