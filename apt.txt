@@ -2,3 +2,4 @@
 ffmpeg
 libsndfile1
 libatlas-base-dev
+gfortran
