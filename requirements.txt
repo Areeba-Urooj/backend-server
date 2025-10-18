@@ -17,9 +17,9 @@ audioread==3.0.1
 
 # Scientific stack - PINNED TO FORCE WHEEL USAGE
 # NumPy and SciPy 1.26/1.12 are often built with modern, accessible wheels.
-numpy==1.26.4
-scipy==1.12.0
-scikit-learn==1.4.1
+numpy>=2.3.4
+scipy>=1.13.0
+scikit-learn>=1.5.0
 numba==0.59.1
 llvmlite==0.42.0
 
