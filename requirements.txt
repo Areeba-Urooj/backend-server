@@ -14,20 +14,16 @@ setuptools>=69.0.3
 redis==5.2.0
 rq==2.3.0
 
-# Audio processing - Pinning for compatibility
-librosa==0.10.1
+# Audio processing - NO LIBROSA (incompatible with Python 3.13)
 soundfile==0.12.1
 audioread==3.0.1
 
-# Scientific stack - STRICTLY PINNED TO AVOID SERIALIZATION ISSUES
-# These versions were confirmed to install on Python 3.13.4
+# Scientific stack - Compatible with Python 3.13
 numpy==2.3.4
 scipy==1.16.3
 scikit-learn==1.7.2
-numba==0.62.1
-llvmlite==0.45.1
 
-# Dependencies of the pinned libraries (kept for explicit clarity)
+# Dependencies
 decorator==5.1.1
 joblib==1.4.2
 
@@ -36,4 +32,3 @@ boto3==1.34.137
 botocore==1.34.137
 jmespath==1.0.1
 s3transfer==0.10.1
-tensorflow==2.18.0
