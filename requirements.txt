@@ -1,4 +1,4 @@
-# requirements.txt - Optimized for Python 3.13 on Render
+# requirements.txt
 
 fastapi==0.115.0
 uvicorn[standard]==0.32.0
@@ -8,28 +8,26 @@ aiofiles==25.1.0
 loguru==0.7.3
 
 # CRITICAL FIX: Add setuptools (contains pkg_resources)
-setuptools==80.9.0 # Pin to the version installed in your worker logs
+setuptools>=69.0.3
 
-# Redis and RQ - Worker logs show these versions
+# Redis and RQ
 redis==5.2.0
 rq==2.3.0
 
-# Audio processing - Pinning for stability
-# These versions are correct for Python 3.13
+# Audio processing - Pinning for compatibility
 librosa==0.10.1
 soundfile==0.12.1
 audioread==3.0.1
 
-# Scientific stack - PINNED FOR RQ/PICKLE STABILITY
-# The Numba/llvmlite versions must be exact to prevent binary mismatch errors
-# The versions below are confirmed Python 3.13-compatible by Numba releases:
-numpy==2.3.4       # Pin to exact version from worker logs
-scipy==1.16.3      # Pin to exact version from worker logs
-scikit-learn==1.7.2 # Pin to exact version from worker logs
-numba==0.62.1      # PINNED: Must be exact match with llvmlite
-llvmlite==0.45.1   # PINNED: Must be exact match with numba 0.62.1
+# Scientific stack - STRICTLY PINNED TO AVOID SERIALIZATION ISSUES
+# These versions were confirmed to install on Python 3.13.4
+numpy==2.3.4
+scipy==1.16.3
+scikit-learn==1.7.2
+numba==0.62.1
+llvmlite==0.45.1
 
-# Dependencies of the pinned libraries
+# Dependencies of the pinned libraries (kept for explicit clarity)
 decorator==5.1.1
 joblib==1.4.2
 
