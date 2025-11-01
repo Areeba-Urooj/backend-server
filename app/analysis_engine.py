@@ -2,18 +2,11 @@
 
 import re
 import numpy as np
-import librosa
-from typing import Dict, Any, List, Tuple, Optional
-from sklearn.ensemble import RandomForestClassifier
+import soundfile as sf
+from typing import Dict, Any, Tuple
 from sklearn.preprocessing import StandardScaler
-import joblib
 import os
 import sys
-
-# --- Configuration for Model Paths ---
-MODEL_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH = os.path.join(MODEL_DIR, "emotion_model.joblib")
-SCALER_PATH = os.path.join(MODEL_DIR, "emotion_scaler.joblib")
 
 # --- Filler Word Detection ---
 def detect_fillers(transcript: str) -> int:
@@ -115,114 +108,68 @@ def score_confidence(audio_features: Dict[str, Any], fluency_metrics: Dict[str, 
     
     return round(max(0.0, min(1.0, confidence_score)), 2)
 
-# --- Emotional Tone Classification ---
-def extract_audio_features(audio_path: str) -> np.ndarray:
-    """Extract MFCC features from audio file."""
-    try:
-        y, sr = librosa.load(audio_path, sr=None, duration=30)
-        
-        mfccs = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
-        mfccs_scaled = np.mean(mfccs.T, axis=0)
-        
-        spectral_centroids = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
-        spectral_rolloff = librosa.feature.spectral_rolloff(y=y, sr=sr)[0]
-        zero_crossing_rate = librosa.feature.zero_crossing_rate(y)[0]
-        
-        features = np.concatenate([
-            mfccs_scaled,
-            [np.mean(spectral_centroids)],
-            [np.mean(spectral_rolloff)],
-            [np.mean(zero_crossing_rate)]
-        ])
-        
-        return features
-        
-    except Exception as e:
-        print(f"Error extracting features from {audio_path}: {e}", file=sys.stderr)
-        return np.zeros(16)
-
-def create_emotion_model() -> Tuple[RandomForestClassifier, StandardScaler]:
-    """Create and train emotion classification model with synthetic data."""
-    np.random.seed(42)
-    n_samples = 300
-    
-    features = []
-    labels = []
-    
-    emotions = ['Neutral', 'High Energy', 'Stress']
-    for i, emotion in enumerate(emotions):
-        n_class_samples = n_samples // len(emotions)
-        
-        for _ in range(n_class_samples):
-            mfccs = np.random.normal(0, 1, 13)
-            
-            if emotion == 'Neutral':
-                spectral_centroid = np.random.normal(2000, 200)
-                spectral_rolloff = np.random.normal(3000, 300)
-                zcr = np.random.normal(0.05, 0.01)
-            elif emotion == 'High Energy':
-                spectral_centroid = np.random.normal(3000, 300)
-                spectral_rolloff = np.random.normal(4000, 400)
-                zcr = np.random.normal(0.08, 0.02)
-            else:
-                spectral_centroid = np.random.normal(2500, 400)
-                spectral_rolloff = np.random.normal(3500, 500)
-                zcr = np.random.normal(0.12, 0.03)
-            
-            feature_vector = np.concatenate([mfccs, [spectral_centroid], [spectral_rolloff], [zcr]])
-            features.append(feature_vector)
-            labels.append(emotion)
-    
-    X = np.array(features)
-    y = np.array(labels)
-    
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-    
-    model = RandomForestClassifier(n_estimators=100, random_state=42)
-    model.fit(X_scaled, y)
-    
-    return model, scaler
-
-def classify_emotion(audio_path: str, model: RandomForestClassifier, scaler: StandardScaler) -> str:
-    """
-    Classify the emotional tone of an audio file.
-    
-    CRITICAL FIX: Now accepts both model AND scaler to properly scale features.
-    """
-    try:
-        # Extract raw features
-        features = extract_audio_features(audio_path)
-        features = features.reshape(1, -1)
-        
-        # ✅ FIX: Scale the features using the same scaler used during training
-        features_scaled = scaler.transform(features)
-        
-        # Make prediction on scaled features
-        prediction = model.predict(features_scaled)[0]
-        
-        return prediction
-        
-    except Exception as e:
-        print(f"Error classifying emotion for {audio_path}: {e}", file=sys.stderr)
-        return "Neutral"  # Changed to capitalized for consistency
-
-# --- Model Initialization ---
+# --- Pre-trained Emotion Model ---
 def initialize_emotion_model():
-    """Initialize or load the emotion classification model."""
+    """
+    Initialize a simple rule-based emotion classifier.
+    Uses audio features to classify emotions without needing a trained model.
+    """
+    print("Initializing rule-based emotion classifier...")
     
-    try:
-        # Try to load existing model from deployment
-        if os.path.exists(MODEL_PATH) and os.path.exists(SCALER_PATH):
-            model = joblib.load(MODEL_PATH)
-            scaler = joblib.load(SCALER_PATH)
-            print("Loaded existing emotion classification model from deployment.")
-            return model, scaler, False
-    except Exception as e:
-        print(f"Error loading existing model. Creating new one: {e}", file=sys.stderr)
+    # We'll use a simple rule-based approach instead of ML model
+    # This avoids needing to download/train a model
+    model = None
+    scaler = StandardScaler()
     
-    # Create new model if loading failed
-    print("Creating new emotion classification model in memory.")
-    model, scaler = create_emotion_model()
+    # Fit scaler with dummy data so it's ready to use
+    dummy_data = np.random.randn(100, 16)
+    scaler.fit(dummy_data)
     
     return model, scaler, True
+
+def classify_emotion_simple(audio_path: str, model=None, scaler=None) -> str:
+    """
+    Rule-based emotion classification using audio features.
+    No ML model needed - uses heuristics based on energy, pitch, and tempo.
+    """
+    try:
+        # Load audio
+        y, sr = sf.read(audio_path)
+        if len(y.shape) > 1:
+            y = np.mean(y, axis=1)
+        
+        # Limit duration
+        max_samples = sr * 10  # 10 seconds max for speed
+        if len(y) > max_samples:
+            y = y[:max_samples]
+        
+        # Calculate key features
+        # 1. Energy (amplitude)
+        energy = np.mean(np.abs(y))
+        energy_std = np.std(np.abs(y))
+        
+        # 2. Zero crossing rate (indicates pitch/frequency changes)
+        zero_crossings = np.sum(np.abs(np.diff(np.sign(y)))) / (2 * len(y))
+        
+        # 3. Tempo/rhythm variation
+        frame_size = int(0.1 * sr)  # 100ms frames
+        frame_energies = []
+        for i in range(0, len(y) - frame_size, frame_size):
+            frame = y[i:i + frame_size]
+            frame_energies.append(np.mean(np.abs(frame)))
+        
+        tempo_variation = np.std(frame_energies) if frame_energies else 0
+        
+        # Rule-based classification
+        if energy > 0.15 and zero_crossings > 0.08 and tempo_variation > 0.05:
+            return "High Energy"  # Excited, enthusiastic
+        elif energy < 0.05 or tempo_variation < 0.02:
+            return "Neutral"  # Calm, monotone
+        elif energy_std > 0.08 and tempo_variation > 0.04:
+            return "Stress"  # Variable, tense
+        else:
+            return "Neutral"  # Default
+            
+    except Exception as e:
+        print(f"Error classifying emotion: {e}", file=sys.stderr)
+        return "Neutral"
