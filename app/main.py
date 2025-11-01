@@ -20,7 +20,9 @@ from pydantic import BaseModel
 
 # Ensure analysis_worker can be imported
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import analysis_worker  # Worker module is now correctly imported
+
+# ✅ FIX: Import the worker module using full path
+from app import analysis_worker
 
 # Import models
 from app.models import AnalysisStatusResponse, AnalysisResult
@@ -52,10 +54,8 @@ def get_redis_connection():
 
 try:
     redis_conn = get_redis_connection()
-    # Use the established connection for the Queue
     queue = Queue('default', connection=redis_conn) 
 except RuntimeError:
-    # If connection fails, allow FastAPI to start, but job submission will fail
     redis_conn = None
     queue = None
 
@@ -96,8 +96,8 @@ class SubmissionResponse(BaseModel):
     message: str
 
 class UploadResponse(BaseModel):
-    file_id: str # This should be the S3 Key (e.g., "uploads/uuid.m4a")
-    s3_key: str # Redundant, but kept for compatibility with original logs
+    file_id: str
+    s3_key: str
     message: str
 
 # --- API Endpoints ---
@@ -115,7 +115,6 @@ async def upload_audio_file(
     if not s3_client or not S3_BUCKET_NAME:
         raise HTTPException(status_code=503, detail="S3 storage service is unavailable.")
     
-    # Generate S3 key based on file extension
     file_extension = os.path.splitext(file.filename)[1] or ".m4a"
     file_uuid = str(uuid4())
     s3_key = f"uploads/{file_uuid}{file_extension}"
@@ -123,7 +122,6 @@ async def upload_audio_file(
     try:
         logger.info(f"[API] ⬆️ Starting S3 upload to key: {s3_key}")
         
-        # Read file content into memory. For large files, use upload_fileobj with a temporary file.
         file_content = await file.read() 
         
         s3_client.put_object(
@@ -135,8 +133,8 @@ async def upload_audio_file(
         logger.info(f"[API] ✅ S3 upload complete for S3 Key: {s3_key}")
 
         return JSONResponse(content={
-            "file_id": file_uuid, # Return UUID for simple reference
-            "s3_key": s3_key,     # Return full S3 Key for job submission
+            "file_id": file_uuid,
+            "s3_key": s3_key,
             "message": "File uploaded successfully."
         }, status_code=200)
 
@@ -155,7 +153,7 @@ async def upload_audio_file(
 
 @app.post("/api/v1/analysis/submit", response_model=SubmissionResponse)
 async def submit_analysis_job(
-    s3_key: str = Form(..., description="The S3 Key (path/filename) of the file returned by the /upload endpoint."),
+    s3_key: str = Form(..., description="The S3 Key of the uploaded file."),
     transcript: str = Form(..., description="The full transcription of the audio file."),
     user_id: str = Form(..., description="The ID of the authenticated user.")
 ):
@@ -163,17 +161,15 @@ async def submit_analysis_job(
     if not queue:
         raise HTTPException(status_code=503, detail="RQ/Redis service is unavailable.")
 
-    # Extract file_id (UUID) from s3_key for internal tracking/logging
     file_id = os.path.splitext(os.path.basename(s3_key))[0]
 
     try:
-        # Enqueue the analysis job, passing the full S3 key
-        # 🚨 FIX: We explicitly use the fully qualified path string 
-        # 'app.analysis_worker.perform_analysis_job' to ensure the worker finds it.
+        # ✅ FIX: Pass the function object directly, not a string
+        # This ensures the worker can deserialize and execute it
         job = queue.enqueue(
-            'app.analysis_worker.perform_analysis_job',
+            analysis_worker.perform_analysis_job,  # Direct function reference
             file_id=file_id,
-            s3_key=s3_key, # Pass the full S3 key
+            s3_key=s3_key,
             transcript=transcript,
             user_id=user_id,
             job_timeout='30m'
@@ -201,11 +197,9 @@ def get_analysis_status(job_id: str):
         raise HTTPException(status_code=503, detail="RQ/Redis service is unavailable.")
         
     try:
-        # Fetch the job from Redis
         job = Job.fetch(job_id, connection=redis_conn)
         status = job.get_status()
         
-        # Create the base response
         response_data = AnalysisStatusResponse(
             job_id=job_id,
             status=status,
@@ -213,16 +207,12 @@ def get_analysis_status(job_id: str):
             started_at=job.started_at.isoformat() if job.started_at else None,
         )
 
-        # If job is finished, retrieve and validate the result
         if status == 'finished':
             response_data.ended_at = job.ended_at.isoformat() if job.ended_at else None
             
-            # Get the result from the job
             job_result = job.result
             
-            # Transform the worker result to match the AnalysisResult model
             if job_result and isinstance(job_result, dict):
-                # Map the worker's result structure to the AnalysisResult model
                 analysis_result = AnalysisResult(
                     confidence_score=job_result.get('confidence_score', 0.0),
                     speaking_pace=int(job_result.get('speaking_pace', 0)),
@@ -248,5 +238,4 @@ def get_analysis_status(job_id: str):
     except redis.exceptions.ConnectionError:
         raise HTTPException(status_code=500, detail="Could not connect to Redis.")
     except Exception:
-        # Job.fetch throws an exception if the job ID is not found
         raise HTTPException(status_code=404, detail=f"Job with ID {job_id} not found.")
