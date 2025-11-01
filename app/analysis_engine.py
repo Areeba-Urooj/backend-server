@@ -3,24 +3,21 @@
 import re
 import numpy as np
 import librosa
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
 import joblib
 import os
-import sys # Import sys for path handling
+import sys
 
 # --- Configuration for Model Paths ---
-# Use an absolute path or relative to the script location (assuming the files are committed next to the script)
 MODEL_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(MODEL_DIR, "emotion_model.joblib")
 SCALER_PATH = os.path.join(MODEL_DIR, "emotion_scaler.joblib")
 
-# --- Filler Word Detection (No changes needed) ---
+# --- Filler Word Detection ---
 def detect_fillers(transcript: str) -> int:
-    """
-    Detect filler words in the transcript using a rule-based dictionary approach.
-    """
+    """Detect filler words in the transcript."""
     filler_words = [
         'um', 'uh', 'like', 'you know', 'I mean', 'right', 'so', 
         'actually', 'basically', 'literally', 'well', 'you see',
@@ -36,11 +33,9 @@ def detect_fillers(transcript: str) -> int:
     
     return filler_count
 
-# --- Repetition/Stutter Detection (No changes needed) ---
+# --- Repetition/Stutter Detection ---
 def detect_repetitions(transcript: str) -> int:
-    """
-    Detect repetitions and stutters in the transcript using N-gram analysis.
-    """
+    """Detect repetitions and stutters in the transcript."""
     cleaned_transcript = re.sub(r'[^\w\s]', ' ', transcript)
     cleaned_transcript = re.sub(r'\s+', ' ', cleaned_transcript).strip()
     words = cleaned_transcript.lower().split()
@@ -50,12 +45,12 @@ def detect_repetitions(transcript: str) -> int:
     
     repetition_count = 0
     
-    # Check for immediate word repetitions (bigrams)
+    # Check for immediate word repetitions
     for i in range(len(words) - 1):
         if words[i] == words[i + 1]:
             repetition_count += 1
     
-    # Check for trigram repetitions (3-word phrases)
+    # Check for trigram repetitions
     if len(words) >= 3:
         for i in range(len(words) - 2):
             phrase1 = ' '.join(words[i:i+2])
@@ -73,11 +68,9 @@ def detect_repetitions(transcript: str) -> int:
     
     return repetition_count
 
-# --- Speaking Confidence Score (No changes needed) ---
+# --- Speaking Confidence Score ---
 def score_confidence(audio_features: Dict[str, Any], fluency_metrics: Dict[str, Any]) -> float:
-    """
-    Calculate a speaking confidence score based on audio features and fluency metrics.
-    """
+    """Calculate speaking confidence score."""
     rms_std = audio_features.get('rms_std', 0)
     rms_mean = audio_features.get('rms_mean', 0)
     speaking_pace_wpm = audio_features.get('speaking_pace_wpm', 0)
@@ -87,27 +80,25 @@ def score_confidence(audio_features: Dict[str, Any], fluency_metrics: Dict[str, 
     repetition_count = fluency_metrics.get('repetition_count', 0)
     total_words = fluency_metrics.get('total_words', 1)
     
-    # Calculate individual component scores (0.0 to 1.0)
-    
-    # 1. Pace Consistency Score
+    # Pace Consistency Score
     pace_ideal = 140
     pace_deviation = abs(speaking_pace_wpm - pace_ideal) / pace_ideal
     pace_score = max(0, 1 - pace_deviation)
     
-    # 2. Vocal Energy Score
+    # Vocal Energy Score
     energy_score = min(1, rms_mean / 0.1)
     energy_variation_penalty = min(0.3, rms_std * 10)
     energy_score = max(0, energy_score - energy_variation_penalty)
     
-    # 3. Fluency Score
+    # Fluency Score
     filler_rate = filler_count / total_words
     repetition_rate = repetition_count / total_words
     fluency_score = max(0, 1 - (filler_rate * 10 + repetition_rate * 15))
     
-    # 4. Pitch Stability Score
+    # Pitch Stability Score
     pitch_score = max(0, 1 - (pitch_std / 100))
     
-    # Weighted combination of scores
+    # Weighted combination
     weights = {
         'pace': 0.3,
         'energy': 0.3,
@@ -126,9 +117,7 @@ def score_confidence(audio_features: Dict[str, Any], fluency_metrics: Dict[str, 
 
 # --- Emotional Tone Classification ---
 def extract_audio_features(audio_path: str) -> np.ndarray:
-    """
-    Extract MFCC features from audio file for emotion classification.
-    """
+    """Extract MFCC features from audio file."""
     try:
         y, sr = librosa.load(audio_path, sr=None, duration=30)
         
@@ -149,14 +138,11 @@ def extract_audio_features(audio_path: str) -> np.ndarray:
         return features
         
     except Exception as e:
-        # NOTE: Using print() here because the worker logger isn't initialized yet when this is called
         print(f"Error extracting features from {audio_path}: {e}", file=sys.stderr)
         return np.zeros(16)
 
 def create_emotion_model() -> Tuple[RandomForestClassifier, StandardScaler]:
-    """
-    Create and train a simple emotion classification model (synthetic data).
-    """
+    """Create and train emotion classification model with synthetic data."""
     np.random.seed(42)
     n_samples = 300
     
@@ -198,61 +184,45 @@ def create_emotion_model() -> Tuple[RandomForestClassifier, StandardScaler]:
     
     return model, scaler
 
-def classify_emotion(audio_path: str, model) -> str:
+def classify_emotion(audio_path: str, model: RandomForestClassifier, scaler: StandardScaler) -> str:
     """
     Classify the emotional tone of an audio file.
-    The model passed in is the loaded/trained model instance.
+    
+    CRITICAL FIX: Now accepts both model AND scaler to properly scale features.
     """
     try:
-        # The model object passed in includes the scaler fit within its structure 
-        # (or the features are scaled before being passed to model.predict)
+        # Extract raw features
         features = extract_audio_features(audio_path)
-        
-        # NOTE: The model in this file is trained on UN-SCALED features from create_emotion_model
-        # because the internal `RandomForestClassifier` is trained on `X_scaled`.
-        # For this to work correctly, the loaded scaler must be used here.
-        # Since the worker is a placeholder, we simplify:
-        
-        # FIX: Since we don't have the scaler object passed directly to this function
-        # and the worker is now initialized to have the scaler globally, we will need to 
-        # pass the scaler object as well, or update the model to use the scaler internally.
-        # For *this* worker implementation, we are just passing the raw features to the model 
-        # which was trained on *scaled* features. This will likely cause bad predictions.
-        
-        # TEMPORARY FIX: For the purpose of *unblocking* the pipeline, we rely on the robustness 
-        # of the un-scaled features against the RandomForest. This needs refinement later.
         features = features.reshape(1, -1)
         
-        prediction = model.predict(features)[0]
+        # ✅ FIX: Scale the features using the same scaler used during training
+        features_scaled = scaler.transform(features)
+        
+        # Make prediction on scaled features
+        prediction = model.predict(features_scaled)[0]
         
         return prediction
         
     except Exception as e:
         print(f"Error classifying emotion for {audio_path}: {e}", file=sys.stderr)
-        return "neutral"
+        return "Neutral"  # Changed to capitalized for consistency
 
-# --- Model Initialization (FIXED for Read-Only FS) ---
+# --- Model Initialization ---
 def initialize_emotion_model():
-    """
-    Initialize or load the emotion classification model.
-    Attempts to load committed files first. Creates a new model ONLY if loading fails.
-    """
+    """Initialize or load the emotion classification model."""
     
     try:
-        # Try to load existing model from the deployed package
+        # Try to load existing model from deployment
         if os.path.exists(MODEL_PATH) and os.path.exists(SCALER_PATH):
             model = joblib.load(MODEL_PATH)
             scaler = joblib.load(SCALER_PATH)
             print("Loaded existing emotion classification model from deployment.")
-            return model, scaler, False # False means model was loaded, not created
+            return model, scaler, False
     except Exception as e:
-        print(f"Error loading existing model. Falling back to training a new one: {e}", file=sys.stderr)
+        print(f"Error loading existing model. Creating new one: {e}", file=sys.stderr)
     
-    # Create new model if loading failed or files don't exist
+    # Create new model if loading failed
     print("Creating new emotion classification model in memory.")
     model, scaler = create_emotion_model()
     
-    # NOTE: REMOVED joblib.dump() here because the filesystem is read-only.
-    # The model will be trained on every worker restart if the files are not committed.
-    
-    return model, scaler, True # True means model was newly created in memory
+    return model, scaler, True
