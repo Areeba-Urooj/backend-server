@@ -14,17 +14,16 @@ from botocore.exceptions import ClientError
 from redis import Redis
 from rq import Worker 
 import numpy as np
-import soundfile as sf  # Replace librosa with soundfile
-from scipy import signal
+import soundfile as sf
 from scipy.fft import fft
 
-# Import ML/Fluency Logic
+# Import ML/Fluency Logic - FIXED IMPORT
 from app.analysis_engine import (
     detect_fillers, 
     detect_repetitions, 
     score_confidence, 
     initialize_emotion_model,
-    classify_emotion
+    classify_emotion_simple  # CHANGED: Was classify_emotion
 )
 
 # --- Configuration ---
@@ -67,10 +66,8 @@ def extract_rms(y):
     frame_length = 2048
     hop_length = 512
     
-    # Pad signal
     y_padded = np.pad(y, int(frame_length // 2), mode='reflect')
     
-    # Calculate RMS for each frame
     rms = []
     for i in range(0, len(y_padded) - frame_length, hop_length):
         frame = y_padded[i:i + frame_length]
@@ -80,17 +77,14 @@ def extract_rms(y):
 
 def extract_pitch(y, sr):
     """Simple pitch estimation using autocorrelation."""
-    # Use a smaller segment for faster processing
-    segment_length = min(len(y), sr * 2)  # Max 2 seconds
+    segment_length = min(len(y), sr * 2)
     y_segment = y[:segment_length]
     
-    # Compute autocorrelation
     correlation = np.correlate(y_segment, y_segment, mode='full')
     correlation = correlation[len(correlation)//2:]
     
-    # Find peaks
-    min_period = int(sr / 300)  # Max 300 Hz
-    max_period = int(sr / 75)   # Min 75 Hz
+    min_period = int(sr / 300)
+    max_period = int(sr / 75)
     
     if max_period < len(correlation):
         peak_region = correlation[min_period:max_period]
@@ -119,7 +113,7 @@ def perform_analysis_job(
     total_words = len(transcript.split())
 
     if EMOTION_MODEL is None or EMOTION_SCALER is None:
-        raise RuntimeError("Emotion model or scaler is not loaded. Cannot perform ML analysis.")
+        logger.warning("[WORKER] ⚠️ Emotion model not loaded, using fallback")
 
     try:
         # 1. Download from S3
@@ -127,38 +121,31 @@ def perform_analysis_job(
         s3_client.download_file(S3_BUCKET_NAME, s3_key, temp_audio_file)
         logger.info("✅ Download complete.")
         
-        # 2. Load audio using soundfile (NO LIBROSA)
+        # 2. Load audio using soundfile
         logger.info("🎵 Loading audio file...")
         y, sr = sf.read(temp_audio_file)
         
-        # Convert stereo to mono if needed
         if len(y.shape) > 1:
             y = np.mean(y, axis=1)
         
         duration_seconds = len(y) / sr
         logger.info(f"📊 Audio duration: {duration_seconds:.2f}s, Sample rate: {sr} Hz")
         
-        # 3. Extract audio features (without librosa)
+        # 3. Extract audio features
         logger.info("📈 Extracting audio features...")
         
-        # RMS energy
         rms = extract_rms(y)
         avg_amplitude = np.mean(np.abs(y))
         energy_std = np.std(rms)
         
-        # Silence analysis
         rms_threshold = np.mean(rms) * 0.2
         silence_ratio = np.sum(rms < rms_threshold) / len(rms) if len(rms) > 0 else 0
         long_pause_count = int(silence_ratio * (duration_seconds / 5))
         
-        # Pitch analysis (simplified)
         logger.info("🎼 Analyzing pitch...")
         pitch_mean = extract_pitch(y, sr)
-        # For pitch_std, we'd need multiple pitch estimates which is expensive
-        # Use a simple approximation based on amplitude variation
-        pitch_std = energy_std * 50  # Rough approximation
+        pitch_std = energy_std * 50
         
-        # Speaking pace
         speaking_pace_wpm = (total_words / max(1, duration_seconds)) * 60
 
         # 4. Fluency Analysis
@@ -181,7 +168,7 @@ def perform_analysis_job(
         
         confidence_score = score_confidence(audio_features, fluency_metrics)
         
-        # 5. Emotion Classification
+        # 5. Emotion Classification - FIXED FUNCTION CALL
         logger.info("😊 Classifying emotion...")
         emotion = classify_emotion_simple(temp_audio_file, EMOTION_MODEL, EMOTION_SCALER)
 
@@ -209,8 +196,9 @@ def perform_analysis_job(
         logger.info(f"✅ Analysis complete in {round(time.time() - job_start_time, 2)}s. Emotion: {emotion}, Confidence: {confidence_score}")
         
         # 7. Cleanup
-        os.remove(temp_audio_file)
-        logger.info(f"🗑️ Cleaned up temp file: {temp_audio_file}")
+        if os.path.exists(temp_audio_file):
+            os.remove(temp_audio_file)
+            logger.info(f"🗑️ Cleaned up temp file: {temp_audio_file}")
         
         return analysis_result
 
@@ -222,80 +210,7 @@ def perform_analysis_job(
         raise
     finally:
         if os.path.exists(temp_audio_file):
-             os.remove(temp_audio_file)
-
-def classify_emotion_simple(audio_path: str, model, scaler) -> str:
-    """Simplified emotion classification without librosa."""
-    try:
-        # Load audio
-        y, sr = sf.read(audio_path)
-        if len(y.shape) > 1:
-            y = np.mean(y, axis=1)
-        
-        # Limit duration for speed
-        max_samples = sr * 30  # 30 seconds max
-        if len(y) > max_samples:
-            y = y[:max_samples]
-        
-        # Extract simple features
-        # 1. MFCCs approximation using FFT and mel filterbank (simplified)
-        n_fft = 2048
-        hop_length = 512
-        n_mfcc = 13
-        
-        # Simple spectral features instead of true MFCCs
-        frame_count = min(100, (len(y) - n_fft) // hop_length)
-        mfcc_approx = []
-        
-        for i in range(frame_count):
-            start = i * hop_length
-            frame = y[start:start + n_fft]
-            if len(frame) < n_fft:
-                frame = np.pad(frame, (0, n_fft - len(frame)))
-            
-            # FFT
-            spectrum = np.abs(fft(frame))[:n_fft//2]
-            
-            # Log scale
-            log_spectrum = np.log(spectrum + 1e-10)
-            
-            # Take first 13 coefficients as pseudo-MFCC
-            mfcc_approx.append(log_spectrum[:n_mfcc])
-        
-        mfccs_scaled = np.mean(mfcc_approx, axis=0) if mfcc_approx else np.zeros(n_mfcc)
-        
-        # 2. Spectral centroid (simplified)
-        freqs = np.fft.rfftfreq(n_fft, 1/sr)
-        spectrum_full = np.abs(fft(y[:n_fft]))[:len(freqs)]
-        spectral_centroid = np.sum(freqs * spectrum_full) / (np.sum(spectrum_full) + 1e-10)
-        
-        # 3. Spectral rolloff
-        cumsum = np.cumsum(spectrum_full)
-        rolloff_idx = np.where(cumsum >= 0.85 * cumsum[-1])[0]
-        spectral_rolloff = freqs[rolloff_idx[0]] if len(rolloff_idx) > 0 else sr/2
-        
-        # 4. Zero crossing rate
-        zero_crossings = np.sum(np.abs(np.diff(np.sign(y)))) / 2
-        zcr = zero_crossings / len(y)
-        
-        # Combine features
-        features = np.concatenate([
-            mfccs_scaled,
-            [spectral_centroid],
-            [spectral_rolloff],
-            [zcr]
-        ])
-        
-        # Scale and predict
-        features = features.reshape(1, -1)
-        features_scaled = scaler.transform(features)
-        prediction = model.predict(features_scaled)[0]
-        
-        return prediction
-        
-    except Exception as e:
-        logger.error(f"Error classifying emotion for {audio_path}: {e}", exc_info=True)
-        return "Neutral"
+            os.remove(temp_audio_file)
 
 # --- Worker Entrypoint ---
 if __name__ == '__main__':
