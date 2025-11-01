@@ -1,9 +1,14 @@
+# requirements.txt
+
 fastapi==0.115.0
 uvicorn[standard]==0.32.0
 python-multipart==0.0.20
 pydantic==2.10.0
 aiofiles==25.1.0
 loguru==0.7.3
+
+# CRITICAL FIX: Add setuptools (contains pkg_resources)
+setuptools>=69.0.3
 
 # Redis and RQ
 redis==5.2.0
@@ -31,4 +36,3 @@ boto3==1.34.137
 botocore==1.34.137
 jmespath==1.0.1
 s3transfer==0.10.1
-
