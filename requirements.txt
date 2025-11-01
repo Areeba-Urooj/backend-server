@@ -24,8 +24,8 @@ audioread==3.0.1
 numpy==2.3.4
 scipy==1.16.3
 scikit-learn==1.7.2
-numba==0.62.1
-llvmlite==0.45.1
+numba==0.61.2
+llvmlite==0.45.0
 
 # Dependencies of the pinned libraries (kept for explicit clarity)
 decorator==5.1.1
