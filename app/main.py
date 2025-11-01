@@ -21,8 +21,9 @@ from pydantic import BaseModel
 # Ensure analysis_worker can be imported
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# ✅ FIX: Import the worker module using full path
-from app import analysis_worker
+# ✅ FIX: DO NOT import analysis_worker at module level
+# It will be imported lazily when needed to avoid loading heavy ML libraries in the API server
+analysis_worker = None
 
 # Import models
 from app.models import AnalysisStatusResponse, AnalysisResult
@@ -164,10 +165,13 @@ async def submit_analysis_job(
     file_id = os.path.splitext(os.path.basename(s3_key))[0]
 
     try:
-        # ✅ FIX: Pass the function object directly, not a string
-        # This ensures the worker can deserialize and execute it
+        # ✅ FIX: Import analysis_worker lazily here, not at module level
+        # This prevents loading heavy ML libraries in the API server
+        from app import analysis_worker
+        
+        # Pass the function object directly
         job = queue.enqueue(
-            analysis_worker.perform_analysis_job,  # Direct function reference
+            analysis_worker.perform_analysis_job,
             file_id=file_id,
             s3_key=s3_key,
             transcript=transcript,
@@ -199,6 +203,11 @@ def get_analysis_status(job_id: str):
     try:
         job = Job.fetch(job_id, connection=redis_conn)
         status = job.get_status()
+        
+        # ✅ ADD: Log full job details for debugging
+        logger.info(f"[API] Job {job_id} status: {status}")
+        if status == 'failed':
+            logger.error(f"[API] Job {job_id} failed with error: {job.exc_info}")
         
         response_data = AnalysisStatusResponse(
             job_id=job_id,
@@ -232,10 +241,13 @@ def get_analysis_status(job_id: str):
                 
         elif status == 'failed':
             response_data.error = job.exc_info
+            # ✅ ADD: Also log the full exception
+            logger.error(f"[API] Full exception info for job {job_id}:\n{job.exc_info}")
             
         return response_data
         
     except redis.exceptions.ConnectionError:
         raise HTTPException(status_code=500, detail="Could not connect to Redis.")
-    except Exception:
+    except Exception as e:
+        logger.error(f"[API] Error fetching job {job_id}: {e}", exc_info=True)
         raise HTTPException(status_code=404, detail=f"Job with ID {job_id} not found.")
