@@ -1,29 +1,14 @@
-# app/main.py
-
 import os
-import sys
 import logging
-from uuid import uuid4
 from typing import Dict, Any, Optional
-
-from fastapi import FastAPI, File, UploadFile, HTTPException, Form
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
+import time
 
 import boto3
 from botocore.exceptions import ClientError
-
-import redis
-from rq import Queue
-from rq.job import Job
-from pydantic import BaseModel
-
-# Ensure analysis_worker can be imported
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import analysis_worker  # Worker module is now correctly imported
-
-# Import models
-from app.models import AnalysisStatusResponse, AnalysisResult
+from redis import Redis
+from rq import Worker 
+import numpy as np
+import librosa
 
 # --- Configuration ---
 S3_BUCKET_NAME = os.environ.get('S3_BUCKET_NAME')
@@ -32,221 +17,135 @@ AWS_REGION = os.environ.get('AWS_REGION', 'eu-north-1')
 # --- Logging Setup ---
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s | %(levelname)s | %(name)s:%(lineno)d - %(message)s'
+    format='%(asctime)s | %(levelname)s | [WORKER] - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# --- Redis & RQ Setup ---
-def get_redis_connection():
-    """Initializes and returns the Redis connection."""
-    redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379')
-    logger.info(f"[MAIN] Connecting to Redis at: {redis_url}")
-    try:
-        conn = redis.from_url(redis_url)
-        conn.ping()
-        logger.info("[MAIN] ✅ Successfully connected to Redis")
-        return conn
-    except Exception as e:
-        logger.error(f"[MAIN] ❌ Failed to connect to Redis: {e}", exc_info=True)
-        raise RuntimeError("Failed to connect to Redis for RQ.") from e
-
-try:
-    redis_conn = get_redis_connection()
-    # Use the established connection for the Queue
-    queue = Queue('default', connection=redis_conn) 
-except RuntimeError:
-    # If connection fails, allow FastAPI to start, but job submission will fail
-    redis_conn = None
-    queue = None
-
 # --- S3 Client Initialization ---
 def get_s3_client():
-    """Initializes and returns the S3 client."""
+    """Initializes and returns the S3 client with the correct region."""
     if not S3_BUCKET_NAME:
-        logger.error("[MAIN] ❌ S3_BUCKET_NAME environment variable is not set.")
+        logger.error("[WORKER] ❌ S3_BUCKET_NAME environment variable is not set.")
         raise ValueError("S3_BUCKET_NAME is not configured.")
+    # Use the explicitly set AWS_REGION
     return boto3.client('s3', region_name=AWS_REGION)
 
 try:
     s3_client = get_s3_client()
-    logger.info(f"[MAIN] ✅ S3 Client initialized for bucket: {S3_BUCKET_NAME} in region: {AWS_REGION}")
-except ValueError:
-    s3_client = None
+    logger.info(f"[WORKER] ✅ S3 Client initialized for bucket: {S3_BUCKET_NAME} in region: {AWS_REGION}")
+except ValueError as e:
+    logger.error(f"[WORKER] ❌ Configuration Error: {e}")
+    raise
 
-# --- FastAPI App Initialization ---
-app = FastAPI(
-    title="Audio Analysis API",
-    version="1.0.0",
-    description="API for uploading audio and queuing analysis jobs."
-)
+# --- Core Analysis Function ---
+def perform_analysis_job(
+    file_id: str, 
+    s3_key: str, 
+    transcript: str, 
+    user_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Worker function to fetch audio, perform analysis, and return the results.
+    Includes placeholder analysis logic using librosa and numpy.
+    """
+    job_start_time = time.time()
+    logger.info(f"🚀 Starting analysis for file_id: {file_id}, s3_key: {s3_key}")
+    if user_id:
+        logger.info(f"User ID: {user_id}")
 
-# CORS configuration
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# --- Pydantic Models ---
-class SubmissionResponse(BaseModel):
-    file_id: str
-    job_id: str
-    message: str
-
-class UploadResponse(BaseModel):
-    file_id: str # This should be the S3 Key (e.g., "uploads/uuid.m4a")
-    s3_key: str # Redundant, but kept for compatibility with original logs
-    message: str
-
-# --- API Endpoints ---
-
-@app.get("/")
-def health_check():
-    """Basic health check."""
-    return {"status": "ok", "message": "Audio Analysis API is running."}
-
-@app.post("/upload", response_model=UploadResponse)
-async def upload_audio_file(
-    file: UploadFile = File(...)
-):
-    """Receives an audio file and uploads it to S3."""
-    if not s3_client or not S3_BUCKET_NAME:
-        raise HTTPException(status_code=503, detail="S3 storage service is unavailable.")
-    
-    # Generate S3 key based on file extension
-    file_extension = os.path.splitext(file.filename)[1] or ".m4a"
-    file_uuid = str(uuid4())
-    s3_key = f"uploads/{file_uuid}{file_extension}"
+    temp_audio_file = f"/tmp/{file_id}_{os.path.basename(s3_key)}"
+    duration_seconds = 0
+    total_words = len(transcript.split())
 
     try:
-        logger.info(f"[API] ⬆️ Starting S3 upload to key: {s3_key}")
+        # 1. Download the file from S3
+        logger.info(f"⬇️ Downloading s3://{S3_BUCKET_NAME}/{s3_key} to {temp_audio_file}")
+        s3_client.download_file(S3_BUCKET_NAME, s3_key, temp_audio_file)
+        logger.info("✅ Download complete.")
         
-        # Read file content into memory. For large files, use upload_fileobj with a temporary file.
-        file_content = await file.read() 
+        # 2. Perform Audio Analysis using librosa (Example Logic)
+        y, sr = librosa.load(temp_audio_file, sr=None)
+        duration_seconds = librosa.get_duration(y=y, sr=sr)
         
-        s3_client.put_object(
-            Bucket=S3_BUCKET_NAME,
-            Key=s3_key,
-            Body=file_content,
-            ContentType=file.content_type
-        )
-        logger.info(f"[API] ✅ S3 upload complete for S3 Key: {s3_key}")
+        # Calculate RMS (Root Mean Square Energy)
+        rms = librosa.feature.rms(y=y)[0]
+        
+        # Simple placeholder for silence/pauses (e.g., RMS below a threshold)
+        rms_threshold = np.mean(rms) * 0.2  # 20% of mean RMS
+        silence_ratio = np.sum(rms < rms_threshold) / len(rms)
+        long_pause_count = int(silence_ratio * 10) # Placeholder metric
+        
+        # Simple Placeholder for Pitch (F0)
+        pitches, magnitudes = librosa.core.piptrack(y=y, sr=sr, fmin=75, fmax=300)
+        pitch_valid = pitches[magnitudes > np.quantile(magnitudes, 0.9)]
+        pitch_mean = np.mean(pitch_valid) if len(pitch_valid) > 0 else 0
+        pitch_std = np.std(pitch_valid) if len(pitch_valid) > 0 else 0
+        
+        # Speaking Pace (words per minute)
+        speaking_pace_wpm = (total_words / max(1, duration_seconds)) * 60
 
-        return JSONResponse(content={
-            "file_id": file_uuid, # Return UUID for simple reference
-            "s3_key": s3_key,     # Return full S3 Key for job submission
-            "message": "File uploaded successfully."
-        }, status_code=200)
+        # Placeholder for filler words and repetitions (requires NLP/transcript processing)
+        filler_word_count = transcript.lower().count('um') + transcript.lower().count('uh')
+        repetition_count = 2 # Hardcoded placeholder
+
+        # 3. Compile Results
+        analysis_result = {
+            "duration_seconds": round(duration_seconds, 2),
+            "total_words": total_words,
+            "repetition_count": repetition_count,
+            "long_pause_count": long_pause_count,
+            "confidence_score": round(np.random.uniform(0.9, 0.99), 2), # Random confidence
+            "emotion": "calm", # Hardcoded placeholder
+            "recommendations": ["Ensure clear articulation.", "Try to reduce filler words."] if filler_word_count > 0 else ["Excellent pace and clarity."],
+            "audio_features": {
+                "rms_mean": round(np.mean(rms), 4),
+                "rms_std": round(np.std(rms), 4),
+                "silence_ratio": round(silence_ratio, 2),
+                "speaking_pace_wpm": round(speaking_pace_wpm, 1),
+                "pitch_mean": round(pitch_mean, 1),
+                "pitch_std": round(pitch_std, 1),
+            },
+            "filler_word_analysis": {
+                "filler_word_count": filler_word_count,
+                "filler_word_rate": round(filler_word_count / total_words, 3) if total_words > 0 else 0,
+            },
+            "transcript": transcript,
+        }
+
+        logger.info("✅ Analysis complete.")
+        
+        # 4. Clean up the temporary file
+        os.remove(temp_audio_file)
+        logger.info(f"🗑️ Cleaned up temp file: {temp_audio_file}")
+        
+        # 5. Return the full result structure
+        return analysis_result
 
     except ClientError as e:
-        logger.error(f"[API] ❌ S3 Error during upload: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"S3 Upload Failed: {e.response['Error'].get('Message', 'Unknown S3 error')}"
-        )
+        logger.error(f"❌ S3 Error during worker processing: {e}", exc_info=True)
+        raise
     except Exception as e:
-        logger.error(f"[API] ❌ General Error during upload: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"An error occurred while processing the upload: {str(e)}"
-        )
+        logger.error(f"❌ General Analysis Error: {e}", exc_info=True)
+        raise
+    finally:
+        # Final cleanup attempt
+        if os.path.exists(temp_audio_file):
+             os.remove(temp_audio_file)
 
-@app.post("/api/v1/analysis/submit", response_model=SubmissionResponse)
-async def submit_analysis_job(
-    s3_key: str = Form(..., description="The S3 Key (path/filename) of the file returned by the /upload endpoint."),
-    transcript: str = Form(..., description="The full transcription of the audio file."),
-    user_id: str = Form(..., description="The ID of the authenticated user.")
-):
-    """Queues an audio analysis job using s3_key and transcript."""
-    if not queue:
-        raise HTTPException(status_code=503, detail="RQ/Redis service is unavailable.")
-
-    # Extract file_id (UUID) from s3_key for internal tracking/logging
-    file_id = os.path.splitext(os.path.basename(s3_key))[0]
-
+# --- Worker Entrypoint ---
+if __name__ == '__main__':
+    redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379')
+    logger.info(f"Starting worker and connecting to Redis at: {redis_url}")
+    
     try:
-        # Enqueue the analysis job, passing the full S3 key
-        # 🚨 FIX: We explicitly use the fully qualified path string 
-        # 'app.analysis_worker.perform_analysis_job' to ensure the worker finds it.
-        job = queue.enqueue(
-            'app.analysis_worker.perform_analysis_job',
-            file_id=file_id,
-            s3_key=s3_key, # Pass the full S3 key
-            transcript=transcript,
-            user_id=user_id,
-            job_timeout='30m'
-        )
+        redis_conn = Redis.from_url(redis_url)
+        redis_conn.ping()
+        logger.info("Redis connection established.")
         
-        logger.info(f"[API] 📝 Job enqueued successfully. Job ID: {job.id}")
-
-        return JSONResponse(content={
-            "file_id": file_id,
-            "job_id": job.id,
-            "message": "Analysis job queued."
-        }, status_code=200)
+        # ✅ FINAL FIX: Pass the connection object directly to the Worker constructor
+        worker = Worker(['default'], connection=redis_conn)
+        worker.work()
 
     except Exception as e:
-        logger.error(f"[API] ❌ Error during job enqueue: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to submit analysis job: {str(e)}"
-        )
-
-@app.get("/api/v1/analysis/status/{job_id}", response_model=AnalysisStatusResponse)
-def get_analysis_status(job_id: str):
-    """Retrieves the status and result of an RQ job."""
-    if not redis_conn:
-        raise HTTPException(status_code=503, detail="RQ/Redis service is unavailable.")
-        
-    try:
-        # Fetch the job from Redis
-        job = Job.fetch(job_id, connection=redis_conn)
-        status = job.get_status()
-        
-        # Create the base response
-        response_data = AnalysisStatusResponse(
-            job_id=job_id,
-            status=status,
-            enqueued_at=job.enqueued_at.isoformat() if job.enqueued_at else None,
-            started_at=job.started_at.isoformat() if job.started_at else None,
-        )
-
-        # If job is finished, retrieve and validate the result
-        if status == 'finished':
-            response_data.ended_at = job.ended_at.isoformat() if job.ended_at else None
-            
-            # Get the result from the job
-            job_result = job.result
-            
-            # Transform the worker result to match the AnalysisResult model
-            if job_result and isinstance(job_result, dict):
-                # Map the worker's result structure to the AnalysisResult model
-                analysis_result = AnalysisResult(
-                    confidence_score=job_result.get('confidence_score', 0.0),
-                    speaking_pace=int(job_result.get('speaking_pace', 0)),
-                    filler_word_count=job_result.get('filler_word_count', 0),
-                    repetition_count=job_result.get('repetition_count', 0),
-                    long_pause_count=float(job_result.get('long_pause_count', 0)),
-                    silence_ratio=float(job_result.get('silence_ratio', 0)),
-                    avg_amplitude=float(job_result.get('avg_amplitude', 0)),
-                    pitch_mean=float(job_result.get('pitch_mean', 0)),
-                    pitch_std=float(job_result.get('pitch_std', 0)),
-                    emotion=job_result.get('emotion', 'neutral'),
-                    energy_std=float(job_result.get('energy_std', 0)),
-                    recommendations=job_result.get('recommendations', []),
-                    transcript=job_result.get('transcript', '')
-                )
-                response_data.result = analysis_result
-                
-        elif status == 'failed':
-            response_data.error = job.exc_info
-            
-        return response_data
-        
-    except redis.exceptions.ConnectionError:
-        raise HTTPException(status_code=500, detail="Could not connect to Redis.")
-    except Exception:
-        # Job.fetch throws an exception if the job ID is not found
-        raise HTTPException(status_code=404, detail=f"Job with ID {job_id} not found.")
+        logger.error(f"❌ Worker failed to start or connect to Redis: {e}", exc_info=True)
+        exit(1)
