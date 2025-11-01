@@ -1,7 +1,16 @@
 import os
+# CRITICAL FIX: Environment variables to prevent silent crash due to librosa/numba incompatibility
+os.environ['NUMBA_DISABLE_JIT'] = '1'
+os.environ['LIBROSA_USE_NATIVE_MPG123'] = '1'
+
 import logging
 from typing import Dict, Any, Optional
 import time
+import sys
+
+# Ensure app directory is in path for local imports
+# This is usually needed if the worker is run from a different directory
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import boto3
 from botocore.exceptions import ClientError
@@ -9,6 +18,15 @@ from redis import Redis
 from rq import Worker 
 import numpy as np
 import librosa
+
+# Import ML/Fluency Logic
+from app.analysis_engine import (
+    detect_fillers, 
+    detect_repetitions, 
+    score_confidence, 
+    initialize_emotion_model,
+    classify_emotion
+)
 
 # --- Configuration ---
 S3_BUCKET_NAME = os.environ.get('S3_BUCKET_NAME')
@@ -37,6 +55,16 @@ except ValueError as e:
     logger.error(f"[WORKER] ❌ Configuration Error: {e}")
     raise
 
+# --- Global ML Model/Scaler Initialization ---
+# Perform this once at worker start, not for every job.
+try:
+    # model and scaler are now available globally for the worker process
+    EMOTION_MODEL, EMOTION_SCALER, _ = initialize_emotion_model()
+    logger.info("[WORKER] ✅ Emotion model initialized/loaded.")
+except Exception as e:
+    logger.error(f"[WORKER] ❌ Failed to initialize emotion model: {e}", exc_info=True)
+    EMOTION_MODEL, EMOTION_SCALER = None, None # Set to None to handle errors later
+
 # --- Core Analysis Function ---
 def perform_analysis_job(
     file_id: str, 
@@ -46,7 +74,6 @@ def perform_analysis_job(
 ) -> Dict[str, Any]:
     """
     Worker function to fetch audio, perform analysis, and return the results.
-    Includes placeholder analysis logic using librosa and numpy.
     """
     job_start_time = time.time()
     logger.info(f"🚀 Starting analysis for file_id: {file_id}, s3_key: {s3_key}")
@@ -57,23 +84,30 @@ def perform_analysis_job(
     duration_seconds = 0
     total_words = len(transcript.split())
 
+    if EMOTION_MODEL is None:
+        raise RuntimeError("Emotion model is not loaded. Cannot perform ML analysis.")
+
     try:
         # 1. Download the file from S3
         logger.info(f"⬇️ Downloading s3://{S3_BUCKET_NAME}/{s3_key} to {temp_audio_file}")
         s3_client.download_file(S3_BUCKET_NAME, s3_key, temp_audio_file)
         logger.info("✅ Download complete.")
         
-        # 2. Perform Audio Analysis using librosa (Example Logic)
+        # 2. Perform Audio Analysis using librosa
         y, sr = librosa.load(temp_audio_file, sr=None)
         duration_seconds = librosa.get_duration(y=y, sr=sr)
         
         # Calculate RMS (Root Mean Square Energy)
         rms = librosa.feature.rms(y=y)[0]
+        avg_amplitude = np.mean(np.abs(y)) # More direct amplitude measure
+        energy_std = np.std(rms)
         
         # Simple placeholder for silence/pauses (e.g., RMS below a threshold)
         rms_threshold = np.mean(rms) * 0.2  # 20% of mean RMS
         silence_ratio = np.sum(rms < rms_threshold) / len(rms)
-        long_pause_count = int(silence_ratio * 10) # Placeholder metric
+        # Assuming long_pause_count is the number of silence segments > 0.5s
+        # This is a complex calculation; keeping the original simple placeholder for now.
+        long_pause_count = int(silence_ratio * (duration_seconds / 5)) # Scale by duration/5s segments
         
         # Simple Placeholder for Pitch (F0)
         pitches, magnitudes = librosa.core.piptrack(y=y, sr=sr, fmin=75, fmax=300)
@@ -84,41 +118,56 @@ def perform_analysis_job(
         # Speaking Pace (words per minute)
         speaking_pace_wpm = (total_words / max(1, duration_seconds)) * 60
 
-        # Placeholder for filler words and repetitions (requires NLP/transcript processing)
-        filler_word_count = transcript.lower().count('um') + transcript.lower().count('uh')
-        repetition_count = 2 # Hardcoded placeholder
-
-        # 3. Compile Results
-        analysis_result = {
-            "duration_seconds": round(duration_seconds, 2),
-            "total_words": total_words,
+        # 3. Perform Fluency/ML Analysis
+        filler_word_count = detect_fillers(transcript)
+        repetition_count = detect_repetitions(transcript)
+        
+        # Structure features for confidence scoring
+        audio_features = {
+            "rms_mean": np.mean(rms),
+            "rms_std": np.std(rms),
+            "speaking_pace_wpm": speaking_pace_wpm,
+            "pitch_std": pitch_std,
+            "pitch_mean": pitch_mean, # Added for completeness
+        }
+        fluency_metrics = {
+            "filler_word_count": filler_word_count,
             "repetition_count": repetition_count,
-            "long_pause_count": long_pause_count,
-            "confidence_score": round(np.random.uniform(0.9, 0.99), 2), # Random confidence
-            "emotion": "calm", # Hardcoded placeholder
-            "recommendations": ["Ensure clear articulation.", "Try to reduce filler words."] if filler_word_count > 0 else ["Excellent pace and clarity."],
-            "audio_features": {
-                "rms_mean": round(np.mean(rms), 4),
-                "rms_std": round(np.std(rms), 4),
-                "silence_ratio": round(silence_ratio, 2),
-                "speaking_pace_wpm": round(speaking_pace_wpm, 1),
-                "pitch_mean": round(pitch_mean, 1),
-                "pitch_std": round(pitch_std, 1),
-            },
-            "filler_word_analysis": {
-                "filler_word_count": filler_word_count,
-                "filler_word_rate": round(filler_word_count / total_words, 3) if total_words > 0 else 0,
-            },
+            "total_words": total_words,
+        }
+        
+        confidence_score = score_confidence(audio_features, fluency_metrics)
+        emotion = classify_emotion(temp_audio_file, EMOTION_MODEL)
+
+        # 4. Compile Results in the EXACT structure expected by AnalysisResult model in main.py
+        # NOTE: Keys must match the model in app/models.py (implied by main.py usage)
+        analysis_result = {
+            "confidence_score": round(confidence_score, 2),
+            "speaking_pace": int(round(speaking_pace_wpm)),
+            "filler_word_count": filler_word_count,
+            "repetition_count": repetition_count,
+            "long_pause_count": float(long_pause_count),
+            "silence_ratio": round(silence_ratio, 2),
+            "avg_amplitude": round(float(avg_amplitude), 4),
+            "pitch_mean": round(float(pitch_mean), 2),
+            "pitch_std": round(float(pitch_std), 2),
+            "emotion": emotion.lower(), # Ensure lower case for Pydantic
+            "energy_std": round(float(energy_std), 4),
+            "recommendations": [
+                f"Your speaking pace is {int(round(speaking_pace_wpm))} WPM. Consider adjusting it toward 140 WPM.",
+                f"You used {filler_word_count} filler words. Focus on concise pauses.",
+                f"Your emotional tone was classified as **{emotion}**."
+            ],
             "transcript": transcript,
         }
 
-        logger.info("✅ Analysis complete.")
+        logger.info(f"✅ Analysis complete in {round(time.time() - job_start_time, 2)}s. Emotion: {emotion}, Confidence: {confidence_score}")
         
-        # 4. Clean up the temporary file
+        # 5. Clean up the temporary file
         os.remove(temp_audio_file)
         logger.info(f"🗑️ Cleaned up temp file: {temp_audio_file}")
         
-        # 5. Return the full result structure
+        # 6. Return the result structure
         return analysis_result
 
     except ClientError as e:
@@ -142,7 +191,7 @@ if __name__ == '__main__':
         redis_conn.ping()
         logger.info("Redis connection established.")
         
-        # ✅ FINAL FIX: Pass the connection object directly to the Worker constructor
+        # Pass the connection object directly to the Worker constructor
         worker = Worker(['default'], connection=redis_conn)
         worker.work()
 
