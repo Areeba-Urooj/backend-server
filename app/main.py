@@ -21,9 +21,6 @@ from pydantic import BaseModel
 # Ensure app path is included
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# 🟢 FIX: REMOVED all imports of 'analysis_worker' from the top level
-# analysis_worker = None 
-
 # Import models
 from app.models import AnalysisStatusResponse, AnalysisResult
 
@@ -165,15 +162,15 @@ async def submit_analysis_job(
     file_id = os.path.splitext(os.path.basename(s3_key))[0]
 
     try:
-        # 🟢 FIX: Do NOT import the worker. Pass the function name as a string.
-        # This prevents the server from importing heavy ML libraries.
+        # Pass the function name as a string, preventing import of heavy ML libraries
         job = queue.enqueue(
-            'app.analysis_worker.perform_analysis_job', # <-- Pass as a string
+            'app.analysis_worker.perform_analysis_job', 
             file_id=file_id,
             s3_key=s3_key,
             transcript=transcript,
             user_id=user_id,
-            job_timeout='30m'
+            job_timeout='30m',
+            serializer='json' # Ensure result is stored as JSON, not Python pickle
         )
         
         logger.info(f"[API] 📝 Job enqueued successfully. Job ID: {job.id}")
@@ -198,9 +195,10 @@ def get_analysis_status(job_id: str):
         raise HTTPException(status_code=503, detail="RQ/Redis service is unavailable.")
         
     try:
-        # 🟢 FIX: We must tell Job.fetch() which modules to trust
-        # for deserializing the job result or exception.
-        job = Job.fetch(job_id, connection=redis_conn, serializer='json')
+        # 🟢 CRITICAL FIX: Job.fetch defaults to using 'pickle', which fails if analysis_worker 
+        # is not fully loaded/trusted by the API process. 
+        # Fetch the job object, relying on the job's stored serializer ('json') set during enqueue.
+        job = Job.fetch(job_id, connection=redis_conn)
         status = job.get_status()
         
         logger.info(f"[API] Job {job_id} status: {status}")
@@ -217,9 +215,11 @@ def get_analysis_status(job_id: str):
         if status == 'finished':
             response_data.ended_at = job.ended_at.isoformat() if job.ended_at else None
             
-            job_result = job.result
+            # job.result should now be a standard Python dictionary because we set serializer='json' in enqueue.
+            job_result = job.result 
             
             if job_result and isinstance(job_result, dict):
+                # The mapping below is correct for the flat dictionary returned by analysis_worker
                 analysis_result = AnalysisResult(
                     confidence_score=job_result.get('confidence_score', 0.0),
                     speaking_pace=int(job_result.get('speaking_pace', 0)),
@@ -247,6 +247,4 @@ def get_analysis_status(job_id: str):
         raise HTTPException(status_code=500, detail="Could not connect to Redis.")
     except Exception as e:
         logger.error(f"[API] Error fetching job {job_id}: {e}", exc_info=True)
-        # This will now safely report "not found" or other errors
-        # without crashing the server.
         raise HTTPException(status_code=404, detail=f"Job with ID {job_id} not found or failed to fetch.")
