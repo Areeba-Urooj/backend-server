@@ -1,7 +1,2 @@
-# apt.txt
-# Essential audio libraries for librosa/soundfile
 ffmpeg
 libsndfile1
-
-# Removed: libatlas-base-dev, gfortran, libopenblas-dev, liblapack-dev
-# as they are not needed when using pre-built wheels and complicate the build.
