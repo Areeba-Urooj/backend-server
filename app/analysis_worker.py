@@ -1,4 +1,5 @@
 import os
+# These ENV vars are for librosa, we can leave them in, but they won't interfere
 os.environ['NUMBA_DISABLE_JIT'] = '1'
 os.environ['LIBROSA_USE_NATIVE_MPG123'] = '1'
 
@@ -16,6 +17,8 @@ from rq import Worker
 import numpy as np
 import soundfile as sf
 from scipy.fft import fft
+from pydub import AudioSegment # <-- NEW: Import for M4A handling
+from pydub.exceptions import CouldntDecodeError # <-- NEW: Import for error handling
 
 # Import ML/Fluency Logic - FIXED IMPORT
 from app.analysis_engine import (
@@ -29,6 +32,7 @@ from app.analysis_engine import (
 # --- Configuration ---
 S3_BUCKET_NAME = os.environ.get('S3_BUCKET_NAME')
 AWS_REGION = os.environ.get('AWS_REGION', 'eu-north-1') 
+TARGET_SR = 16000 # Standard sample rate for speech analysis
 
 # --- Logging Setup ---
 logging.basicConfig(
@@ -121,16 +125,40 @@ def perform_analysis_job(
         s3_client.download_file(S3_BUCKET_NAME, s3_key, temp_audio_file)
         logger.info("✅ Download complete.")
         
-        # 2. Load audio using soundfile
-        logger.info("🎵 Loading audio file...")
-        y, sr = sf.read(temp_audio_file)
+        # 2. Load audio using pydub for M4A support <-- FIX APPLIED HERE
+        logger.info(f"🎵 Loading audio file using pydub (M4A format expected)...")
         
-        if len(y.shape) > 1:
-            y = np.mean(y, axis=1)
-        
-        duration_seconds = len(y) / sr
-        logger.info(f"📊 Audio duration: {duration_seconds:.2f}s, Sample rate: {sr} Hz")
-        
+        audio = None
+        try:
+            # Load the audio using pydub. FFmpeg is used to decode the M4A file.
+            audio = AudioSegment.from_file(temp_audio_file, format="m4a")
+            
+            # Resample and convert to mono for consistent analysis
+            if audio.frame_rate != TARGET_SR:
+                audio = audio.set_frame_rate(TARGET_SR)
+            if audio.channels > 1:
+                audio = audio.set_channels(1)
+                
+            sr = TARGET_SR
+            
+            # Convert to normalized NumPy array (float32, range [-1.0, 1.0])
+            y = np.array(audio.get_array_of_samples()).astype(np.float32) / 32768.0
+            
+            duration_seconds = audio.duration_seconds
+            logger.info(f"📊 Audio duration: {duration_seconds:.2f}s, Sample rate: {sr} Hz (Processed by pydub)")
+            
+        except CouldntDecodeError as e:
+            logger.error(f"❌ Pydub Decode Error: Ensure FFmpeg is installed and accessible. {e}", exc_info=True)
+            raise Exception("Failed to decode audio file using pydub/FFmpeg. Format not supported.") from e
+        except Exception as e:
+            # Fallback to soundfile for other formats/errors (though highly unlikely for M4A)
+            logger.warning(f"Pydub failed, trying soundfile as fallback. Error: {e}")
+            y, sr = sf.read(temp_audio_file)
+            if len(y.shape) > 1:
+                y = np.mean(y, axis=1)
+            duration_seconds = len(y) / sr
+
+
         # 3. Extract audio features
         logger.info("📈 Extracting audio features...")
         
@@ -144,6 +172,7 @@ def perform_analysis_job(
         
         logger.info("🎼 Analyzing pitch...")
         pitch_mean = extract_pitch(y, sr)
+        # Pitch standard deviation is approximated based on energy stability
         pitch_std = energy_std * 50
         
         speaking_pace_wpm = (total_words / max(1, duration_seconds)) * 60
