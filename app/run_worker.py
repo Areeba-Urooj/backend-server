@@ -5,12 +5,7 @@ Place this file in: app/run_worker.py
 """
 
 import os
-# We no longer need Numba/Librosa, so these ENV vars are not necessary.
-# os.environ['NUMBA_DISABLE_JIT'] = '1'
-# os.environ['NUMBA_DISABLE_CUDA'] = '1'  
-# os.environ['NUMBA_DISABLE_OPENMP'] = '1'
-# os.environ['NUMBA_BOUNDSCHECK'] = '0'
-# os.environ['LIBROSA_USE_NATIVE_MPG123'] = '1'
+# REMOVED Numba/Librosa ENV VARS as they are no longer dependencies
 
 import sys
 import logging
