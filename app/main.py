@@ -21,8 +21,31 @@ from pydantic import BaseModel
 # Ensure app path is included
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# Import models
-from app.models import AnalysisStatusResponse, AnalysisResult
+# Import models (Assuming you have these defined in app/models.py)
+# NOTE: The models used here must be correctly defined in app/models.py
+class AnalysisResult(BaseModel):
+    confidence_score: float
+    speaking_pace: int
+    filler_word_count: int
+    repetition_count: int
+    long_pause_count: float
+    silence_ratio: float
+    avg_amplitude: float
+    pitch_mean: float
+    pitch_std: float
+    emotion: str
+    energy_std: float
+    recommendations: list[str]
+    transcript: str
+
+class AnalysisStatusResponse(BaseModel):
+    job_id: str
+    status: str
+    enqueued_at: Optional[str] = None
+    started_at: Optional[str] = None
+    ended_at: Optional[str] = None
+    result: Optional[AnalysisResult] = None
+    error: Optional[str] = None
 
 # --- Configuration ---
 S3_BUCKET_NAME = os.environ.get('S3_BUCKET_NAME')
@@ -86,7 +109,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Pydantic Models ---
+# --- Pydantic Models for Response (defined above or imported from app.models) ---
 class SubmissionResponse(BaseModel):
     file_id: str
     job_id: str
@@ -162,15 +185,18 @@ async def submit_analysis_job(
     file_id = os.path.splitext(os.path.basename(s3_key))[0]
 
     try:
-        # Pass the function name as a string, preventing import of heavy ML libraries
+        # 🟢 CRITICAL FIX: Use 'kwargs' to separate worker arguments from RQ arguments
         job = queue.enqueue(
             'app.analysis_worker.perform_analysis_job', 
-            file_id=file_id,
-            s3_key=s3_key,
-            transcript=transcript,
-            user_id=user_id,
-            job_timeout='30m',
-            serializer='json' # Ensure result is stored as JSON, not Python pickle
+            kwargs={
+                'file_id': file_id,
+                's3_key': s3_key,
+                'transcript': transcript,
+                'user_id': user_id,
+            },
+            # These arguments are now correctly passed ONLY to RQ
+            job_timeout='30m', 
+            serializer='json' 
         )
         
         logger.info(f"[API] 📝 Job enqueued successfully. Job ID: {job.id}")
@@ -195,9 +221,6 @@ def get_analysis_status(job_id: str):
         raise HTTPException(status_code=503, detail="RQ/Redis service is unavailable.")
         
     try:
-        # 🟢 CRITICAL FIX: Job.fetch defaults to using 'pickle', which fails if analysis_worker 
-        # is not fully loaded/trusted by the API process. 
-        # Fetch the job object, relying on the job's stored serializer ('json') set during enqueue.
         job = Job.fetch(job_id, connection=redis_conn)
         status = job.get_status()
         
@@ -215,11 +238,11 @@ def get_analysis_status(job_id: str):
         if status == 'finished':
             response_data.ended_at = job.ended_at.isoformat() if job.ended_at else None
             
-            # job.result should now be a standard Python dictionary because we set serializer='json' in enqueue.
             job_result = job.result 
             
             if job_result and isinstance(job_result, dict):
-                # The mapping below is correct for the flat dictionary returned by analysis_worker
+                # This mapping is crucial and relies on the worker returning a flat dictionary 
+                # that matches the fields in the AnalysisResult Pydantic model.
                 analysis_result = AnalysisResult(
                     confidence_score=job_result.get('confidence_score', 0.0),
                     speaking_pace=int(job_result.get('speaking_pace', 0)),
@@ -233,7 +256,9 @@ def get_analysis_status(job_id: str):
                     emotion=job_result.get('emotion', 'neutral'),
                     energy_std=float(job_result.get('energy_std', 0)),
                     recommendations=job_result.get('recommendations', []),
-                    transcript=job_result.get('transcript', '')
+                    transcript=job_result.get('transcript', ''),
+                    # Add duration_seconds here if your worker returns it:
+                    # duration_seconds=float(job_result.get('duration_seconds', 0)), 
                 )
                 response_data.result = analysis_result
                 
@@ -247,4 +272,5 @@ def get_analysis_status(job_id: str):
         raise HTTPException(status_code=500, detail="Could not connect to Redis.")
     except Exception as e:
         logger.error(f"[API] Error fetching job {job_id}: {e}", exc_info=True)
+        # Often this is a 404/not found, but a fetch error can be ambiguous
         raise HTTPException(status_code=404, detail=f"Job with ID {job_id} not found or failed to fetch.")
