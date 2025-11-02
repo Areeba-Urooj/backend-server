@@ -1,9 +1,4 @@
 import os
-# We no longer need Numba/Librosa, so these ENV vars are not necessary,
-# but they don't hurt anything if left in.
-os.environ['NUMBA_DISABLE_JIT'] = '1'
-os.environ['LIBROSA_USE_NATIVE_MPG123'] = '1'
-
 import logging
 from typing import Dict, Any, Optional, List
 import time
@@ -11,23 +6,25 @@ import sys
 import subprocess
 import numpy as np
 import soundfile as sf
-import json # <-- NEW: Import for JSON handling
+import json
 
 # --- NEW IMPORTS FOR OPENAI ---
 from openai import OpenAI, RateLimitError, APIError 
 # ------------------------------
 
+import boto3
 from botocore.exceptions import ClientError
 from redis import Redis
-from rq import Worker
+from rq import Worker 
 
-# Import ML/Fluency Logic
+# Import ALL necessary functions and constants from the engine
 from app.analysis_engine import (
     detect_fillers, 
     detect_repetitions, 
     score_confidence, 
     initialize_emotion_model,
-    classify_emotion_simple
+    classify_emotion_simple,
+    calculate_pitch_stats # Import the ZCR-based pitch calculator
 )
 
 # --- Configuration ---
@@ -35,7 +32,7 @@ S3_BUCKET_NAME = os.environ.get('S3_BUCKET_NAME')
 AWS_REGION = os.environ.get('AWS_REGION', 'eu-north-1') 
 TARGET_SR = 16000 # Standard sample rate for speech analysis
 
-# --- Logging Setup ---
+# --- Logging Setup (Existing Code) ---
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | [WORKER] - %(message)s'
@@ -66,7 +63,6 @@ except Exception as e:
     EMOTION_MODEL, EMOTION_SCALER = None, None
 
 # --- OpenAI Client Initialization ---
-# This client will automatically pick up the OPENAI_API_KEY environment variable.
 try:
     OPENAI_CLIENT = OpenAI()
     logger.info("[WORKER] ✅ OpenAI Client initialized.")
@@ -75,51 +71,13 @@ except Exception as e:
     OPENAI_CLIENT = None
 # ------------------------------------
 
-# --- Audio Processing Functions (Existing Code) ---
-def extract_rms(y):
-    """Calculate RMS (Root Mean Square) energy."""
-    frame_length = 2048
-    hop_length = 512
-    
-    y_padded = np.pad(y, int(frame_length // 2), mode='reflect')
-    
-    rms = []
-    for i in range(0, len(y_padded) - frame_length, hop_length):
-        frame = y_padded[i:i + frame_length]
-        rms.append(np.sqrt(np.mean(frame**2)))
-    
-    return np.array(rms)
-
-def extract_pitch(y, sr):
-    """Simple pitch estimation using autocorrelation."""
-    segment_length = min(len(y), sr * 2)
-    y_segment = y[:segment_length]
-    
-    correlation = np.correlate(y_segment, y_segment, mode='full')
-    correlation = correlation[len(correlation)//2:]
-    
-    min_period = int(sr / 300)
-    max_period = int(sr / 75)
-    
-    if max_period < len(correlation):
-        peak_region = correlation[min_period:max_period]
-        if len(peak_region) > 0:
-            peak_idx = np.argmax(peak_region) + min_period
-            pitch = sr / peak_idx
-            return pitch
-    
-    return 0
-    
 # --- NEW: Intelligent Feedback Generation Function ---
 def generate_intelligent_feedback(transcript: str, metrics: Dict[str, Any]) -> List[str]:
-    """
-    Generates tailored feedback and recommendations using the OpenAI API.
-    """
+    """Generates tailored feedback and recommendations using the OpenAI API."""
     if not OPENAI_CLIENT:
         logger.warning("[OPENAI] Skipping feedback generation: OpenAI client not initialized.")
         return ["Error: Feedback service unavailable. Please check the OPENAI_API_KEY environment variable."]
 
-    # Format the input data for the LLM
     metrics_summary = json.dumps({
         "Duration (Seconds)": metrics.get('duration_seconds', 0.0),
         "Total Words": metrics.get('total_words', 0),
@@ -135,51 +93,38 @@ def generate_intelligent_feedback(transcript: str, metrics: Dict[str, Any]) -> L
         "You are an expert speech coach. Your task is to analyze the provided speech transcript and metrics. "
         "Generate a structured list of exactly three highly specific, actionable, and encouraging recommendations "
         "for the user to improve their public speaking. "
-        "The response MUST be a JSON array of strings (e.g., ['Tip 1', 'Tip 2', 'Tip 3']). "
-        "Do not include any introductory text, closing remarks, or numbering."
+        "The response MUST be a JSON array of strings wrapped in a single key called 'recommendations' "
+        "(e.g., {'recommendations': ['Tip 1', 'Tip 2', 'Tip 3']}). Do not include any introductory text, "
+        "closing remarks, or numbering outside the array."
     )
     
     user_prompt = (
-        f"Transcript:\n---\n{transcript[:1000]}...\n---\n" # Limit transcript length for prompt
+        f"Transcript (First 1000 characters):\n---\n{transcript[:1000]}...\n---\n"
         f"Analysis Metrics:\n---\n{metrics_summary}\n---\n"
-        "Based on these, generate a JSON array of 3 specific recommendations."
+        "Based on these, generate a JSON object with a single key 'recommendations' containing a list of 3 specific recommendations."
     )
 
     try:
-        logger.info("[OPENAI] Calling Chat API for feedback generation...")
-        
-        # Use gpt-4o-mini for speed and cost-effectiveness with structured output
         response = OPENAI_CLIENT.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
-            response_format={"type": "json_object"}, # Request JSON output
+            response_format={"type": "json_object"}, 
             temperature=0.7
         )
         
         feedback_json_str = response.choices[0].message.content
         feedback_data = json.loads(feedback_json_str)
-        
-        # The model is instructed to return an array of strings inside a JSON,
-        # so we will look for a key like 'recommendations' or just assume the array is the value.
-        # Since we asked for a JSON object response_format, we must parse the object:
         recommendations = feedback_data.get('recommendations', []) 
         
         if isinstance(recommendations, list) and all(isinstance(r, str) for r in recommendations):
             logger.info(f"[OPENAI] Successfully generated {len(recommendations)} recommendations.")
             return recommendations
         else:
-            # Fallback if the model returns a slightly incorrect JSON structure
-            if 'recommendations' not in feedback_data:
-                 # Try to extract a list of strings if the model returned { "feedback": [...] }
-                 for key, value in feedback_data.items():
-                    if isinstance(value, list) and all(isinstance(r, str) for r in value):
-                        return value
-            
             logger.error(f"[OPENAI] Generated feedback was not a list of strings: {feedback_data}")
-            return ["Feedback generation failed: Model returned incorrect format. (Check LLM logs)"]
+            return ["Feedback generation failed: Model returned incorrect format. (Check LLM instructions)"]
 
     except RateLimitError:
         logger.error("[OPENAI] Rate limit exceeded for feedback generation.")
@@ -188,97 +133,75 @@ def generate_intelligent_feedback(transcript: str, metrics: Dict[str, Any]) -> L
         logger.error(f"[OPENAI] API call or JSON decoding failed: {e.__class__.__name__}: {e}")
         return [f"An error occurred during intelligent feedback generation: {e.__class__.__name__}"]
 
+
 # --- Core Analysis Function ---
 def perform_analysis_job(
     file_id: str, 
     s3_key: str, 
-    transcript: str, # 🟢 NOTE 1: This is the raw transcript from the Flutter app
+    transcript: str, 
     user_id: Optional[str] = None
 ) -> Dict[str, Any]:
     """Worker function to fetch audio, perform analysis, and return results."""
     job_start_time = time.time()
     logger.info(f"🚀 Starting analysis for file_id: {file_id}, s3_key: {s3_key}")
-    if user_id:
-        logger.info(f"User ID: {user_id}")
 
     temp_audio_file = f"/tmp/{file_id}_{os.path.basename(s3_key)}"
     temp_wav_file = f"/tmp/{file_id}_converted.wav"
-    duration_seconds = 0
     
-    # 🟢 NOTE 2: Use the raw transcript to calculate the total words
+    # 1. Fluency analysis first (uses the raw transcript immediately)
     total_words = len(transcript.split()) 
-
-    if EMOTION_MODEL is None or EMOTION_SCALER is None:
-        logger.warning("[WORKER] ⚠️ Emotion model not loaded, using fallback")
-
+    filler_word_count = detect_fillers(transcript)
+    repetition_count = detect_repetitions(transcript)
+    
+    # Initialize values
+    duration_seconds = 0
+    speaking_pace_wpm = 0
+    emotion = "Neutral"
+    confidence_score = 0.0
+    
+    # We will compute the rest of the metrics inside the try block
     try:
-        # 1-3. Download, Convert, and Load (Existing Code)
-        logger.info(f"⬇️ Downloading s3://{S3_BUCKET_NAME}/{s3_key} to {temp_audio_file}")
+        # 2. Download and Convert (Existing FFmpeg Logic)
+        logger.info(f"⬇️ Downloading s3://{S3_BUCKET_NAME}/{s3_key}...")
         s3_client.download_file(S3_BUCKET_NAME, s3_key, temp_audio_file)
-        logger.info("✅ Download complete.")
         
-        logger.info(f"🎬 Converting M4A ({temp_audio_file}) to WAV ({temp_wav_file}) using FFmpeg...")
-        ffmpeg_command = [
-            "ffmpeg", 
-            "-i", temp_audio_file,
-            "-ac", "1",
-            "-ar", str(TARGET_SR),
-            "-y",
-            temp_wav_file
-        ]
-        
-        try:
-            result = subprocess.run(ffmpeg_command, 
-                                    capture_output=True, 
-                                    text=True, 
-                                    check=True)
-            logger.info("✅ FFmpeg conversion successful.")
-        except subprocess.CalledProcessError as e:
-            logger.error(f"❌ FFmpeg Conversion Error. Is FFmpeg installed via apt.txt?")
-            logger.error(f"FFmpeg stderr: {e.stderr}")
-            raise
-        except FileNotFoundError:
-            logger.error("❌ FFmpeg command not found.")
-            raise
+        ffmpeg_command = ["ffmpeg", "-i", temp_audio_file, "-ac", "1", "-ar", str(TARGET_SR), "-y", temp_wav_file]
+        subprocess.run(ffmpeg_command, capture_output=True, text=True, check=True)
+        logger.info("✅ FFmpeg conversion successful.")
 
-        logger.info(f"🎵 Loading converted WAV file: {temp_wav_file}")
+        # 3. Load the converted WAV file
         y, sr = sf.read(temp_wav_file)
-        
         if len(y.shape) > 1:
             y = np.mean(y, axis=1)
             
         duration_seconds = len(y) / sr
-        logger.info(f"📊 Audio duration: {duration_seconds:.2f}s, Sample rate: {sr} Hz")
-        
-        # 4. Extract audio features (Existing Code)
-        logger.info("📈 Extracting audio features...")
-        
-        rms = extract_rms(y)
-        avg_amplitude = np.mean(np.abs(y))
-        energy_std = np.std(rms)
-        
-        rms_threshold = np.mean(rms) * 0.2
-        silence_ratio = np.sum(rms < rms_threshold) / len(rms) if len(rms) > 0 else 0
-        long_pause_count = int(silence_ratio * (duration_seconds / 5))
-        
-        logger.info("🎼 Analyzing pitch...")
-        pitch_mean = extract_pitch(y, sr)
-        pitch_std = energy_std * 50
-        
         speaking_pace_wpm = (total_words / max(1, duration_seconds)) * 60
 
-        # 5. Fluency Analysis (Existing Code)
-        logger.info("💬 Analyzing transcript fluency...")
-        # 🟢 NOTE 3: Fluency functions use the raw transcript (as desired)
-        filler_word_count = detect_fillers(transcript)
-        repetition_count = detect_repetitions(transcript)
+        # 4. Feature Extraction (Using streamlined NumPy/Engine functions)
+        logger.info("📈 Extracting audio features and metrics...")
+        
+        # Calculate RMS for energy/volume
+        rms = np.sqrt(np.mean(y**2)) # Single RMS value for the whole audio
+        avg_amplitude = np.mean(np.abs(y))
+        
+        # Calculate energy std (using the whole signal amplitude std as proxy)
+        energy_std = np.std(np.abs(y)) 
+        
+        # Simple silence ratio/pause count approximation (using 0.2 of overall mean amplitude as a rough threshold)
+        y_abs = np.abs(y)
+        amplitude_threshold = np.mean(y_abs) * 0.2
+        silence_ratio = np.sum(y_abs < amplitude_threshold) / len(y_abs)
+        long_pause_count = int(silence_ratio * (duration_seconds / 5)) # Estimate based on silence ratio
+        
+        # Pitch Stats (using imported engine function)
+        pitch_mean_proxy, pitch_std_proxy = calculate_pitch_stats(y, sr)
         
         audio_features = {
-            "rms_mean": float(np.mean(rms)),
-            "rms_std": float(np.std(rms)),
+            "rms_mean": float(rms),
+            "rms_std": float(energy_std), # Using energy_std as the std of the rms
             "speaking_pace_wpm": speaking_pace_wpm,
-            "pitch_std": float(pitch_std),
-            "pitch_mean": float(pitch_mean),
+            "pitch_std": float(pitch_std_proxy),
+            "pitch_mean": float(pitch_mean_proxy),
         }
         fluency_metrics = {
             "filler_word_count": filler_word_count,
@@ -287,13 +210,9 @@ def perform_analysis_job(
         }
         
         confidence_score = score_confidence(audio_features, fluency_metrics)
-        
-        # 6. Emotion Classification (Existing Code)
-        logger.info("😊 Classifying emotion...")
         emotion = classify_emotion_simple(temp_wav_file, EMOTION_MODEL, EMOTION_SCALER)
 
-        # 7. Compile Core Metrics
-        # This dictionary is used both for the final result AND the LLM prompt
+        # 5. Compile Core Metrics for LLM
         core_analysis_metrics = {
             "confidence_score": round(confidence_score, 2),
             "speaking_pace": int(round(speaking_pace_wpm)),
@@ -302,52 +221,42 @@ def perform_analysis_job(
             "long_pause_count": float(long_pause_count),
             "silence_ratio": round(silence_ratio, 2),
             "avg_amplitude": round(float(avg_amplitude), 4),
-            "pitch_mean": round(float(pitch_mean), 2),
-            "pitch_std": round(float(pitch_std), 2),
+            "pitch_mean": round(float(pitch_mean_proxy), 2),
+            "pitch_std": round(float(pitch_std_proxy), 2),
             "emotion": emotion.lower(),
             "energy_std": round(float(energy_std), 4),
-            "transcript": transcript, # Retain the raw transcript
+            "transcript": transcript,
             "total_words": total_words,
-            "duration_seconds": round(duration_seconds, 2), # CRITICAL for Flutter app
+            "duration_seconds": round(duration_seconds, 2),
         }
         
-        # 8. 🧠 NEW STEP: Generate Intelligent Feedback
+        # 6. Generate Intelligent Feedback
         logger.info("🤖 Generating intelligent feedback using OpenAI...")
         llm_recommendations = generate_intelligent_feedback(
             transcript=transcript, 
             metrics=core_analysis_metrics
         )
         
-        # 9. Compile Final Result (Merge core metrics with LLM recommendations)
+        # 7. Compile Final Result
         final_result = {
             **core_analysis_metrics,
             "recommendations": llm_recommendations,
         }
 
-        logger.info(f"✅ Analysis complete in {round(time.time() - job_start_time, 2)}s. Emotion: {emotion}, Confidence: {confidence_score}")
+        logger.info(f"✅ Analysis complete in {round(time.time() - job_start_time, 2)}s.")
         
-        # 10. Cleanup (Existing Code)
-        if os.path.exists(temp_audio_file):
-            os.remove(temp_audio_file)
-            logger.info(f"🗑️ Cleaned up temp M4A file: {temp_audio_file}")
-        if os.path.exists(temp_wav_file):
-            os.remove(temp_wav_file)
-            logger.info(f"🗑️ Cleaned up converted WAV file: {temp_wav_file}")
+        # 8. Cleanup
+        if os.path.exists(temp_audio_file): os.remove(temp_audio_file)
+        if os.path.exists(temp_wav_file): os.remove(temp_wav_file)
         
         return final_result
 
-    except ClientError as e:
-        logger.error(f"❌ S3 Error: {e}", exc_info=True)
-        raise
     except Exception as e:
-        logger.error(f"❌ Analysis Error: {e}", exc_info=True)
+        logger.error(f"❌ FATAL Analysis Error: {e}", exc_info=True)
+        # Final cleanup attempt before re-raising
+        if os.path.exists(temp_audio_file): os.remove(temp_audio_file)
+        if os.path.exists(temp_wav_file): os.remove(temp_wav_file)
         raise
-    finally:
-        # Final cleanup attempt
-        if os.path.exists(temp_audio_file):
-             os.remove(temp_audio_file)
-        if os.path.exists(temp_wav_file):
-             os.remove(temp_wav_file)
 
 # --- Worker Entrypoint (Existing Code) ---
 if __name__ == '__main__':
