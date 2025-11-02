@@ -7,16 +7,18 @@ Place this file in: app/run_worker.py
 # ⚠️ CRITICAL: Set Numba environment variables FIRST, before ANY imports
 # This MUST be done before importing os, sys, or any other module
 import os
-os.environ['NUMBA_DISABLE_JIT'] = '1'
-os.environ['NUMBA_DISABLE_CUDA'] = '1'  
-os.environ['NUMBA_DISABLE_OPENMP'] = '1'
-os.environ['NUMBA_BOUNDSCHECK'] = '0'
-os.environ['LIBROSA_USE_NATIVE_MPG123'] = '1'
+# REMOVED Numba/Librosa ENV VARS as they are no longer dependencies
+# os.environ['NUMBA_DISABLE_JIT'] = '1'
+# os.environ['NUMBA_DISABLE_CUDA'] = '1'  
+# os.environ['NUMBA_DISABLE_OPENMP'] = '1'
+# os.environ['NUMBA_BOUNDSCHECK'] = '0'
+# os.environ['LIBROSA_USE_NATIVE_MPG123'] = '1'
 
 import sys
 import logging
 
 # Add parent directory to path so 'app' module can be imported
+# This assumes the file is at app/run_worker.py
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from redis import Redis
@@ -42,7 +44,7 @@ if __name__ == '__main__':
         queue = Queue('default', connection=redis_conn)
         logger.info(f"✅ Queue 'default' created/connected")
         
-        # Import worker module to ensure it's loaded
+        # Import worker module to ensure it's loaded (smoke test)
         logger.info("📦 Importing worker module...")
         from app import analysis_worker
         logger.info("✅ Worker module imported successfully")
@@ -60,5 +62,4 @@ if __name__ == '__main__':
         worker.work()
         
     except Exception as e:
-        logger.error(f"❌ Worker launcher failed: {e}", exc_info=True)
-        sys.exit(1)
+        logger.error(f"❌ Worker launcher failed: {e}", exc_info=True
