@@ -62,14 +62,23 @@ except Exception as e:
     logger.error(f"[WORKER] ❌ Failed to initialize emotion model: {e}", exc_info=True)
     EMOTION_MODEL, EMOTION_SCALER = None, None
 
-# --- OpenAI Client Initialization ---
+# --- OpenAI Client Initialization (FIXED) ---
 try:
-    OPENAI_CLIENT = OpenAI()
-    logger.info("[WORKER] ✅ OpenAI Client initialized.")
+    # FIX: Explicitly pass the API key to prevent the environment from injecting 
+    # unwanted, non-standard arguments like 'proxies', which caused the TypeError.
+    openai_key = os.environ.get("OPENAI_API_KEY")
+    if openai_key:
+        OPENAI_CLIENT = OpenAI(api_key=openai_key) 
+        logger.info("[WORKER] ✅ OpenAI Client initialized.")
+    else:
+        logger.warning("[WORKER] ⚠️ OPENAI_API_KEY environment variable not found. Skipping LLM initialization.")
+        OPENAI_CLIENT = None
+        
 except Exception as e:
+    # Catch any remaining initialization errors
     logger.error(f"[WORKER] ❌ Failed to initialize OpenAI client: {e}")
     OPENAI_CLIENT = None
-# ------------------------------------
+# --------------------------------------------
 
 # --- NEW: Intelligent Feedback Generation Function ---
 def generate_intelligent_feedback(transcript: str, metrics: Dict[str, Any]) -> List[str]:
