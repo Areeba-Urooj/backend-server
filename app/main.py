@@ -18,12 +18,11 @@ from rq import Queue
 from rq.job import Job
 from pydantic import BaseModel
 
-# Ensure analysis_worker can be imported
+# Ensure app path is included
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# ✅ FIX: DO NOT import analysis_worker at module level
-# It will be imported lazily when needed to avoid loading heavy ML libraries in the API server
-analysis_worker = None
+# 🟢 FIX: REMOVED all imports of 'analysis_worker' from the top level
+# analysis_worker = None 
 
 # Import models
 from app.models import AnalysisStatusResponse, AnalysisResult
@@ -123,8 +122,6 @@ async def upload_audio_file(
     try:
         logger.info(f"[API] ⬆️ Starting S3 upload to key: {s3_key}")
         
-        # 🟢 FIX APPLIED HERE: Removed 'ContentLength' from ExtraArgs, 
-        # as it is not a valid parameter for ExtraArgs with upload_fileobj.
         s3_client.upload_fileobj(
             Fileobj=file.file,
             Bucket=S3_BUCKET_NAME,
@@ -168,12 +165,10 @@ async def submit_analysis_job(
     file_id = os.path.splitext(os.path.basename(s3_key))[0]
 
     try:
-        # ✅ FIX: Import analysis_worker lazily here, not at module level
-        from app import analysis_worker
-        
-        # Pass the function object directly
+        # 🟢 FIX: Do NOT import the worker. Pass the function name as a string.
+        # This prevents the server from importing heavy ML libraries.
         job = queue.enqueue(
-            analysis_worker.perform_analysis_job,
+            'app.analysis_worker.perform_analysis_job', # <-- Pass as a string
             file_id=file_id,
             s3_key=s3_key,
             transcript=transcript,
@@ -203,10 +198,11 @@ def get_analysis_status(job_id: str):
         raise HTTPException(status_code=503, detail="RQ/Redis service is unavailable.")
         
     try:
-        job = Job.fetch(job_id, connection=redis_conn)
+        # 🟢 FIX: We must tell Job.fetch() which modules to trust
+        # for deserializing the job result or exception.
+        job = Job.fetch(job_id, connection=redis_conn, serializer='json')
         status = job.get_status()
         
-        # ✅ ADD: Log full job details for debugging
         logger.info(f"[API] Job {job_id} status: {status}")
         if status == 'failed':
             logger.error(f"[API] Job {job_id} failed with error: {job.exc_info}")
@@ -243,7 +239,6 @@ def get_analysis_status(job_id: str):
                 
         elif status == 'failed':
             response_data.error = job.exc_info
-            # ✅ ADD: Also log the full exception
             logger.error(f"[API] Full exception info for job {job_id}:\n{job.exc_info}")
             
         return response_data
@@ -252,4 +247,6 @@ def get_analysis_status(job_id: str):
         raise HTTPException(status_code=500, detail="Could not connect to Redis.")
     except Exception as e:
         logger.error(f"[API] Error fetching job {job_id}: {e}", exc_info=True)
-        raise HTTPException(status_code=404, detail=f"Job with ID {job_id} not found.")
+        # This will now safely report "not found" or other errors
+        # without crashing the server.
+        raise HTTPException(status_code=404, detail=f"Job with ID {job_id} not found or failed to fetch.")
