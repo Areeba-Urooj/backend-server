@@ -6,6 +6,7 @@ python-multipart==0.0.20
 pydantic==2.10.0
 aiofiles==25.1.0
 loguru==0.7.3
+pyaudioop
 
 # CRITICAL FIX: Add setuptools (contains pkg_resources)
 setuptools>=69.0.3
