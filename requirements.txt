@@ -14,9 +14,9 @@ setuptools>=69.0.3
 redis==5.2.0
 rq==2.3.0
 
-# AUDIO PROCESSING: Only using basic, stable libraries
+# Audio processing - Using soundfile (which requires audioread)
 soundfile==0.12.1
-audioread==3.0.1 
+audioread==3.0.1
 
 # Scientific stack - Compatible with Python 3.13
 numpy==2.3.4
