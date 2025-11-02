@@ -123,19 +123,16 @@ async def upload_audio_file(
     try:
         logger.info(f"[API] ⬆️ Starting S3 upload to key: {s3_key}")
         
-        # 🟢 FIX: Do not use file.read() which loads the whole file into memory.
-        # Use file.file (the SpooledTemporaryFile) directly for streaming upload.
+        # 🟢 FIX APPLIED HERE: Removed 'ContentLength' from ExtraArgs, 
+        # as it is not a valid parameter for ExtraArgs with upload_fileobj.
         s3_client.upload_fileobj(
             Fileobj=file.file,
             Bucket=S3_BUCKET_NAME,
             Key=s3_key,
             ExtraArgs={
-                'ContentType': file.content_type,
-                'ContentLength': file.size # Optional but helpful
+                'ContentType': file.content_type
             }
         )
-        # Note: If file.size is None, you might need to use ContentLength from file.headers 
-        # but upload_fileobj is generally more resilient.
         
         logger.info(f"[API] ✅ S3 upload complete for S3 Key: {s3_key}")
 
@@ -153,7 +150,6 @@ async def upload_audio_file(
         )
     except Exception as e:
         logger.error(f"[API] ❌ General Error during upload: {e}", exc_info=True)
-        # ⚠️ This is the error path causing the 520 if memory/timeout hits here
         raise HTTPException(
             status_code=500,
             detail=f"An error occurred while processing the upload: {str(e)}"
@@ -176,9 +172,6 @@ async def submit_analysis_job(
         from app import analysis_worker
         
         # Pass the function object directly
-        # The worker's perform_analysis_job must be updated to NOT require
-        # EMOTION_MODEL and EMOTION_SCALER since they are no longer necessary for 
-        # the rule-based approach, and should be loaded internally in the worker.
         job = queue.enqueue(
             analysis_worker.perform_analysis_job,
             file_id=file_id,
