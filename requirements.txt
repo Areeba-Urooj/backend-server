@@ -6,7 +6,6 @@ python-multipart==0.0.20
 pydantic==2.10.0
 aiofiles==25.1.0
 loguru==0.7.3
-pyaudioop
 
 # CRITICAL FIX: Add setuptools (contains pkg_resources)
 setuptools>=69.0.3
@@ -15,12 +14,9 @@ setuptools>=69.0.3
 redis==5.2.0
 rq==2.3.0
 
-# AUDIO DECODING FIX: Add pydub to handle M4A files via FFmpeg
-pydub==0.25.1
-
-# Audio processing - NO LIBROSA (incompatible with Python 3.13)
+# AUDIO PROCESSING: Only using basic, stable libraries
 soundfile==0.12.1
-audioread==3.0.1
+audioread==3.0.1 
 
 # Scientific stack - Compatible with Python 3.13
 numpy==2.3.4
