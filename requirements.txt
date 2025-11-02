@@ -14,6 +14,9 @@ setuptools>=69.0.3
 redis==5.2.0
 rq==2.3.0
 
+# AUDIO DECODING FIX: Add pydub to handle M4A files via FFmpeg
+pydub==0.25.1
+
 # Audio processing - NO LIBROSA (incompatible with Python 3.13)
 soundfile==0.12.1
 audioread==3.0.1
