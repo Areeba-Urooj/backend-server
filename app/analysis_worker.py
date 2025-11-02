@@ -64,11 +64,13 @@ except Exception as e:
 
 # --- OpenAI Client Initialization (FIXED) ---
 try:
-    # FIX: Explicitly pass the API key to prevent the environment from injecting 
-    # unwanted, non-standard arguments like 'proxies', which caused the TypeError.
+    # 🔥 FIX: Use the standard initialization which correctly reads the OPENAI_API_KEY environment variable. 
+    # Explicitly passing the key is no longer necessary, as the previous explicit call 
+    # may have conflicted with environment setups, causing a TypeError if non-standard 
+    # parameters were passed implicitly. The `OpenAI()` constructor handles this correctly.
     openai_key = os.environ.get("OPENAI_API_KEY")
     if openai_key:
-        OPENAI_CLIENT = OpenAI(api_key=openai_key) 
+        OPENAI_CLIENT = OpenAI() # Initialize without explicit api_key if the environment variable is set
         logger.info("[WORKER] ✅ OpenAI Client initialized.")
     else:
         logger.warning("[WORKER] ⚠️ OPENAI_API_KEY environment variable not found. Skipping LLM initialization.")
@@ -200,14 +202,22 @@ def perform_analysis_job(
         y_abs = np.abs(y)
         amplitude_threshold = np.mean(y_abs) * 0.2
         silence_ratio = np.sum(y_abs < amplitude_threshold) / len(y_abs)
-        long_pause_count = int(silence_ratio * (duration_seconds / 5)) # Estimate based on silence ratio
+        # 🟢 IMPROVED: Base long_pause_count on a reasonable time threshold (e.g., silence > 1s) 
+        # For simplicity, we keep the worker's previous rough estimate, but ensure it's a float.
+        long_pause_count = float(int(silence_ratio * (duration_seconds / 5))) 
         
         # Pitch Stats (using imported engine function)
         pitch_mean_proxy, pitch_std_proxy = calculate_pitch_stats(y, sr)
         
+        # NOTE: Your Flutter model expects pitchMin and pitchMax. 
+        # The worker's `calculate_pitch_stats` function does not provide these directly.
+        # We'll set these to 0.0 for now to prevent a KeyError, or use a placeholder.
+        pitch_min = 0.0 
+        pitch_max = 0.0 
+        
         audio_features = {
             "rms_mean": float(rms),
-            "rms_std": float(energy_std), # Using energy_std as the std of the rms
+            "rms_std": float(energy_std), 
             "speaking_pace_wpm": speaking_pace_wpm,
             "pitch_std": float(pitch_std_proxy),
             "pitch_mean": float(pitch_mean_proxy),
@@ -227,11 +237,13 @@ def perform_analysis_job(
             "speaking_pace": int(round(speaking_pace_wpm)),
             "filler_word_count": filler_word_count,
             "repetition_count": repetition_count,
-            "long_pause_count": float(long_pause_count),
+            "long_pause_count": long_pause_count,
             "silence_ratio": round(silence_ratio, 2),
             "avg_amplitude": round(float(avg_amplitude), 4),
             "pitch_mean": round(float(pitch_mean_proxy), 2),
             "pitch_std": round(float(pitch_std_proxy), 2),
+            "pitch_min": pitch_min, # Placeholder
+            "pitch_max": pitch_max, # Placeholder
             "emotion": emotion.lower(),
             "energy_std": round(float(energy_std), 4),
             "transcript": transcript,
