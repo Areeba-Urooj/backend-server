@@ -1,5 +1,6 @@
 import os
-# These ENV vars are for librosa, we can leave them in, but they won't interfere
+# We no longer need Numba/Librosa, so these ENV vars are not necessary,
+# but they don't hurt anything if left in.
 os.environ['NUMBA_DISABLE_JIT'] = '1'
 os.environ['LIBROSA_USE_NATIVE_MPG123'] = '1'
 
@@ -7,6 +8,10 @@ import logging
 from typing import Dict, Any, Optional
 import time
 import sys
+import subprocess # <-- NEW: Import for running FFmpeg
+import numpy as np
+import soundfile as sf # <-- We will use this to read the converted WAV
+from scipy.fft import fft
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -14,19 +19,14 @@ import boto3
 from botocore.exceptions import ClientError
 from redis import Redis
 from rq import Worker 
-import numpy as np
-import soundfile as sf
-from scipy.fft import fft
-from pydub import AudioSegment # <-- NEW: Import for M4A handling
-from pydub.exceptions import CouldntDecodeError # <-- NEW: Import for error handling
 
-# Import ML/Fluency Logic - FIXED IMPORT
+# Import ML/Fluency Logic
 from app.analysis_engine import (
     detect_fillers, 
     detect_repetitions, 
     score_confidence, 
     initialize_emotion_model,
-    classify_emotion_simple  # CHANGED: Was classify_emotion
+    classify_emotion_simple
 )
 
 # --- Configuration ---
@@ -64,7 +64,7 @@ except Exception as e:
     logger.error(f"[WORKER] ❌ Failed to initialize emotion model: {e}", exc_info=True)
     EMOTION_MODEL, EMOTION_SCALER = None, None
 
-# --- Audio Processing Functions (Replacing Librosa) ---
+# --- Audio Processing Functions (Your custom functions) ---
 def extract_rms(y):
     """Calculate RMS (Root Mean Square) energy."""
     frame_length = 2048
@@ -113,6 +113,7 @@ def perform_analysis_job(
         logger.info(f"User ID: {user_id}")
 
     temp_audio_file = f"/tmp/{file_id}_{os.path.basename(s3_key)}"
+    temp_wav_file = f"/tmp/{file_id}_converted.wav" # <-- NEW: Destination for conversion
     duration_seconds = 0
     total_words = len(transcript.split())
 
@@ -125,41 +126,46 @@ def perform_analysis_job(
         s3_client.download_file(S3_BUCKET_NAME, s3_key, temp_audio_file)
         logger.info("✅ Download complete.")
         
-        # 2. Load audio using pydub for M4A support <-- FIX APPLIED HERE
-        logger.info(f"🎵 Loading audio file using pydub (M4A format expected)...")
+        # 2. Convert M4A to WAV using FFmpeg <-- CRITICAL FIX APPLIED HERE
+        logger.info(f"🎬 Converting M4A ({temp_audio_file}) to WAV ({temp_wav_file}) using FFmpeg...")
         
-        audio = None
+        # Command: ffmpeg -i input.m4a -ac 1 (mono) -ar 16000 (sample rate) output.wav
+        ffmpeg_command = [
+            "ffmpeg", 
+            "-i", temp_audio_file,
+            "-ac", "1",
+            "-ar", str(TARGET_SR),
+            "-y", # Overwrite output file if it exists
+            temp_wav_file
+        ]
+        
         try:
-            # Load the audio using pydub. FFmpeg is used to decode the M4A file.
-            audio = AudioSegment.from_file(temp_audio_file, format="m4a")
-            
-            # Resample and convert to mono for consistent analysis
-            if audio.frame_rate != TARGET_SR:
-                audio = audio.set_frame_rate(TARGET_SR)
-            if audio.channels > 1:
-                audio = audio.set_channels(1)
-                
-            sr = TARGET_SR
-            
-            # Convert to normalized NumPy array (float32, range [-1.0, 1.0])
-            y = np.array(audio.get_array_of_samples()).astype(np.float32) / 32768.0
-            
-            duration_seconds = audio.duration_seconds
-            logger.info(f"📊 Audio duration: {duration_seconds:.2f}s, Sample rate: {sr} Hz (Processed by pydub)")
-            
-        except CouldntDecodeError as e:
-            logger.error(f"❌ Pydub Decode Error: Ensure FFmpeg is installed and accessible. {e}", exc_info=True)
-            raise Exception("Failed to decode audio file using pydub/FFmpeg. Format not supported.") from e
-        except Exception as e:
-            # Fallback to soundfile for other formats/errors (though highly unlikely for M4A)
-            logger.warning(f"Pydub failed, trying soundfile as fallback. Error: {e}")
-            y, sr = sf.read(temp_audio_file)
-            if len(y.shape) > 1:
-                y = np.mean(y, axis=1)
-            duration_seconds = len(y) / sr
+            # Run the command
+            result = subprocess.run(ffmpeg_command, 
+                                    capture_output=True, 
+                                    text=True, 
+                                    check=True) # check=True will raise an error if ffmpeg fails
+            logger.info("✅ FFmpeg conversion successful.")
+        except subprocess.CalledProcessError as e:
+            logger.error(f"❌ FFmpeg Conversion Error. Is FFmpeg installed via apt.txt?")
+            logger.error(f"FFmpeg stdout: {e.stdout}")
+            logger.error(f"FFmpeg stderr: {e.stderr}")
+            raise
+        except FileNotFoundError:
+            logger.error("❌ FFmpeg command not found. Please ensure 'ffmpeg' is in your apt.txt file.")
+            raise
 
-
-        # 3. Extract audio features
+        # 3. Load the converted WAV file using soundfile
+        logger.info(f"🎵 Loading converted WAV file: {temp_wav_file}")
+        y, sr = sf.read(temp_wav_file) # <-- This will now succeed
+        
+        if len(y.shape) > 1:
+            y = np.mean(y, axis=1)
+        
+        duration_seconds = len(y) / sr
+        logger.info(f"📊 Audio duration: {duration_seconds:.2f}s, Sample rate: {sr} Hz")
+        
+        # 4. Extract audio features (using your custom functions)
         logger.info("📈 Extracting audio features...")
         
         rms = extract_rms(y)
@@ -172,12 +178,11 @@ def perform_analysis_job(
         
         logger.info("🎼 Analyzing pitch...")
         pitch_mean = extract_pitch(y, sr)
-        # Pitch standard deviation is approximated based on energy stability
         pitch_std = energy_std * 50
         
         speaking_pace_wpm = (total_words / max(1, duration_seconds)) * 60
 
-        # 4. Fluency Analysis
+        # 5. Fluency Analysis
         logger.info("💬 Analyzing transcript fluency...")
         filler_word_count = detect_fillers(transcript)
         repetition_count = detect_repetitions(transcript)
@@ -197,11 +202,12 @@ def perform_analysis_job(
         
         confidence_score = score_confidence(audio_features, fluency_metrics)
         
-        # 5. Emotion Classification - FIXED FUNCTION CALL
+        # 6. Emotion Classification - FIXED FUNCTION CALL
         logger.info("😊 Classifying emotion...")
-        emotion = classify_emotion_simple(temp_audio_file, EMOTION_MODEL, EMOTION_SCALER)
+        # IMPORTANT: Pass the converted WAV file to the emotion classifier
+        emotion = classify_emotion_simple(temp_wav_file, EMOTION_MODEL, EMOTION_SCALER)
 
-        # 6. Compile Results
+        # 7. Compile Results
         analysis_result = {
             "confidence_score": round(confidence_score, 2),
             "speaking_pace": int(round(speaking_pace_wpm)),
@@ -224,10 +230,13 @@ def perform_analysis_job(
 
         logger.info(f"✅ Analysis complete in {round(time.time() - job_start_time, 2)}s. Emotion: {emotion}, Confidence: {confidence_score}")
         
-        # 7. Cleanup
+        # 8. Cleanup
         if os.path.exists(temp_audio_file):
             os.remove(temp_audio_file)
-            logger.info(f"🗑️ Cleaned up temp file: {temp_audio_file}")
+            logger.info(f"🗑️ Cleaned up temp M4A file: {temp_audio_file}")
+        if os.path.exists(temp_wav_file):
+            os.remove(temp_wav_file)
+            logger.info(f"🗑️ Cleaned up converted WAV file: {temp_wav_file}")
         
         return analysis_result
 
@@ -238,8 +247,11 @@ def perform_analysis_job(
         logger.error(f"❌ Analysis Error: {e}", exc_info=True)
         raise
     finally:
+        # Final cleanup attempt
         if os.path.exists(temp_audio_file):
-            os.remove(temp_audio_file)
+             os.remove(temp_audio_file)
+        if os.path.exists(temp_wav_file):
+             os.remove(temp_wav_file)
 
 # --- Worker Entrypoint ---
 if __name__ == '__main__':
