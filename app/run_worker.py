@@ -9,6 +9,7 @@ import os
 
 import sys
 import logging
+os.environ['OMP_NUM_THREADS'] = '1'
 
 # Add parent directory to path so 'app' module can be imported
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
