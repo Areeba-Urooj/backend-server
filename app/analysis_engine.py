@@ -9,11 +9,11 @@ import re
 from typing import Dict, Any, List, Tuple, NamedTuple, Optional
 from scipy.signal import find_peaks, butter, lfilter
 from scipy.stats import zscore
-from sklearn.preprocessing import StandardScaler 
+from sklearn.preprocessing import StandardScaler  
 
 # --- Configuration & Constants ---
-TARGET_SR = 16000 
-MAX_DURATION_SECONDS = 120 
+TARGET_SR = 16000  
+MAX_DURATION_SECONDS = 120  
 logger = logging.getLogger(__name__)
 
 # --- NamedTuples for Analysis Markers ---
@@ -164,20 +164,20 @@ def detect_custom_markers(transcript: str) -> List[TextMarker]:
 def initialize_emotion_model():
     class MockModel:
         def predict(self, features):
-            return np.array([0]) 
+            return np.array([0])  
     class MockScaler:
         def transform(self, data):
             return data
-    return MockModel(), MockScaler(), ["neutral", "calm", "happy", "sad", "angry"] 
+    return MockModel(), MockScaler(), ["neutral", "calm", "happy", "sad", "angry"]  
 
 def classify_emotion_simple(wav_file_path: str, model, scaler) -> str:
     emotion_classes = ["neutral", "calm", "happy", "sad", "angry"]
     try:
         y, sr = sf.read(wav_file_path)
         energy = np.mean(y**2)
-        if energy > 0.005: 
+        if energy > 0.005:  
             return "excited"
-        return "neutral" 
+        return "neutral"  
     except Exception as e:
         logger.warning(f"Emotion classification failed: {e}")
         return "unknown"
@@ -190,7 +190,7 @@ def butter_highpass(cutoff, fs, order=5):
     return b, a
     
 def calculate_pitch_stats(y: np.ndarray, sr: int) -> Tuple[float, float]:
-    cutoff_freq = 80 
+    cutoff_freq = 80  
     b, a = butter_highpass(cutoff_freq, sr)
     y_filtered = lfilter(b, a, y)
     frame_size = int(0.02 * sr)
@@ -201,7 +201,7 @@ def calculate_pitch_stats(y: np.ndarray, sr: int) -> Tuple[float, float]:
         frame = y_filtered[i:i + frame_size]
         if np.mean(frame**2) > 0.0001:
             acf = np.correlate(frame, frame, mode='full')[len(frame) - 1:]
-            min_lag = int(sr / 300) 
+            min_lag = int(sr / 300)  
             max_lag = int(sr / 60)
             peaks, properties = find_peaks(acf[min_lag:max_lag], height=None)
             
@@ -241,7 +241,7 @@ def detect_acoustic_disfluencies(y: np.ndarray, sr: int, frame_len_ms: int = 25,
     zcr_frames = np.mean(np.diff(np.sign(y_frames), axis=1) != 0, axis=1)
 
     energy_threshold = np.mean(rms_frames) * 0.1
-    zcr_threshold = np.mean(zcr_frames) * 0.5 
+    zcr_threshold = np.mean(zcr_frames) * 0.5  
     
     min_event_frames = int(0.3 / (hop_len_ms / 1000))
     
@@ -272,8 +272,8 @@ def detect_acoustic_disfluencies(y: np.ndarray, sr: int, frame_len_ms: int = 25,
                         event_type = 'prolongation'
                         
                     results.append(DisfluencyResult(
-                        type=event_type, 
-                        start_time_s=round(start_time_s, 2), 
+                        type=event_type,  
+                        start_time_s=round(start_time_s, 2),  
                         duration_s=round(duration_s, 2)
                     ))
                     
@@ -285,37 +285,37 @@ def detect_acoustic_disfluencies(y: np.ndarray, sr: int, frame_len_ms: int = 25,
 # --- 4. Scoring Logic (Unchanged) ---
 
 def score_confidence(audio_features: Dict[str, Any], fluency_metrics: Dict[str, Any]) -> float:
-      
+        
         WEIGHTS = {
-                'WPM_IDEAL': 0.35, 
-                'DISFLUENCY_COUNT': 0.40, 
-                'PITCH_STABILITY': 0.15, 
-                'ENERGY_STD': 0.10, 
+                'WPM_IDEAL': 0.35,  
+                'DISFLUENCY_COUNT': 0.40,  
+                'PITCH_STABILITY': 0.15,  
+                'ENERGY_STD': 0.10,  
         }
 
         pace_wpm = audio_features.get('speaking_pace_wpm', 0)
         ideal_pace = 150.0
-        pace_deviation = min(0.5, abs(pace_wpm - ideal_pace) / ideal_pace) 
-        pace_score = max(0.0, 1.0 - (pace_deviation * 2)) 
+        pace_deviation = min(0.5, abs(pace_wpm - ideal_pace) / ideal_pace)  
+        pace_score = max(0.0, 1.0 - (pace_deviation * 2))  
 
         total_disfluencies = (
-                fluency_metrics.get('filler_word_count', 0) + 
+                fluency_metrics.get('filler_word_count', 0) +  
                 fluency_metrics.get('repetition_count', 0) +
                 fluency_metrics.get('acoustic_disfluency_count', 0)
         )
         total_words = fluency_metrics.get('total_words', 1)
-        max_rate = 0.05 
+        max_rate = 0.05  
         disfluency_rate = total_disfluencies / total_words
         disfluency_score = max(0.0, 1.0 - (disfluency_rate / max_rate))
 
         pitch_std = audio_features.get('pitch_std', 50.0)
-        max_pitch_std = 40.0 
+        max_pitch_std = 40.0  
         pitch_score = max(0.0, 1.0 - (pitch_std / max_pitch_std))
-      
+        
         energy_std = audio_features.get('energy_std', 0.0)
-        ideal_energy_std = 0.005 
+        ideal_energy_std = 0.005  
         energy_deviation = min(0.01, abs(energy_std - ideal_energy_std))
-        energy_score = max(0.0, 1.0 - (energy_deviation * 100)) 
+        energy_score = max(0.0, 1.0 - (energy_deviation * 100))  
 
         final_score = (
                 (pace_score * WEIGHTS['WPM_IDEAL']) +
