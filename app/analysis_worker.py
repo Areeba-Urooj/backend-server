@@ -18,8 +18,7 @@ from botocore.exceptions import ClientError
 from redis import Redis
 from rq import Worker 
 
-# Import ALL necessary functions and constants from the engine,
-# including the NEW acoustic analysis functions and the DisfluencyResult class.
+# Import ALL necessary functions and constants from the engine
 from analysis_engine import ( 
     detect_fillers, 
     detect_repetitions, 
@@ -27,9 +26,9 @@ from analysis_engine import (
     initialize_emotion_model,
     classify_emotion_simple,
     calculate_pitch_stats,
-    detect_acoustic_disfluencies, # 🔥 NEW
-    extract_audio_features,      # 🔥 Using the engine's extraction logic
-    MAX_DURATION_SECONDS         # Import max duration constant
+    detect_acoustic_disfluencies,
+    extract_audio_features,      # Used for safe duration check on raw file
+    MAX_DURATION_SECONDS         
 )
 
 # --- Configuration ---
@@ -62,7 +61,6 @@ except Exception as e:
     
 # --- Global ML Model/Scaler Initialization ---
 try:
-    # This must be consistent with the engine's initialization signature
     EMOTION_MODEL, EMOTION_SCALER, _ = initialize_emotion_model() 
     logger.info("[WORKER] ✅ Emotion model and scaler initialized/loaded.")
 except Exception as e:
@@ -74,14 +72,13 @@ if not OPENAI_API_KEY:
     logger.warning("[WORKER] ⚠️ OPENAI_API_KEY environment variable not found. LLM features will be disabled.")
 # ------------------------------------
 
-# --- REWRITTEN: Intelligent Feedback Generation Function (using httpx) ---
+# --- Intelligent Feedback Generation Function (using httpx) ---
 def generate_intelligent_feedback(transcript: str, metrics: Dict[str, Any]) -> List[str]:
     """Generates tailored feedback and recommendations using a direct HTTP request."""
     if not OPENAI_API_KEY:
         logger.warning("[OPENAI] Skipping feedback generation: OPENAI_API_KEY not set.")
         return ["Error: Feedback service is unavailable (API key not configured)."]
 
-    # Extract acoustic disfluency count
     acoustic_count = metrics.get('acoustic_disfluency_count', 0)
     
     metrics_summary = json.dumps({
@@ -90,7 +87,7 @@ def generate_intelligent_feedback(transcript: str, metrics: Dict[str, Any]) -> L
         "Pace (Words per Minute)": metrics.get('speaking_pace', 0),
         "Filler Word Count": metrics.get('filler_word_count', 0),
         "Repetition Count": metrics.get('repetition_count', 0),
-        "Acoustic Disfluency Count (Blocks/Stutters)": acoustic_count, # Include new metric
+        "Acoustic Disfluency Count (Blocks/Stutters)": acoustic_count, 
         "Silence Ratio": f"{metrics.get('silence_ratio', 0.0) * 100:.2f}%",
         "Emotion Detected": metrics.get('emotion'),
         "Confidence Score": f"{metrics.get('confidence_score', 0.0):.2f}",
@@ -98,7 +95,6 @@ def generate_intelligent_feedback(transcript: str, metrics: Dict[str, Any]) -> L
     
     system_prompt = (
         "You are an expert speech coach. Your task is to analyze the provided speech transcript and metrics. "
-        "The transcript is a clean version of the user's speech, but the metrics include acoustic evidence of blocks and stutters. "
         "Generate a structured list of exactly three highly specific, actionable, and encouraging recommendations "
         "for the user to improve their public speaking. "
         "The response MUST be a JSON array of strings wrapped in a single key called 'recommendations' "
@@ -131,9 +127,8 @@ def generate_intelligent_feedback(transcript: str, metrics: Dict[str, Any]) -> L
     try:
         logger.info("[OPENAI] Calling Chat API manually using httpx...")
         
-        # FINAL FIX: Bypassing Render's proxy injection
         with httpx.Client(trust_env=False) as client:
-            client.proxies = {} # Explicitly disable
+            client.proxies = {} # Explicitly disable proxy injection
             
             response = client.post(
                 api_url,
@@ -168,7 +163,7 @@ def generate_intelligent_feedback(transcript: str, metrics: Dict[str, Any]) -> L
         return [f"An error occurred during intelligent feedback generation: {e.__class__.__name__}"]
 
 
-# --- Core Analysis Function (With Acoustic Integration) ---
+# --- Core Analysis Function (Fixed Audio Loading) ---
 def perform_analysis_job(
     file_id: str, 
     s3_key: str, 
@@ -182,10 +177,8 @@ def perform_analysis_job(
     temp_audio_file = f"/tmp/{file_id}_{os.path.basename(s3_key)}"
     temp_wav_file = f"/tmp/{file_id}_converted.wav"
     
-    # 1. Fluency analysis first (uses the raw transcript immediately)
+    # 1. Fluency analysis first
     total_words = len(transcript.split()) 
-    
-    # 🔥 Use the UPDATED functions that return the list AND count
     filler_words_list, filler_word_count = detect_fillers(transcript)
     repetition_words_list, repetition_count = detect_repetitions(transcript)
     
@@ -196,15 +189,18 @@ def perform_analysis_job(
     confidence_score = 0.0
     
     try:
-        # 2. Download and Convert (Existing FFmpeg Logic)
+        # 2. Download (Original raw file)
         logger.info(f"⬇️ Downloading s3://{S3_BUCKET_NAME}/{s3_key}...")
         s3_client.download_file(S3_BUCKET_NAME, s3_key, temp_audio_file)
         
-        # Check if the file is too long before converting
-        audio_duration = extract_audio_features(temp_audio_file, 0).get('duration_s', 0)
+        # 🔥 FIX: Use extract_audio_features (which must use FFprobe/FFmpeg)
+        # to safely get duration of the raw M4A file before conversion/soundfile.read
+        audio_duration = extract_audio_features(temp_audio_file, 0).get('duration_s', 0) 
+        
         if audio_duration > MAX_DURATION_SECONDS:
              logger.warning(f"⚠️ Audio duration {audio_duration:.2f}s exceeds limit of {MAX_DURATION_SECONDS}s. It will be truncated.")
         
+        # 3. Conversion to WAV (Required for soundfile and ML models)
         ffmpeg_command = ["ffmpeg", "-i", temp_audio_file, "-ac", "1", "-ar", str(TARGET_SR), "-y", temp_wav_file]
         
         try:
@@ -217,12 +213,12 @@ def perform_analysis_job(
             logger.error("❌ FFmpeg command not found. Ensure FFmpeg is installed and in PATH.")
             raise Exception("FFmpeg not available in the worker environment.")
             
-        # 3. Load the converted WAV file (y and sr are needed for both feature extraction and acoustic disfluency detection)
+        # 4. Load the converted WAV file (NOW it's safe to use sf.read)
         y, sr = sf.read(temp_wav_file, dtype='float32', always_2d=False)
         if len(y.shape) > 1:
             y = np.mean(y, axis=1)
 
-        # Truncate 'y' here to prevent issues in the engine functions if the engine's extraction didn't handle it
+        # Truncate 'y'
         max_samples = sr * MAX_DURATION_SECONDS
         if len(y) > max_samples:
             y = y[:max_samples]
@@ -230,10 +226,11 @@ def perform_analysis_job(
         duration_seconds = len(y) / sr
         speaking_pace_wpm = (total_words / max(1, duration_seconds)) * 60
 
-        # 4. Feature Extraction & NEW Acoustic Analysis
+        # 5. Feature Extraction & Acoustic Analysis
         logger.info("📈 Extracting audio features and metrics...")
         
-        # --- Audio Feature Calculation (Re-calculate using y, sr) ---
+        # --- Audio Feature Calculation ---
+        # Recalculate based on truncated/converted 'y' and 'sr'
         rms = np.sqrt(np.mean(y**2)) 
         avg_amplitude = np.mean(np.abs(y))
         energy_std = np.std(np.abs(y)) 
@@ -244,8 +241,8 @@ def perform_analysis_job(
         long_pause_count = float(int(silence_ratio * (duration_seconds / 5))) 
         
         pitch_mean_proxy, pitch_std_proxy = calculate_pitch_stats(y, sr)
-        pitch_min = 0.0 # Keeping simple
-        pitch_max = 0.0 # Keeping simple
+        pitch_min = 0.0 
+        pitch_max = 0.0 
         
         audio_features = {
             "rms_mean": float(rms),
@@ -263,26 +260,20 @@ def perform_analysis_job(
         confidence_score = score_confidence(audio_features, fluency_metrics)
         emotion = classify_emotion_simple(temp_wav_file, EMOTION_MODEL, EMOTION_SCALER)
         
-        # 🔥 NEW: Acoustic Disfluency Detection
+        # Acoustic Disfluency Detection (uses y, sr which is the converted WAV)
         acoustic_disfluencies = detect_acoustic_disfluencies(y, sr)
-        # Convert NamedTuple to serializable list of dicts for JSON
         serializable_disfluencies = [d._asdict() for d in acoustic_disfluencies]
         
-        # 5. Compile Core Metrics for LLM
+        # 6. Compile Core Metrics for LLM
         core_analysis_metrics = {
             "confidence_score": round(confidence_score, 2),
             "speaking_pace": int(round(speaking_pace_wpm)),
-            
-            # 🔥 NEW FLUENCY METRICS (List and Count)
             "filler_word_count": filler_word_count,
             "filler_words_list": filler_words_list,
             "repetition_count": repetition_count,
             "repetition_words_list": repetition_words_list,
-            
-            # 🔥 NEW ACOUSTIC DISFLUENCIES
             "acoustic_disfluencies": serializable_disfluencies,
             "acoustic_disfluency_count": len(serializable_disfluencies), 
-            
             "long_pause_count": long_pause_count,
             "silence_ratio": round(silence_ratio, 2),
             "avg_amplitude": round(float(avg_amplitude), 4),
@@ -297,14 +288,14 @@ def perform_analysis_job(
             "duration_seconds": round(duration_seconds, 2),
         }
         
-        # 6. Generate Intelligent Feedback
+        # 7. Generate Intelligent Feedback
         logger.info("🤖 Generating intelligent feedback using OpenAI...")
         llm_recommendations = generate_intelligent_feedback(
             transcript=transcript, 
             metrics=core_analysis_metrics
         )
         
-        # 7. Compile Final Result
+        # 8. Compile Final Result
         final_result = {
             **core_analysis_metrics,
             "recommendations": llm_recommendations,
@@ -312,7 +303,7 @@ def perform_analysis_job(
 
         logger.info(f"✅ Analysis complete in {round(time.time() - job_start_time, 2)}s.")
         
-        # 8. Cleanup
+        # 9. Cleanup
         if os.path.exists(temp_audio_file): os.remove(temp_audio_file)
         if os.path.exists(temp_wav_file): os.remove(temp_wav_file)
         
