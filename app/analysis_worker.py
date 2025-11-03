@@ -10,6 +10,7 @@ import json
 
 # --- NEW IMPORTS FOR OPENAI ---
 from openai import OpenAI, RateLimitError, APIError 
+import httpx # Import httpx to manually configure the client
 # ------------------------------
 
 import boto3
@@ -18,7 +19,6 @@ from redis import Redis
 from rq import Worker 
 
 # Import ALL necessary functions and constants from the engine
-# Assuming 'analysis_engine' is in the Python path
 from analysis_engine import ( 
     detect_fillers, 
     detect_repetitions, 
@@ -60,7 +60,6 @@ except Exception as e:
     
 # --- Global ML Model/Scaler Initialization ---
 try:
-    # Assuming initialize_emotion_model returns (MODEL, SCALER, ENCODER)
     EMOTION_MODEL, EMOTION_SCALER, _ = initialize_emotion_model() 
     logger.info("[WORKER] ✅ Emotion model and scaler initialized/loaded.")
 except Exception as e:
@@ -73,28 +72,24 @@ try:
     openai_key = os.environ.get("OPENAI_API_KEY")
     if openai_key:
         
-        # 🔥 CRITICAL FIX: Temporarily remove all proxy-related environment variables 
-        # to definitively bypass the 'unexpected keyword argument proxies' error 
-        # caused by environment injection (e.g., from Render).
+        # 🔥 CRITICAL FIX: To bypass the 'proxies' error, we will manually
+        # create an httpx.Client and explicitly tell it NOT to use 
+        # environment proxies. We then pass this client to OpenAI.
         
-        # List and pop all proxy variables (case-insensitive check)
-        original_proxies = {}
-        keys_to_remove = [k for k in os.environ.keys() if 'proxy' in k.lower()]
-        for k in keys_to_remove:
-            original_proxies[k] = os.environ.pop(k)
-
-        # 1. Initialize the client using the API key. 
-        OPENAI_CLIENT = OpenAI(api_key=openai_key) 
+        # 1. Create a custom HTTP client that ignores environment proxies
+        http_client = httpx.Client(
+            proxies=None,  # Explicitly disable proxies
+            trust_env=False # Do not trust environment variables for proxies
+        )
         
-        # 2. Restore original proxy values (optional, but good practice)
-        os.environ.update(original_proxies)
-
-        logger.info("[WORKER] ✅ OpenAI Client initialized.")
+        # 2. Initialize the OpenAI client using this custom, clean http_client
+        OPENAI_CLIENT = OpenAI(api_key=openai_key, http_client=http_client) 
+        
+        logger.info("[WORKER] ✅ OpenAI Client initialized (with custom httpx client).")
     else:
         logger.warning("[WORKER] ⚠️ OPENAI_API_KEY environment variable not found. Skipping LLM initialization.")
         
 except Exception as e:
-    # If it fails here, the worker continues, but the LLM feature is disabled.
     logger.error(f"[WORKER] ❌ Failed to initialize OpenAI client: {e}. Worker will continue without LLM features.")
     OPENAI_CLIENT = None
 # --------------------------------------------
