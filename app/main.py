@@ -4,7 +4,8 @@ import os
 import sys
 import logging
 from uuid import uuid4
-from typing import Dict, Any, Optional, List # Import List for Pydantic list[T]
+# Import List and Field for better type hinting and Pydantic usage
+from typing import Dict, Any, Optional, List 
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form
 from fastapi.responses import JSONResponse
@@ -16,18 +17,19 @@ from botocore.exceptions import ClientError
 import redis
 from rq import Queue
 from rq.job import Job
-from pydantic import BaseModel # Ensure pydantic is imported
+from pydantic import BaseModel, Field, ValidationError # Import ValidationError for explicit handling
 
 # Ensure app path is included
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # --- Pydantic Models for Data Structures ---
-# 🔥 FIX: New model to handle highlight markers
+# 🔥 FIX 1: Corrected TextMarker model to match worker keys (based on your error log)
 class TextMarker(BaseModel):
-    start: int
-    end: int
+    # Worker seems to be returning 'type', 'word', 'start_char_index', 'end_char_index'
     type: str
-    text: str
+    word: str 
+    start_char_index: int
+    end_char_index: int
 
 class AnalysisResult(BaseModel):
     confidence_score: float
@@ -36,17 +38,19 @@ class AnalysisResult(BaseModel):
     repetition_count: int
     long_pause_count: float
     silence_ratio: float
-    avg_amplitude: float
+    # 🔥 FIX 2: Ensure avg_amplitude is present (or use default if worker is returning None)
+    # Assuming worker returns a float, making it required for data integrity.
+    avg_amplitude: float 
     pitch_mean: float
     pitch_std: float
     emotion: str
     energy_std: float
     recommendations: List[str]
     transcript: str
-    # 🔥 FIX: Add the new field to match the worker's output
-    highlight_markers: List[TextMarker] = [] 
-    # Add duration_seconds here if the worker returns it directly
-    duration_seconds: Optional[float] = None 
+    # Use the corrected TextMarker model
+    highlight_markers: List[TextMarker] = Field(default_factory=list)
+    # Adding an optional duration field for completeness (if worker returns it)
+    duration_seconds: Optional[float] = None
 
 
 class AnalysisStatusResponse(BaseModel):
@@ -55,7 +59,6 @@ class AnalysisStatusResponse(BaseModel):
     enqueued_at: Optional[str] = None
     started_at: Optional[str] = None
     ended_at: Optional[str] = None
-    # Use the corrected AnalysisResult model
     result: Optional[AnalysisResult] = None 
     error: Optional[str] = None
 
@@ -197,7 +200,6 @@ async def submit_analysis_job(
     file_id = os.path.splitext(os.path.basename(s3_key))[0]
 
     try:
-        # Job enqueuing logic is already correct from your snippet
         job = queue.enqueue(
             'app.analysis_worker.perform_analysis_job', 
             kwargs={
@@ -220,8 +222,6 @@ async def submit_analysis_job(
 
     except Exception as e:
         logger.error(f"[API] ❌ Error during job enqueue: {e}", exc_info=True)
-        # This is where a submission error (like incorrect worker import path) might trigger
-        # the immediate 'finished' status on a subsequent poll due to immediate failure.
         raise HTTPException(
             status_code=500,
             detail=f"Failed to submit analysis job: {str(e)}"
@@ -251,23 +251,37 @@ def get_analysis_status(job_id: str):
             job_result = job.result
             
             if job_result and isinstance(job_result, dict):
-                # We attempt to create the Pydantic model with the job result
+                
                 try:
-                    # Pass the whole dictionary to the Pydantic model for validation
-                    # The Pydantic model will handle defaults for missing fields.
+                    # Attempt to create the Pydantic model with the job result
                     analysis_result = AnalysisResult(**job_result)
                     response_data.result = analysis_result
-                except Exception as e:
-                    # Log failure to map worker result to Pydantic model
-                    logger.error(f"[API] ❌ FAILED to map job result to AnalysisResult model for job {job_id}: {e}", exc_info=True)
+                
+                except ValidationError as e:
+                    # Explicitly catch Pydantic validation errors
+                    error_message = f"{e.__class__.__name__} for AnalysisResult:\n{e.errors()}"
+                    logger.error(f"[API] ❌ FAILED to map job result to AnalysisResult model for job {job_id}:\n{error_message}", exc_info=True)
+                    
+                    # Set status to failed on the API response to clearly signal the client
                     response_data.status = 'failed'
-                    response_data.error = f"Result processing error (API): {str(e)}. Worker result was likely malformed."
+                    response_data.error = f"Result processing error (API): {str(e)}. Worker result keys/types are likely mismatched."
+                
+                except Exception as e:
+                    # Catch other potential errors during result processing
+                    logger.error(f"[API] ❌ General error processing job result for job {job_id}: {e}", exc_info=True)
+                    response_data.status = 'failed'
+                    response_data.error = f"General result processing error (API): {str(e)}"
+            
+            elif status == 'finished' and not job_result:
+                # Handle case where job is finished but result is None (worker returned nothing)
+                logger.error(f"[API] Job {job_id} finished, but result was None.")
+                response_data.status = 'failed'
+                response_data.error = "Job finished successfully, but worker returned no result data."
 
-        # Explicitly handle 'failed' status to ensure error information is returned
-        if status == 'failed':
+        # Explicitly handle 'failed' status from the worker
+        if status == 'failed' and job.exc_info:
             response_data.error = job.exc_info
-            # This check is critical for debugging worker failures
-            logger.error(f"[API] Full exception info for job {job_id}:\n{job.exc_info}")
+            logger.error(f"[API] Full exception info for worker job {job_id}:\n{job.exc_info}")
             
         return response_data
         
@@ -276,8 +290,7 @@ def get_analysis_status(job_id: str):
     except Exception as e:
         logger.error(f"[API] Error fetching job {job_id}: {e}", exc_info=True)
         # Check if the job actually exists in Redis (i.e., not a NotFoundError)
-        # RQ Job.fetch throws a generic Exception if the key is not found
-        if 'No such job' in str(e):
+        if 'No such job' in str(e) or 'NoneType' in str(e): # Added NoneType check for Job.fetch returning None
              raise HTTPException(status_code=404, detail=f"Job with ID {job_id} not found.")
         else:
              raise HTTPException(status_code=500, detail=f"Internal error fetching job status: {str(e)}")
