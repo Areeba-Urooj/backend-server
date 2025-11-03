@@ -1,16 +1,5 @@
 import os
 import logging
-
-# 🔥 CRITICAL FIX: Aggressively scrub proxy environment variables
-# This MUST run before any other modules (like httpx or openai) are imported.
-# Render is injecting 'proxies' and breaking the OpenAI client initialization.
-keys_to_remove = [k for k in os.environ.keys() if 'proxy' in k.lower()]
-if keys_to_remove:
-    logging.warning(f"Removing environment proxy keys: {keys_to_remove}")
-    for k in keys_to_remove:
-        del os.environ[k]
-
-# --- Now, standard imports can proceed ---
 from typing import Dict, Any, Optional, List
 import time
 import sys
@@ -19,10 +8,12 @@ import numpy as np
 import soundfile as sf
 import json
 
-# --- IMPORTS FOR OPENAI ---
-from openai import OpenAI, RateLimitError, APIError 
-import httpx # We keep this import, but the client init will be simpler
-# ------------------------------
+# --- IMPORTS FOR OPENAI (MANUAL HTTP) ---
+# We no longer import the OpenAI client, only its errors
+from openai import RateLimitError, APIError 
+# We use httpx to make the request manually
+import httpx
+# ------------------------------------
 
 import boto3
 from botocore.exceptions import ClientError
@@ -43,9 +34,9 @@ from analysis_engine import (
 S3_BUCKET_NAME = os.environ.get('S3_BUCKET_NAME')
 AWS_REGION = os.environ.get('AWS_REGION', 'eu-north-1') 
 TARGET_SR = 16000 # Standard sample rate for speech analysis
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") # Get the key once
 
 # --- Logging Setup ---
-# (Note: logging is configured *after* the initial scrub)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | [WORKER] - %(message)s'
@@ -63,9 +54,6 @@ def get_s3_client():
 try:
     s3_client = get_s3_client()
     logger.info(f"[WORKER] ✅ S3 Client initialized for bucket: {S3_BUCKET_NAME} in region: {AWS_REGION}")
-except ValueError as e:
-    logger.error(f"[WORKER] ❌ Configuration Error: {e}")
-    raise
 except Exception as e:
     logger.error(f"[WORKER] ❌ S3 Initialization failed: {e}")
     raise
@@ -79,31 +67,18 @@ except Exception as e:
     EMOTION_MODEL, EMOTION_SCALER = None, None
 
 # --- OpenAI Client Initialization ---
-# The proxy variables should be gone by now, so a simple init should work.
-OPENAI_CLIENT = None
-try:
-    openai_key = os.environ.get("OPENAI_API_KEY")
-    if openai_key:
-        # We can now safely initialize the client.
-        # We pass the key explicitly just to be safe.
-        OPENAI_CLIENT = OpenAI(api_key=openai_key) 
-        logger.info("[WORKER] ✅ OpenAI Client initialized.")
-    else:
-        logger.warning("[WORKER] ⚠️ OPENAI_API_KEY environment variable not found. Skipping LLM initialization.")
-        
-except Exception as e:
-    # If it *still* fails with 'proxies', the injection is happening at a 
-    # level Python's 'os.environ' cannot control.
-    logger.error(f"[WORKER] ❌ Failed to initialize OpenAI client: {e}. Worker will continue without LLM features.")
-    OPENAI_CLIENT = None
-# --------------------------------------------
+# We no longer initialize a global client. We will create one per request,
+# or simply check if the API key is present.
+if not OPENAI_API_KEY:
+    logger.warning("[WORKER] ⚠️ OPENAI_API_KEY environment variable not found. LLM features will be disabled.")
+# ------------------------------------
 
-# --- Intelligent Feedback Generation Function ---
+# --- REWRITTEN: Intelligent Feedback Generation Function (using httpx) ---
 def generate_intelligent_feedback(transcript: str, metrics: Dict[str, Any]) -> List[str]:
-    """Generates tailored feedback and recommendations using the OpenAI API."""
-    if not OPENAI_CLIENT:
-        logger.warning("[OPENAI] Skipping feedback generation: OpenAI client not initialized.")
-        return ["Error: Feedback service unavailable. Please check the OPENAI_API_KEY environment variable and ensure the worker started correctly."]
+    """Generates tailored feedback and recommendations using a direct HTTP request."""
+    if not OPENAI_API_KEY:
+        logger.warning("[OPENAI] Skipping feedback generation: OPENAI_API_KEY not set.")
+        return ["Error: Feedback service is unavailable (API key not configured)."]
 
     metrics_summary = json.dumps({
         "Duration (Seconds)": metrics.get('duration_seconds', 0.0),
@@ -131,32 +106,60 @@ def generate_intelligent_feedback(transcript: str, metrics: Dict[str, Any]) -> L
         "Based on these, generate a JSON object with a single key 'recommendations' containing a list of 3 specific recommendations."
     )
 
+    # Define API endpoint and headers
+    api_url = "https://api.openai.com/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    
+    # Define the request payload
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
+        "response_format": {"type": "json_object"}, 
+        "temperature": 0.7
+    }
+
     try:
-        response = OPENAI_CLIENT.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            response_format={"type": "json_object"}, 
-            temperature=0.7
-        )
+        logger.info("[OPENAI] Calling Chat API manually using httpx...")
         
-        feedback_json_str = response.choices[0].message.content
-        feedback_data = json.loads(feedback_json_str)
-        recommendations = feedback_data.get('recommendations', []) 
+        # Create a clean httpx client that ignores environment proxies
+        with httpx.Client(proxies=None, trust_env=False) as client:
+            response = client.post(
+                api_url,
+                headers=headers,
+                json=payload,
+                timeout=60.0 # 60 second timeout
+            )
+        
+        # Check for HTTP errors
+        response.raise_for_status() 
+        
+        feedback_data = response.json()
+        feedback_json_str = feedback_data['choices'][0]['message']['content']
+        
+        # The content itself is a JSON string, so we parse it again
+        recommendation_data = json.loads(feedback_json_str)
+        recommendations = recommendation_data.get('recommendations', []) 
         
         if isinstance(recommendations, list) and all(isinstance(r, str) for r in recommendations):
             logger.info(f"[OPENAI] Successfully generated {len(recommendations)} recommendations.")
             return recommendations
         else:
-            logger.error(f"[OPENAI] Generated feedback was not a list of strings: {feedback_data}")
-            return ["Feedback generation failed: Model returned incorrect format. (Check LLM instructions)"]
+            logger.error(f"[OPENAI] Generated feedback was not a list of strings: {recommendation_data}")
+            return ["Feedback generation failed: Model returned incorrect format."]
 
-    except RateLimitError:
-        logger.error("[OPENAI] Rate limit exceeded for feedback generation.")
-        return ["Feedback service is temporarily busy. Please try again later."]
-    except (APIError, json.JSONDecodeError, Exception) as e:
+    except httpx.RequestError as e:
+        logger.error(f"[OPENAI] HTTP request error: {e}")
+        return [f"An error occurred connecting to the feedback service: {e.__class__.__name__}"]
+    except httpx.HTTPStatusError as e:
+        logger.error(f"[OPENAI] HTTP status error: {e.response.status_code} - {e.response.text}")
+        return [f"Feedback service returned an error: {e.response.status_code}"]
+    except (json.JSONDecodeError, Exception) as e:
         logger.error(f"[OPENAI] API call or JSON decoding failed: {e.__class__.__name__}: {e}")
         return [f"An error occurred during intelligent feedback generation: {e.__class__.__name__}"]
 
@@ -186,7 +189,6 @@ def perform_analysis_job(
     emotion = "Neutral"
     confidence_score = 0.0
     
-    # We will compute the rest of the metrics inside the try block
     try:
         # 2. Download and Convert (Existing FFmpeg Logic)
         logger.info(f"⬇️ Downloading s3://{S3_BUCKET_NAME}/{s3_key}...")
@@ -194,7 +196,6 @@ def perform_analysis_job(
         
         ffmpeg_command = ["ffmpeg", "-i", temp_audio_file, "-ac", "1", "-ar", str(TARGET_SR), "-y", temp_wav_file]
         
-        # Check if ffmpeg is available and run the command
         try:
             subprocess.run(ffmpeg_command, capture_output=True, text=True, check=True)
             logger.info("✅ FFmpeg conversion successful.")
@@ -205,7 +206,6 @@ def perform_analysis_job(
             logger.error("❌ FFmpeg command not found. Ensure FFmpeg is installed and in PATH.")
             raise Exception("FFmpeg not available in the worker environment.")
             
-
         # 3. Load the converted WAV file
         y, sr = sf.read(temp_wav_file)
         if len(y.shape) > 1:
@@ -221,7 +221,6 @@ def perform_analysis_job(
         avg_amplitude = np.mean(np.abs(y))
         energy_std = np.std(np.abs(y)) 
         
-        # Simple silence ratio/pause count approximation
         y_abs = np.abs(y)
         amplitude_threshold = np.mean(y_abs) * 0.2
         silence_ratio = np.sum(y_abs < amplitude_threshold) / len(y_abs)
@@ -259,8 +258,8 @@ def perform_analysis_job(
             "avg_amplitude": round(float(avg_amplitude), 4),
             "pitch_mean": round(float(pitch_mean_proxy), 2),
             "pitch_std": round(float(pitch_std_proxy), 2),
-            "pitch_min": pitch_min, # Placeholder
-            "pitch_max": pitch_max, # Placeholder
+            "pitch_min": pitch_min, 
+            "pitch_max": pitch_max, 
             "emotion": emotion.lower(),
             "energy_std": round(float(energy_std), 4),
             "transcript": transcript,
@@ -291,7 +290,6 @@ def perform_analysis_job(
 
     except Exception as e:
         logger.error(f"❌ FATAL Analysis Error: {e}", exc_info=True)
-        # Final cleanup attempt before re-raising
         if os.path.exists(temp_audio_file): os.remove(temp_audio_file)
         if os.path.exists(temp_wav_file): os.remove(temp_wav_file)
         raise
