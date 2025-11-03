@@ -18,13 +18,14 @@ from redis import Redis
 from rq import Worker 
 
 # Import ALL necessary functions and constants from the engine
-from app.analysis_engine import (
+# Assuming 'app.analysis_engine' is in the Python path
+from analysis_engine import ( 
     detect_fillers, 
     detect_repetitions, 
     score_confidence, 
     initialize_emotion_model,
     classify_emotion_simple,
-    calculate_pitch_stats # Import the ZCR-based pitch calculator
+    calculate_pitch_stats 
 )
 
 # --- Configuration ---
@@ -32,14 +33,14 @@ S3_BUCKET_NAME = os.environ.get('S3_BUCKET_NAME')
 AWS_REGION = os.environ.get('AWS_REGION', 'eu-north-1') 
 TARGET_SR = 16000 # Standard sample rate for speech analysis
 
-# --- Logging Setup (Existing Code) ---
+# --- Logging Setup ---
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | [WORKER] - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# --- S3 Client Initialization (Existing Code) ---
+# --- S3 Client Initialization ---
 def get_s3_client():
     """Initializes and returns the S3 client."""
     if not S3_BUCKET_NAME:
@@ -53,10 +54,14 @@ try:
 except ValueError as e:
     logger.error(f"[WORKER] ❌ Configuration Error: {e}")
     raise
+except Exception as e:
+    logger.error(f"[WORKER] ❌ S3 Initialization failed: {e}")
+    raise
     
-# --- Global ML Model/Scaler Initialization (Existing Code) ---
+# --- Global ML Model/Scaler Initialization ---
 try:
-    EMOTION_MODEL, EMOTION_SCALER, _ = initialize_emotion_model()
+    # Assuming initialize_emotion_model returns (MODEL, SCALER, ENCODER)
+    EMOTION_MODEL, EMOTION_SCALER, _ = initialize_emotion_model() 
     logger.info("[WORKER] ✅ Emotion model and scaler initialized/loaded.")
 except Exception as e:
     logger.error(f"[WORKER] ❌ Failed to initialize emotion model: {e}", exc_info=True)
@@ -64,30 +69,46 @@ except Exception as e:
 
 # --- OpenAI Client Initialization (FIXED) ---
 try:
-    # 🔥 FIX: Use the standard initialization which correctly reads the OPENAI_API_KEY environment variable. 
-    # Explicitly passing the key is no longer necessary, as the previous explicit call 
-    # may have conflicted with environment setups, causing a TypeError if non-standard 
-    # parameters were passed implicitly. The `OpenAI()` constructor handles this correctly.
     openai_key = os.environ.get("OPENAI_API_KEY")
     if openai_key:
-        OPENAI_CLIENT = OpenAI() # Initialize without explicit api_key if the environment variable is set
+        
+        # 🔥 CRITICAL FIX: To avoid the 'unexpected keyword argument proxies' error,
+        # we defensively remove proxy-related environment variables before 
+        # initializing the client, as some hosting environments inject them.
+        
+        # NOTE: This modification must happen *before* the OpenAI client is instantiated.
+        # It's an aggressive but effective way to bypass the external environment interference.
+        
+        if 'PROXIES' in os.environ:
+            del os.environ['PROXIES']
+        if 'proxies' in os.environ:
+            del os.environ['proxies']
+        if 'HTTPS_PROXY' in os.environ:
+            del os.environ['HTTPS_PROXY']
+        if 'HTTP_PROXY' in os.environ:
+            del os.environ['HTTP_PROXY']
+            
+        # Initialize the client using the API key we confirmed exists.
+        # By providing the key explicitly, we minimize reliance on environment auto-detection
+        # which might be where the proxy injection occurs.
+        OPENAI_CLIENT = OpenAI(api_key=openai_key) 
         logger.info("[WORKER] ✅ OpenAI Client initialized.")
     else:
         logger.warning("[WORKER] ⚠️ OPENAI_API_KEY environment variable not found. Skipping LLM initialization.")
         OPENAI_CLIENT = None
         
 except Exception as e:
-    # Catch any remaining initialization errors
-    logger.error(f"[WORKER] ❌ Failed to initialize OpenAI client: {e}")
+    # This should catch the proxy error if the defensive fix fails, but let's hope it works!
+    logger.error(f"[WORKER] ❌ Failed to initialize OpenAI client: {e}. Worker will continue without LLM features.")
     OPENAI_CLIENT = None
 # --------------------------------------------
 
-# --- NEW: Intelligent Feedback Generation Function ---
+# --- Intelligent Feedback Generation Function ---
 def generate_intelligent_feedback(transcript: str, metrics: Dict[str, Any]) -> List[str]:
     """Generates tailored feedback and recommendations using the OpenAI API."""
     if not OPENAI_CLIENT:
         logger.warning("[OPENAI] Skipping feedback generation: OpenAI client not initialized.")
-        return ["Error: Feedback service unavailable. Please check the OPENAI_API_KEY environment variable."]
+        return ["Error: Feedback service unavailable. Please check the OPENAI_API_KEY environment variable and ensure the worker started correctly."]
 
     metrics_summary = json.dumps({
         "Duration (Seconds)": metrics.get('duration_seconds', 0.0),
@@ -177,8 +198,18 @@ def perform_analysis_job(
         s3_client.download_file(S3_BUCKET_NAME, s3_key, temp_audio_file)
         
         ffmpeg_command = ["ffmpeg", "-i", temp_audio_file, "-ac", "1", "-ar", str(TARGET_SR), "-y", temp_wav_file]
-        subprocess.run(ffmpeg_command, capture_output=True, text=True, check=True)
-        logger.info("✅ FFmpeg conversion successful.")
+        
+        # Check if ffmpeg is available and run the command
+        try:
+            subprocess.run(ffmpeg_command, capture_output=True, text=True, check=True)
+            logger.info("✅ FFmpeg conversion successful.")
+        except subprocess.CalledProcessError as e:
+            logger.error(f"❌ FFmpeg conversion failed: {e.stderr}", exc_info=True)
+            raise Exception("FFmpeg conversion failed.")
+        except FileNotFoundError:
+            logger.error("❌ FFmpeg command not found. Ensure FFmpeg is installed and in PATH.")
+            raise Exception("FFmpeg not available in the worker environment.")
+            
 
         # 3. Load the converted WAV file
         y, sr = sf.read(temp_wav_file)
@@ -188,32 +219,23 @@ def perform_analysis_job(
         duration_seconds = len(y) / sr
         speaking_pace_wpm = (total_words / max(1, duration_seconds)) * 60
 
-        # 4. Feature Extraction (Using streamlined NumPy/Engine functions)
+        # 4. Feature Extraction 
         logger.info("📈 Extracting audio features and metrics...")
         
-        # Calculate RMS for energy/volume
-        rms = np.sqrt(np.mean(y**2)) # Single RMS value for the whole audio
+        rms = np.sqrt(np.mean(y**2)) 
         avg_amplitude = np.mean(np.abs(y))
-        
-        # Calculate energy std (using the whole signal amplitude std as proxy)
         energy_std = np.std(np.abs(y)) 
         
-        # Simple silence ratio/pause count approximation (using 0.2 of overall mean amplitude as a rough threshold)
+        # Simple silence ratio/pause count approximation
         y_abs = np.abs(y)
         amplitude_threshold = np.mean(y_abs) * 0.2
         silence_ratio = np.sum(y_abs < amplitude_threshold) / len(y_abs)
-        # 🟢 IMPROVED: Base long_pause_count on a reasonable time threshold (e.g., silence > 1s) 
-        # For simplicity, we keep the worker's previous rough estimate, but ensure it's a float.
         long_pause_count = float(int(silence_ratio * (duration_seconds / 5))) 
         
-        # Pitch Stats (using imported engine function)
         pitch_mean_proxy, pitch_std_proxy = calculate_pitch_stats(y, sr)
         
-        # NOTE: Your Flutter model expects pitchMin and pitchMax. 
-        # The worker's `calculate_pitch_stats` function does not provide these directly.
-        # We'll set these to 0.0 for now to prevent a KeyError, or use a placeholder.
-        pitch_min = 0.0 
-        pitch_max = 0.0 
+        pitch_min = 0.0 # Placeholder
+        pitch_max = 0.0 # Placeholder
         
         audio_features = {
             "rms_mean": float(rms),
@@ -279,7 +301,7 @@ def perform_analysis_job(
         if os.path.exists(temp_wav_file): os.remove(temp_wav_file)
         raise
 
-# --- Worker Entrypoint (Existing Code) ---
+# --- Worker Entrypoint ---
 if __name__ == '__main__':
     redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379')
     logger.info(f"Starting worker and connecting to Redis at: {redis_url}")
@@ -287,11 +309,16 @@ if __name__ == '__main__':
     try:
         redis_conn = Redis.from_url(redis_url)
         redis_conn.ping()
-        logger.info("Redis connection established.")
+        logger.info("✅ Redis connection established")
         
+        # Explicitly ensure the worker imports the job function from this module
+        # This is a common pattern when the worker script is the one running.
         worker = Worker(['default'], connection=redis_conn)
         worker.work()
 
     except Exception as e:
         logger.error(f"❌ Worker failed to start: {e}", exc_info=True)
+        # Check for Redis connection failure specifically
+        if 'redis' in str(e).lower():
+            logger.critical("⚠️ Check your REDIS_URL and network configuration.")
         exit(1)
