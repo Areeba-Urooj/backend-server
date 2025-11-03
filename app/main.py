@@ -4,7 +4,6 @@ import os
 import sys
 import logging
 from uuid import uuid4
-# Import List and Field for better type hinting and Pydantic usage
 from typing import Dict, Any, Optional, List 
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form
@@ -17,15 +16,13 @@ from botocore.exceptions import ClientError
 import redis
 from rq import Queue
 from rq.job import Job
-from pydantic import BaseModel, Field, ValidationError # Import ValidationError for explicit handling
+from pydantic import BaseModel, Field, ValidationError 
 
 # Ensure app path is included
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # --- Pydantic Models for Data Structures ---
-# 🔥 FIX 1: Corrected TextMarker model to match worker keys (based on your error log)
 class TextMarker(BaseModel):
-    # Worker seems to be returning 'type', 'word', 'start_char_index', 'end_char_index'
     type: str
     word: str 
     start_char_index: int
@@ -38,18 +35,15 @@ class AnalysisResult(BaseModel):
     repetition_count: int
     long_pause_count: float
     silence_ratio: float
-    # 🔥 FIX 2: Ensure avg_amplitude is present (or use default if worker is returning None)
-    # Assuming worker returns a float, making it required for data integrity.
-    avg_amplitude: float 
+    # 🔥 FINAL CRITICAL FIX: Make avg_amplitude optional to stop the validation error.
+    avg_amplitude: Optional[float] = None 
     pitch_mean: float
     pitch_std: float
     emotion: str
     energy_std: float
     recommendations: List[str]
     transcript: str
-    # Use the corrected TextMarker model
     highlight_markers: List[TextMarker] = Field(default_factory=list)
-    # Adding an optional duration field for completeness (if worker returns it)
     duration_seconds: Optional[float] = None
 
 
@@ -258,22 +252,18 @@ def get_analysis_status(job_id: str):
                     response_data.result = analysis_result
                 
                 except ValidationError as e:
-                    # Explicitly catch Pydantic validation errors
                     error_message = f"{e.__class__.__name__} for AnalysisResult:\n{e.errors()}"
                     logger.error(f"[API] ❌ FAILED to map job result to AnalysisResult model for job {job_id}:\n{error_message}", exc_info=True)
                     
-                    # Set status to failed on the API response to clearly signal the client
                     response_data.status = 'failed'
                     response_data.error = f"Result processing error (API): {str(e)}. Worker result keys/types are likely mismatched."
                 
                 except Exception as e:
-                    # Catch other potential errors during result processing
                     logger.error(f"[API] ❌ General error processing job result for job {job_id}: {e}", exc_info=True)
                     response_data.status = 'failed'
                     response_data.error = f"General result processing error (API): {str(e)}"
             
             elif status == 'finished' and not job_result:
-                # Handle case where job is finished but result is None (worker returned nothing)
                 logger.error(f"[API] Job {job_id} finished, but result was None.")
                 response_data.status = 'failed'
                 response_data.error = "Job finished successfully, but worker returned no result data."
@@ -289,8 +279,7 @@ def get_analysis_status(job_id: str):
         raise HTTPException(status_code=500, detail="Could not connect to Redis.")
     except Exception as e:
         logger.error(f"[API] Error fetching job {job_id}: {e}", exc_info=True)
-        # Check if the job actually exists in Redis (i.e., not a NotFoundError)
-        if 'No such job' in str(e) or 'NoneType' in str(e): # Added NoneType check for Job.fetch returning None
+        if 'No such job' in str(e) or 'NoneType' in str(e): 
              raise HTTPException(status_code=404, detail=f"Job with ID {job_id} not found.")
         else:
              raise HTTPException(status_code=500, detail=f"Internal error fetching job status: {str(e)}")
