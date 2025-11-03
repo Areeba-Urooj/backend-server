@@ -18,15 +18,14 @@ from redis import Redis
 from rq import Worker 
 
 # Import ALL necessary functions and constants from the engine
-# This now imports the real, complete functions from above
 from analysis_engine import ( 
     detect_fillers, 
     detect_repetitions, 
     score_confidence, 
     initialize_emotion_model,
     classify_emotion_simple,
-    calculate_pitch_stats,
-    detect_acoustic_disfluencies,
+    calculate_pitch_stats, # Now NumPy/SciPy based
+    detect_acoustic_disfluencies, # Now NumPy/SciPy based
     extract_audio_features,      
     MAX_DURATION_SECONDS         
 )
@@ -34,7 +33,7 @@ from analysis_engine import (
 # --- Configuration ---
 S3_BUCKET_NAME = os.environ.get('S3_BUCKET_NAME')
 AWS_REGION = os.environ.get('AWS_REGION', 'eu-north-1') 
-TARGET_SR = 16000 # Standard sample rate for speech analysis
+TARGET_SR = 16000 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") 
 
 # --- Logging Setup ---
@@ -46,7 +45,6 @@ logger = logging.getLogger(__name__)
 
 # --- S3 Client Initialization ---
 def get_s3_client():
-    """Initializes and returns the S3 client."""
     if not S3_BUCKET_NAME:
         logger.error("[WORKER] ❌ S3_BUCKET_NAME environment variable is not set.")
         raise ValueError("S3_BUCKET_NAME is not configured.")
@@ -73,8 +71,7 @@ def generate_intelligent_feedback(transcript: str, metrics: Dict[str, Any]) -> L
     if not OPENAI_API_KEY:
         logger.warning("[OPENAI] Skipping feedback generation: OPENAI_API_KEY not set.")
         return ["Error: Feedback service is unavailable (API key not configured)."]
-
-    # ... (Rest of the generate_intelligent_feedback function is identical to the previous version) ...
+        
     acoustic_count = metrics.get('acoustic_disfluency_count', 0)
     
     metrics_summary = json.dumps({
@@ -196,6 +193,7 @@ def perform_analysis_job(
              logger.warning(f"⚠️ Audio duration {audio_duration:.2f}s exceeds limit of {MAX_DURATION_SECONDS}s.")
         
         # 4. Conversion to WAV 
+        # NOTE: FFmpeg MUST be a system dependency installed on the worker.
         ffmpeg_command = ["ffmpeg", "-i", temp_audio_file, "-ac", "1", "-ar", str(TARGET_SR), "-y", temp_wav_file]
         
         try:
@@ -224,25 +222,30 @@ def perform_analysis_job(
         # 6. Feature Extraction & Acoustic Analysis
         logger.info("📈 Extracting audio features and metrics...")
         
-        # --- Audio Feature Calculation (Numpy/Librosa based on 'y') ---
+        # --- Audio Feature Calculation (Numpy/SciPy based on 'y') ---
         rms = np.sqrt(np.mean(y**2)) 
         avg_amplitude = np.mean(np.abs(y))
         energy_std = np.std(np.abs(y)) 
         
         # Simple silence calculation based on RMS frames
-        frame_len = int(sr * 0.05) # 50ms frames
-        hop_len = int(sr * 0.01)   # 10ms hop
-        rms_frames = librosa.feature.rms(y=y, frame_length=frame_len, hop_length=hop_len)[0]
-        rms_threshold = np.mean(rms_frames) * 0.1 # 10% of average RMS
+        frame_len = int(sr * 0.05) 
+        hop_len = int(sr * 0.01)   
+        
+        # Use simple NumPy RMS calculation, avoiding Librosa
+        num_frames = (len(y) - frame_len) // hop_len + 1
+        rms_frames = np.array([np.sqrt(np.mean(y[i*hop_len : i*hop_len + frame_len]**2)) for i in range(num_frames)])
+        
+        rms_threshold = np.mean(rms_frames) * 0.1 
         silence_frames = np.sum(rms_frames < rms_threshold)
         total_frames = len(rms_frames)
         silence_ratio = silence_frames / total_frames if total_frames > 0 else 0.0
         
-        # Simple proxy for long pause count (e.g., more than 0.5s of consecutive silence)
+        # Simple proxy for long pause count
         frames_per_half_second = int(0.5 / (hop_len / sr))
         long_pause_count = len([i for i in range(len(rms_frames) - frames_per_half_second) 
                                 if all(rms_frames[i+j] < rms_threshold for j in range(frames_per_half_second))])
 
+        # Uses the new NumPy/SciPy function
         pitch_mean, pitch_std = calculate_pitch_stats(y, sr)
         
         audio_features_for_score = {
@@ -253,7 +256,7 @@ def perform_analysis_job(
             "pitch_mean": float(pitch_mean),
         }
         
-        # Acoustic Disfluency Detection
+        # Uses the new NumPy/SciPy function
         acoustic_disfluencies = detect_acoustic_disfluencies(y, sr)
         serializable_disfluencies = [d._asdict() for d in acoustic_disfluencies]
         
