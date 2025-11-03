@@ -1,5 +1,16 @@
 import os
 import logging
+
+# 🔥 CRITICAL FIX: Aggressively scrub proxy environment variables
+# This MUST run before any other modules (like httpx or openai) are imported.
+# Render is injecting 'proxies' and breaking the OpenAI client initialization.
+keys_to_remove = [k for k in os.environ.keys() if 'proxy' in k.lower()]
+if keys_to_remove:
+    logging.warning(f"Removing environment proxy keys: {keys_to_remove}")
+    for k in keys_to_remove:
+        del os.environ[k]
+
+# --- Now, standard imports can proceed ---
 from typing import Dict, Any, Optional, List
 import time
 import sys
@@ -8,9 +19,9 @@ import numpy as np
 import soundfile as sf
 import json
 
-# --- NEW IMPORTS FOR OPENAI ---
+# --- IMPORTS FOR OPENAI ---
 from openai import OpenAI, RateLimitError, APIError 
-import httpx # Import httpx to manually configure the client
+import httpx # We keep this import, but the client init will be simpler
 # ------------------------------
 
 import boto3
@@ -34,6 +45,7 @@ AWS_REGION = os.environ.get('AWS_REGION', 'eu-north-1')
 TARGET_SR = 16000 # Standard sample rate for speech analysis
 
 # --- Logging Setup ---
+# (Note: logging is configured *after* the initial scrub)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | [WORKER] - %(message)s'
@@ -66,30 +78,22 @@ except Exception as e:
     logger.error(f"[WORKER] ❌ Failed to initialize emotion model: {e}", exc_info=True)
     EMOTION_MODEL, EMOTION_SCALER = None, None
 
-# --- OpenAI Client Initialization (FINAL FIXED ATTEMPT) ---
+# --- OpenAI Client Initialization ---
+# The proxy variables should be gone by now, so a simple init should work.
 OPENAI_CLIENT = None
 try:
     openai_key = os.environ.get("OPENAI_API_KEY")
     if openai_key:
-        
-        # 🔥 CRITICAL FIX: To bypass the 'proxies' error, we will manually
-        # create an httpx.Client and explicitly tell it NOT to use 
-        # environment proxies. We then pass this client to OpenAI.
-        
-        # 1. Create a custom HTTP client that ignores environment proxies
-        http_client = httpx.Client(
-            proxies=None,  # Explicitly disable proxies
-            trust_env=False # Do not trust environment variables for proxies
-        )
-        
-        # 2. Initialize the OpenAI client using this custom, clean http_client
-        OPENAI_CLIENT = OpenAI(api_key=openai_key, http_client=http_client) 
-        
-        logger.info("[WORKER] ✅ OpenAI Client initialized (with custom httpx client).")
+        # We can now safely initialize the client.
+        # We pass the key explicitly just to be safe.
+        OPENAI_CLIENT = OpenAI(api_key=openai_key) 
+        logger.info("[WORKER] ✅ OpenAI Client initialized.")
     else:
         logger.warning("[WORKER] ⚠️ OPENAI_API_KEY environment variable not found. Skipping LLM initialization.")
         
 except Exception as e:
+    # If it *still* fails with 'proxies', the injection is happening at a 
+    # level Python's 'os.environ' cannot control.
     logger.error(f"[WORKER] ❌ Failed to initialize OpenAI client: {e}. Worker will continue without LLM features.")
     OPENAI_CLIENT = None
 # --------------------------------------------
