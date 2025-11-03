@@ -18,7 +18,7 @@ from redis import Redis
 from rq import Worker 
 
 # Import ALL necessary functions and constants from the engine
-# Assuming 'app.analysis_engine' is in the Python path
+# Assuming 'analysis_engine' is in the Python path
 from analysis_engine import ( 
     detect_fillers, 
     detect_repetitions, 
@@ -67,38 +67,34 @@ except Exception as e:
     logger.error(f"[WORKER] ❌ Failed to initialize emotion model: {e}", exc_info=True)
     EMOTION_MODEL, EMOTION_SCALER = None, None
 
-# --- OpenAI Client Initialization (FIXED) ---
+# --- OpenAI Client Initialization (FINAL FIXED ATTEMPT) ---
+OPENAI_CLIENT = None
 try:
     openai_key = os.environ.get("OPENAI_API_KEY")
     if openai_key:
         
-        # 🔥 CRITICAL FIX: To avoid the 'unexpected keyword argument proxies' error,
-        # we defensively remove proxy-related environment variables before 
-        # initializing the client, as some hosting environments inject them.
+        # 🔥 CRITICAL FIX: Temporarily remove all proxy-related environment variables 
+        # to definitively bypass the 'unexpected keyword argument proxies' error 
+        # caused by environment injection (e.g., from Render).
         
-        # NOTE: This modification must happen *before* the OpenAI client is instantiated.
-        # It's an aggressive but effective way to bypass the external environment interference.
-        
-        if 'PROXIES' in os.environ:
-            del os.environ['PROXIES']
-        if 'proxies' in os.environ:
-            del os.environ['proxies']
-        if 'HTTPS_PROXY' in os.environ:
-            del os.environ['HTTPS_PROXY']
-        if 'HTTP_PROXY' in os.environ:
-            del os.environ['HTTP_PROXY']
-            
-        # Initialize the client using the API key we confirmed exists.
-        # By providing the key explicitly, we minimize reliance on environment auto-detection
-        # which might be where the proxy injection occurs.
+        # List and pop all proxy variables (case-insensitive check)
+        original_proxies = {}
+        keys_to_remove = [k for k in os.environ.keys() if 'proxy' in k.lower()]
+        for k in keys_to_remove:
+            original_proxies[k] = os.environ.pop(k)
+
+        # 1. Initialize the client using the API key. 
         OPENAI_CLIENT = OpenAI(api_key=openai_key) 
+        
+        # 2. Restore original proxy values (optional, but good practice)
+        os.environ.update(original_proxies)
+
         logger.info("[WORKER] ✅ OpenAI Client initialized.")
     else:
         logger.warning("[WORKER] ⚠️ OPENAI_API_KEY environment variable not found. Skipping LLM initialization.")
-        OPENAI_CLIENT = None
         
 except Exception as e:
-    # This should catch the proxy error if the defensive fix fails, but let's hope it works!
+    # If it fails here, the worker continues, but the LLM feature is disabled.
     logger.error(f"[WORKER] ❌ Failed to initialize OpenAI client: {e}. Worker will continue without LLM features.")
     OPENAI_CLIENT = None
 # --------------------------------------------
@@ -311,14 +307,11 @@ if __name__ == '__main__':
         redis_conn.ping()
         logger.info("✅ Redis connection established")
         
-        # Explicitly ensure the worker imports the job function from this module
-        # This is a common pattern when the worker script is the one running.
         worker = Worker(['default'], connection=redis_conn)
         worker.work()
 
     except Exception as e:
         logger.error(f"❌ Worker failed to start: {e}", exc_info=True)
-        # Check for Redis connection failure specifically
         if 'redis' in str(e).lower():
             logger.critical("⚠️ Check your REDIS_URL and network configuration.")
         exit(1)
