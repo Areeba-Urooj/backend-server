@@ -4,7 +4,7 @@ import os
 import sys
 import logging
 from uuid import uuid4
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List # Import List for Pydantic list[T]
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form
 from fastapi.responses import JSONResponse
@@ -16,13 +16,19 @@ from botocore.exceptions import ClientError
 import redis
 from rq import Queue
 from rq.job import Job
-from pydantic import BaseModel
+from pydantic import BaseModel # Ensure pydantic is imported
 
 # Ensure app path is included
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# Import models (Assuming you have these defined in app/models.py)
-# NOTE: The models used here must be correctly defined in app/models.py
+# --- Pydantic Models for Data Structures ---
+# 🔥 FIX: New model to handle highlight markers
+class TextMarker(BaseModel):
+    start: int
+    end: int
+    type: str
+    text: str
+
 class AnalysisResult(BaseModel):
     confidence_score: float
     speaking_pace: int
@@ -35,8 +41,13 @@ class AnalysisResult(BaseModel):
     pitch_std: float
     emotion: str
     energy_std: float
-    recommendations: list[str]
+    recommendations: List[str]
     transcript: str
+    # 🔥 FIX: Add the new field to match the worker's output
+    highlight_markers: List[TextMarker] = [] 
+    # Add duration_seconds here if the worker returns it directly
+    duration_seconds: Optional[float] = None 
+
 
 class AnalysisStatusResponse(BaseModel):
     job_id: str
@@ -44,7 +55,8 @@ class AnalysisStatusResponse(BaseModel):
     enqueued_at: Optional[str] = None
     started_at: Optional[str] = None
     ended_at: Optional[str] = None
-    result: Optional[AnalysisResult] = None
+    # Use the corrected AnalysisResult model
+    result: Optional[AnalysisResult] = None 
     error: Optional[str] = None
 
 # --- Configuration ---
@@ -109,7 +121,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Pydantic Models for Response (defined above or imported from app.models) ---
+# --- Pydantic Models for Response ---
 class SubmissionResponse(BaseModel):
     file_id: str
     job_id: str
@@ -185,7 +197,7 @@ async def submit_analysis_job(
     file_id = os.path.splitext(os.path.basename(s3_key))[0]
 
     try:
-        # 🟢 CRITICAL FIX: Use 'kwargs' to separate worker arguments from RQ arguments
+        # Job enqueuing logic is already correct from your snippet
         job = queue.enqueue(
             'app.analysis_worker.perform_analysis_job', 
             kwargs={
@@ -194,7 +206,6 @@ async def submit_analysis_job(
                 'transcript': transcript,
                 'user_id': user_id,
             },
-            # These arguments are now correctly passed ONLY to RQ
             job_timeout='30m', 
             serializer='json' 
         )
@@ -209,6 +220,8 @@ async def submit_analysis_job(
 
     except Exception as e:
         logger.error(f"[API] ❌ Error during job enqueue: {e}", exc_info=True)
+        # This is where a submission error (like incorrect worker import path) might trigger
+        # the immediate 'finished' status on a subsequent poll due to immediate failure.
         raise HTTPException(
             status_code=500,
             detail=f"Failed to submit analysis job: {str(e)}"
@@ -225,8 +238,6 @@ def get_analysis_status(job_id: str):
         status = job.get_status()
         
         logger.info(f"[API] Job {job_id} status: {status}")
-        if status == 'failed':
-            logger.error(f"[API] Job {job_id} failed with error: {job.exc_info}")
         
         response_data = AnalysisStatusResponse(
             job_id=job_id,
@@ -237,33 +248,25 @@ def get_analysis_status(job_id: str):
 
         if status == 'finished':
             response_data.ended_at = job.ended_at.isoformat() if job.ended_at else None
-            
-            job_result = job.result 
+            job_result = job.result
             
             if job_result and isinstance(job_result, dict):
-                # This mapping is crucial and relies on the worker returning a flat dictionary 
-                # that matches the fields in the AnalysisResult Pydantic model.
-                analysis_result = AnalysisResult(
-                    confidence_score=job_result.get('confidence_score', 0.0),
-                    speaking_pace=int(job_result.get('speaking_pace', 0)),
-                    filler_word_count=job_result.get('filler_word_count', 0),
-                    repetition_count=job_result.get('repetition_count', 0),
-                    long_pause_count=float(job_result.get('long_pause_count', 0)),
-                    silence_ratio=float(job_result.get('silence_ratio', 0)),
-                    avg_amplitude=float(job_result.get('avg_amplitude', 0)),
-                    pitch_mean=float(job_result.get('pitch_mean', 0)),
-                    pitch_std=float(job_result.get('pitch_std', 0)),
-                    emotion=job_result.get('emotion', 'neutral'),
-                    energy_std=float(job_result.get('energy_std', 0)),
-                    recommendations=job_result.get('recommendations', []),
-                    transcript=job_result.get('transcript', ''),
-                    # Add duration_seconds here if your worker returns it:
-                    # duration_seconds=float(job_result.get('duration_seconds', 0)), 
-                )
-                response_data.result = analysis_result
-                
-        elif status == 'failed':
+                # We attempt to create the Pydantic model with the job result
+                try:
+                    # Pass the whole dictionary to the Pydantic model for validation
+                    # The Pydantic model will handle defaults for missing fields.
+                    analysis_result = AnalysisResult(**job_result)
+                    response_data.result = analysis_result
+                except Exception as e:
+                    # Log failure to map worker result to Pydantic model
+                    logger.error(f"[API] ❌ FAILED to map job result to AnalysisResult model for job {job_id}: {e}", exc_info=True)
+                    response_data.status = 'failed'
+                    response_data.error = f"Result processing error (API): {str(e)}. Worker result was likely malformed."
+
+        # Explicitly handle 'failed' status to ensure error information is returned
+        if status == 'failed':
             response_data.error = job.exc_info
+            # This check is critical for debugging worker failures
             logger.error(f"[API] Full exception info for job {job_id}:\n{job.exc_info}")
             
         return response_data
@@ -272,5 +275,9 @@ def get_analysis_status(job_id: str):
         raise HTTPException(status_code=500, detail="Could not connect to Redis.")
     except Exception as e:
         logger.error(f"[API] Error fetching job {job_id}: {e}", exc_info=True)
-        # Often this is a 404/not found, but a fetch error can be ambiguous
-        raise HTTPException(status_code=404, detail=f"Job with ID {job_id} not found or failed to fetch.")
+        # Check if the job actually exists in Redis (i.e., not a NotFoundError)
+        # RQ Job.fetch throws a generic Exception if the key is not found
+        if 'No such job' in str(e):
+             raise HTTPException(status_code=404, detail=f"Job with ID {job_id} not found.")
+        else:
+             raise HTTPException(status_code=500, detail=f"Internal error fetching job status: {str(e)}")
