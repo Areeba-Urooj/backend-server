@@ -20,9 +20,9 @@ logger = logging.getLogger(__name__)
 
 # Time-based marker for acoustic/audio events
 class DisfluencyResult(NamedTuple):
-    type: str # 'block', 'prolongation'
-    start_time_s: float
-    duration_s: float
+        type: str # 'block', 'prolongation'
+        start_time_s: float
+        duration_s: float
 
 # Index-based marker for textual events (CRITICAL for Flutter highlighting)
 class TextMarker(NamedTuple):
@@ -34,32 +34,32 @@ class TextMarker(NamedTuple):
 
 # --- 1. Core Feature Extraction (FFprobe/FFmpeg Safe) ---
 def extract_audio_features(file_path: str) -> Dict[str, Any]:
-    """
-    Safely extracts duration using ffprobe for any format (M4A/WAV).
-    """
-    features: Dict[str, Any] = {'duration_s': 0.0, 'sample_rate': 0}
-    try:
-        command = [
-            'ffprobe', '-v', 'error',
-            '-show_entries', 'format=duration:stream=sample_rate',
-            '-of', 'json', file_path
-        ]
-        result = subprocess.run(command, capture_output=True, text=True, check=True)
-        probe_data = json.loads(result.stdout)
-        duration = float(probe_data['format']['duration'])
-        features['duration_s'] = duration
-        if 'streams' in probe_data and probe_data['streams']:
-            sample_rate = int(probe_data['streams'][0].get('sample_rate', TARGET_SR))
-            features['sample_rate'] = sample_rate
-        else:
-            features['sample_rate'] = TARGET_SR
-        return features
-    except subprocess.CalledProcessError as e:
-        logger.error(f"FFprobe duration extraction failed: {e.stderr}")
-        raise RuntimeError(f"FFprobe duration extraction failed: {e.__class__.__name__}")
-    except Exception as e:
-        logger.error(f"Error during audio feature extraction (FFprobe): {e}")
-        raise RuntimeError(f"Error during audio feature extraction (FFprobe): {e.__class__.__name__}")
+        """
+        Safely extracts duration using ffprobe for any format (M4A/WAV).
+        """
+        features: Dict[str, Any] = {'duration_s': 0.0, 'sample_rate': 0}
+        try:
+                command = [
+                        'ffprobe', '-v', 'error',
+                        '-show_entries', 'format=duration:stream=sample_rate',
+                        '-of', 'json', file_path
+                ]
+                result = subprocess.run(command, capture_output=True, text=True, check=True)
+                probe_data = json.loads(result.stdout)
+                duration = float(probe_data['format']['duration'])
+                features['duration_s'] = duration
+                if 'streams' in probe_data and probe_data['streams']:
+                        sample_rate = int(probe_data['streams'][0].get('sample_rate', TARGET_SR))
+                        features['sample_rate'] = sample_rate
+                else:
+                        features['sample_rate'] = TARGET_SR
+                return features
+        except subprocess.CalledProcessError as e:
+                logger.error(f"FFprobe duration extraction failed: {e.stderr}")
+                raise RuntimeError(f"FFprobe duration extraction failed: {e.__class__.__name__}")
+        except Exception as e:
+                logger.error(f"Error during audio feature extraction (FFprobe): {e}")
+                raise RuntimeError(f"Error during audio feature extraction (FFprobe): {e.__class__.__name__}")
 
 # --- 2. Textual Analysis Functions (MODIFIED FOR HIGHLIGHTING) ---
 
@@ -285,43 +285,43 @@ def detect_acoustic_disfluencies(y: np.ndarray, sr: int, frame_len_ms: int = 25,
 # --- 4. Scoring Logic (Unchanged) ---
 
 def score_confidence(audio_features: Dict[str, Any], fluency_metrics: Dict[str, Any]) -> float:
-    
-    WEIGHTS = {
-        'WPM_IDEAL': 0.35, 
-        'DISFLUENCY_COUNT': 0.40, 
-        'PITCH_STABILITY': 0.15, 
-        'ENERGY_STD': 0.10, 
-    }
+      
+        WEIGHTS = {
+                'WPM_IDEAL': 0.35, 
+                'DISFLUENCY_COUNT': 0.40, 
+                'PITCH_STABILITY': 0.15, 
+                'ENERGY_STD': 0.10, 
+        }
 
-    pace_wpm = audio_features.get('speaking_pace_wpm', 0)
-    ideal_pace = 150.0
-    pace_deviation = min(0.5, abs(pace_wpm - ideal_pace) / ideal_pace) 
-    pace_score = max(0.0, 1.0 - (pace_deviation * 2)) 
+        pace_wpm = audio_features.get('speaking_pace_wpm', 0)
+        ideal_pace = 150.0
+        pace_deviation = min(0.5, abs(pace_wpm - ideal_pace) / ideal_pace) 
+        pace_score = max(0.0, 1.0 - (pace_deviation * 2)) 
 
-    total_disfluencies = (
-        fluency_metrics.get('filler_word_count', 0) + 
-        fluency_metrics.get('repetition_count', 0) +
-        fluency_metrics.get('acoustic_disfluency_count', 0)
-    )
-    total_words = fluency_metrics.get('total_words', 1)
-    max_rate = 0.05 
-    disfluency_rate = total_disfluencies / total_words
-    disfluency_score = max(0.0, 1.0 - (disfluency_rate / max_rate))
+        total_disfluencies = (
+                fluency_metrics.get('filler_word_count', 0) + 
+                fluency_metrics.get('repetition_count', 0) +
+                fluency_metrics.get('acoustic_disfluency_count', 0)
+        )
+        total_words = fluency_metrics.get('total_words', 1)
+        max_rate = 0.05 
+        disfluency_rate = total_disfluencies / total_words
+        disfluency_score = max(0.0, 1.0 - (disfluency_rate / max_rate))
 
-    pitch_std = audio_features.get('pitch_std', 50.0)
-    max_pitch_std = 40.0 
-    pitch_score = max(0.0, 1.0 - (pitch_std / max_pitch_std))
-    
-    energy_std = audio_features.get('energy_std', 0.0)
-    ideal_energy_std = 0.005 
-    energy_deviation = min(0.01, abs(energy_std - ideal_energy_std))
-    energy_score = max(0.0, 1.0 - (energy_deviation * 100)) 
+        pitch_std = audio_features.get('pitch_std', 50.0)
+        max_pitch_std = 40.0 
+        pitch_score = max(0.0, 1.0 - (pitch_std / max_pitch_std))
+      
+        energy_std = audio_features.get('energy_std', 0.0)
+        ideal_energy_std = 0.005 
+        energy_deviation = min(0.01, abs(energy_std - ideal_energy_std))
+        energy_score = max(0.0, 1.0 - (energy_deviation * 100)) 
 
-    final_score = (
-        (pace_score * WEIGHTS['WPM_IDEAL']) +
-        (disfluency_score * WEIGHTS['DISFLUENCY_COUNT']) +
-        (pitch_score * WEIGHTS['PITCH_STABILITY']) +
-        (energy_score * WEIGHTS['ENERGY_STD'])
-    )
+        final_score = (
+                (pace_score * WEIGHTS['WPM_IDEAL']) +
+                (disfluency_score * WEIGHTS['DISFLUENCY_COUNT']) +
+                (pitch_score * WEIGHTS['PITCH_STABILITY']) +
+                (energy_score * WEIGHTS['ENERGY_STD'])
+        )
 
-    return min(1.0, max(0.0, final_score))
+        return min(1.0, max(0.0, final_score))
