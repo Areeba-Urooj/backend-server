@@ -5,23 +5,26 @@ import numpy as np
 import soundfile as sf
 import os
 import sys
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, List, NamedTuple
 from sklearn.preprocessing import StandardScaler
 # Note: We avoid importing librosa for memory reasons.
-# We will use simple scipy/numpy methods for pitch and features.
 
 # --- Global Constants for Pitch Analysis ---
-# A common sample rate for speech analysis
 TARGET_SR = 16000
-# Duration limit to prevent OOM errors on large files
 MAX_DURATION_SECONDS = 90 # 1.5 minutes maximum
+FRAME_SIZE_MS = 25 # 25ms frame size for ZCR and energy analysis
 
-# --- Feature Extraction Helpers ---
+# --- New: Structured Acoustic Disfluency Result ---
+class DisfluencyResult(NamedTuple):
+    type: str # 'Block', 'Prolongation', 'Rapid Repetition'
+    start_time_s: float
+    duration_s: float
+
+# --- Feature Extraction Helpers (No changes needed) ---
 
 def get_audio_duration(wav_file_path: str) -> float:
     """Safely get the duration of an audio file."""
     try:
-        # Use soundfile to read file info without loading full data
         info = sf.info(wav_file_path)
         return info.duration
     except Exception as e:
@@ -31,13 +34,7 @@ def get_audio_duration(wav_file_path: str) -> float:
 def calculate_pitch_stats(audio: np.ndarray, sr: int) -> Tuple[float, float]:
     """
     Placeholder for pitch calculation using basic zero-crossing rate (ZCR) approximation.
-    NOTE: Real pitch analysis requires a robust library like librosa/pyaudio.
-    This is a low-resource approximation for stability.
     """
-    # A simplified, low-resource proxy for pitch variability: ZCR
-    # ZCR is the rate at which the signal changes sign. It's related to fundamental frequency (pitch).
-    
-    # Calculate zero-crossing rate (ZCR) for small, non-overlapping frames
     frame_size = int(0.025 * sr) # 25ms frame
     hop_size = int(0.01 * sr) # 10ms hop
     
@@ -53,32 +50,25 @@ def calculate_pitch_stats(audio: np.ndarray, sr: int) -> Tuple[float, float]:
         
     zcr_array = np.array(zcr_values)
     
-    # ZCR mean and std are used as proxies for pitch mean/std.
-    # Higher ZCR typically means higher frequency/pitch.
-    pitch_mean_proxy = np.mean(zcr_array) * 1000 # Scale for a more readable number
+    pitch_mean_proxy = np.mean(zcr_array) * 1000 
     pitch_std_proxy = np.std(zcr_array) * 1000
     
     return pitch_mean_proxy, pitch_std_proxy
 
-# --- Main Feature Extraction Function (Crucial for fixing the worker) ---
+# --- Core Feature Extraction (No changes needed) ---
 
 def extract_audio_features(wav_file_path: str, total_words: int) -> Dict[str, Any]:
     """
     Loads audio, limits duration, and extracts core features (RMS, Pitch, Pace).
-    Uses memory-efficient methods.
     """
     features: Dict[str, Any] = {}
     
     try:
-        # 1. Load Audio Data Safely
-        # We use sf.read to avoid librosa's high memory footprint.
         y, sr = sf.read(wav_file_path, dtype='float32', always_2d=False)
 
-        # Ensure mono audio
         if len(y.shape) > 1:
             y = np.mean(y, axis=1)
 
-        # Limit audio length to prevent memory overload
         max_samples = sr * MAX_DURATION_SECONDS
         if len(y) > max_samples:
             y = y[:max_samples]
@@ -89,9 +79,9 @@ def extract_audio_features(wav_file_path: str, total_words: int) -> Dict[str, An
         # 2. RMS (Root Mean Square) for Volume/Energy
         rms_values = np.sqrt(np.mean(y**2))
         features['rms_mean'] = np.mean(rms_values)
-        features['rms_std'] = np.std(y) # std of amplitude as a proxy for variability
+        features['rms_std'] = np.std(y) 
 
-        # 3. Pitch Statistics (Low-Resource Approximation)
+        # 3. Pitch Statistics 
         pitch_mean, pitch_std = calculate_pitch_stats(y, sr)
         features['pitch_mean'] = pitch_mean
         features['pitch_std'] = pitch_std
@@ -104,68 +94,153 @@ def extract_audio_features(wav_file_path: str, total_words: int) -> Dict[str, An
 
     except Exception as e:
         print(f"FATAL: Error during audio feature extraction: {e}", file=sys.stderr)
-        # Re-raising the error is crucial for RQ to mark the job as failed
         raise RuntimeError(f"Audio feature extraction failed: {e}")
 
+# --- FLUENCY FUNCTIONS (UPDATED TO RETURN LISTS) ---
 
-# --- Filler Word Detection (No changes needed) ---
-def detect_fillers(transcript: str) -> int:
-    """Detect filler words in the transcript."""
-    # ... (Keep existing implementation)
+def detect_fillers(transcript: str) -> Tuple[List[str], int]:
+    """Detect filler words in the transcript and return the list of matches and the count."""
     filler_words = [
-        'um', 'uh', 'like', 'you know', 'I mean', 'right', 'so', 
+        'um', 'uh', 'like', 'you know', 'i mean', 'right', 'so',  
         'actually', 'basically', 'literally', 'well', 'you see',
         'hmm', 'ah', 'er', 'okay', 'alright', 'sort of', 'kind of'
     ]
     
     transcript_lower = transcript.lower()
-    filler_count = 0
-    for filler in filler_words:
-        pattern = r'\b' + re.escape(filler) + r'\b'
-        matches = re.findall(pattern, transcript_lower)
-        filler_count += len(matches)
+    matches = []
     
-    return filler_count
+    for filler in filler_words:
+        # Use word boundaries for accurate matching
+        pattern = r'\b' + re.escape(filler) + r'\b'
+        matches.extend(re.findall(pattern, transcript_lower))
+        
+    return matches, len(matches)
 
-# --- Repetition/Stutter Detection (No changes needed) ---
-def detect_repetitions(transcript: str) -> int:
-    """Detect repetitions and stutters in the transcript."""
-    # ... (Keep existing implementation)
+
+def detect_repetitions(transcript: str) -> Tuple[List[str], int]:
+    """
+    Detect immediate word/phrase repetitions in the transcript.
+    Returns the list of the repeated phrases/words and the count.
+    """
     cleaned_transcript = re.sub(r'[^\w\s]', ' ', transcript)
     cleaned_transcript = re.sub(r'\s+', ' ', cleaned_transcript).strip()
     words = cleaned_transcript.lower().split()
     
     if len(words) < 2:
-        return 0
+        return [], 0
     
-    repetition_count = 0
+    repetition_list = []
     
-    # Check for immediate word repetitions
+    # 1. Check for immediate word repetitions (e.g., "I I went")
     for i in range(len(words) - 1):
         if words[i] == words[i + 1]:
-            repetition_count += 1
-    
-    # Check for trigram repetitions
-    if len(words) >= 3:
-        for i in range(len(words) - 2):
-            phrase1 = ' '.join(words[i:i+2])
-            phrase2 = ' '.join(words[i+1:i+3])
-            if phrase1 == phrase2:
-                repetition_count += 1
-    
-    # Check for 4-word phrase repetitions
+            repetition_list.append(words[i]) # Store the repeated word itself
+
+    # 2. Check for two-word phrase repetitions (e.g., "I went home I went home")
     if len(words) >= 4:
         for i in range(len(words) - 3):
             phrase1 = ' '.join(words[i:i+2])
             phrase2 = ' '.join(words[i+2:i+4])
             if phrase1 == phrase2:
-                repetition_count += 1
+                repetition_list.append(phrase1)
     
-    return repetition_count
+    return repetition_list, len(repetition_list)
+
+
+# --- NEW: ACOUSTIC DISFLUENCY DETECTION ---
+
+def detect_acoustic_disfluencies(y: np.ndarray, sr: int) -> List[DisfluencyResult]:
+    """
+    Detects acoustic signs of disfluency (blocks, prolongations) in the raw audio.
+    
+    Args:
+        y: Audio time series (numpy array).
+        sr: Sample rate.
+        
+    Returns:
+        List of DisfluencyResult objects (NamedTuple: type, start_time_s, duration_s)
+    """
+    results: List[DisfluencyResult] = []
+    
+    # --- Acoustic Parameters ---
+    # Convert milliseconds to samples
+    frame_samples = int(FRAME_SIZE_MS * sr / 1000)
+    hop_samples = int(frame_samples / 2) # 50% overlap
+
+    # Thresholds (Tuned based on general speech characteristics)
+    MIN_BLOCK_DURATION_S = 0.5 # 500ms of silence/near-silence
+    ENERGY_SILENCE_THRESHOLD = np.std(np.abs(y)) * 0.1 # Very low energy
+    PROLONGATION_FRAME_COUNT = int(0.3 * 1000 / FRAME_SIZE_MS) # ~300ms 
+    ZCR_STABLE_THRESHOLD = 0.005 # Low ZCR change indicates stable sound (vowel hold)
+
+    if len(y) < frame_samples:
+        return results
+
+    # --- 1. Frame-level Analysis ---
+    frame_energies = []
+    frame_zcr_means = []
+    
+    for i in range(0, len(y) - frame_samples, hop_samples):
+        frame = y[i:i + frame_samples]
+        energy = np.mean(np.abs(frame))
+        zcr = np.sum(np.abs(np.diff(np.sign(frame)))) / (2.0 * frame_samples)
+        frame_energies.append(energy)
+        frame_zcr_means.append(zcr)
+
+    energy_array = np.array(frame_energies)
+    zcr_array = np.array(frame_zcr_means)
+    
+    # Convert to boolean flags
+    is_silent = energy_array < ENERGY_SILENCE_THRESHOLD
+    
+    # --- 2. Block/Silence Detection (Potential 'Blocks') ---
+    in_block = False
+    block_start_frame = -1
+    
+    for i, silent in enumerate(is_silent):
+        if silent and not in_block:
+            in_block = True
+            block_start_frame = i
+        elif not silent and in_block:
+            block_end_frame = i
+            duration_frames = block_end_frame - block_start_frame
+            duration_s = duration_frames * hop_samples / sr
+            
+            if duration_s >= MIN_BLOCK_DURATION_S:
+                start_s = block_start_frame * hop_samples / sr
+                results.append(DisfluencyResult(
+                    type='Block (Pause)', 
+                    start_time_s=start_s, 
+                    duration_s=duration_s
+                ))
+            in_block = False
+
+    # --- 3. Simple Prolongation Detection (Stable ZCR during non-silent speech) ---
+    # Look for frames where ZCR is stable (vowel is held) for > PROLONGATION_FRAME_COUNT
+    for i in range(len(zcr_array) - PROLONGATION_FRAME_COUNT):
+        # Check if energy is NOT silent AND ZCR variation is low over the window
+        is_speech = np.all(energy_array[i : i + PROLONGATION_FRAME_COUNT] > ENERGY_SILENCE_THRESHOLD)
+        zcr_stable = np.std(zcr_array[i : i + PROLONGATION_FRAME_COUNT]) < ZCR_STABLE_THRESHOLD
+        
+        if is_speech and zcr_stable:
+             # Found a potential prolongation
+             start_s = i * hop_samples / sr
+             duration_s = PROLONGATION_FRAME_COUNT * hop_samples / sr
+             results.append(DisfluencyResult(
+                 type='Prolongation',
+                 start_time_s=start_s,
+                 duration_s=duration_s
+             ))
+             # Skip ahead to avoid detecting the same prolonged segment multiple times
+             i += PROLONGATION_FRAME_COUNT - 1
+             
+    # NOTE: Rapid repetition (stuttering) is the hardest to detect without ML. 
+    # For now, we rely on the Block and Prolongation proxies.
+             
+    return results
 
 # --- Speaking Confidence Score (No changes needed) ---
 def score_confidence(audio_features: Dict[str, Any], fluency_metrics: Dict[str, Any]) -> float:
-    """Calculate speaking confidence score."""
     # ... (Keep existing implementation)
     rms_std = audio_features.get('rms_std', 0)
     rms_mean = audio_features.get('rms_mean', 0)
@@ -211,64 +286,50 @@ def score_confidence(audio_features: Dict[str, Any], fluency_metrics: Dict[str, 
     
     return round(max(0.0, min(1.0, confidence_score)), 2)
 
-# --- Pre-trained Emotion Model (No changes needed) ---
+# --- Emotion Model (No changes needed) ---
 def initialize_emotion_model():
-    """
-    Initialize a simple rule-based emotion classifier.
-    """
+    """Initialize a simple rule-based emotion classifier."""
     print("Initializing rule-based emotion classifier...")
     model = None
     scaler = StandardScaler()
     
-    # Fit scaler with dummy data so it's ready to use
     dummy_data = np.random.randn(100, 16)
     scaler.fit(dummy_data)
     
     return model, scaler, True
 
 def classify_emotion_simple(audio_path: str, model=None, scaler=None) -> str:
-    """
-    Rule-based emotion classification using audio features.
-    No ML model needed - uses heuristics based on energy, pitch, and tempo.
-    """
+    # ... (Keep existing implementation)
     try:
-        # Load audio
-        # Using sf.read (soundfile) instead of audioread/librosa for stability
         y, sr = sf.read(audio_path, dtype='float32', always_2d=False)
         if len(y.shape) > 1:
             y = np.mean(y, axis=1)
-        
-        # Limit duration (using a smaller limit here for the emotion analysis itself)
-        max_samples = sr * 10  # 10 seconds max for speed
+            
+        max_samples = sr * 10 
         if len(y) > max_samples:
             y = y[:max_samples]
-        
-        # Calculate key features
-        # 1. Energy (amplitude)
+            
         energy = np.mean(np.abs(y))
         energy_std = np.std(np.abs(y))
         
-        # 2. Zero crossing rate (indicates pitch/frequency changes)
         zero_crossings = np.sum(np.abs(np.diff(np.sign(y)))) / (2 * len(y))
         
-        # 3. Tempo/rhythm variation
-        frame_size = int(0.1 * sr)  # 100ms frames
+        frame_size = int(0.1 * sr) 
         frame_energies = []
         for i in range(0, len(y) - frame_size, frame_size):
             frame = y[i:i + frame_size]
             frame_energies.append(np.mean(np.abs(frame)))
-        
+            
         tempo_variation = np.std(frame_energies) if frame_energies else 0
         
-        # Rule-based classification
         if energy > 0.15 and zero_crossings > 0.08 and tempo_variation > 0.05:
-            return "High Energy"  # Excited, enthusiastic
+            return "High Energy"
         elif energy < 0.05 or tempo_variation < 0.02:
-            return "Neutral"  # Calm, monotone
+            return "Neutral"
         elif energy_std > 0.08 and tempo_variation > 0.04:
-            return "Stress"  # Variable, tense
+            return "Stress"
         else:
-            return "Neutral"  # Default
+            return "Neutral"
             
     except Exception as e:
         print(f"Error classifying emotion: {e}", file=sys.stderr)
