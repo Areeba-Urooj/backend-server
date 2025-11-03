@@ -9,7 +9,6 @@ import soundfile as sf
 import json
 
 # --- IMPORTS FOR OPENAI (MANUAL HTTP) ---
-from openai import RateLimitError, APIError 
 import httpx
 # ------------------------------------
 
@@ -19,6 +18,7 @@ from redis import Redis
 from rq import Worker 
 
 # Import ALL necessary functions and constants from the engine
+# This now imports the real, complete functions from above
 from analysis_engine import ( 
     detect_fillers, 
     detect_repetitions, 
@@ -27,7 +27,7 @@ from analysis_engine import (
     classify_emotion_simple,
     calculate_pitch_stats,
     detect_acoustic_disfluencies,
-    extract_audio_features,      # Used for safe duration check on raw file
+    extract_audio_features,      
     MAX_DURATION_SECONDS         
 )
 
@@ -35,7 +35,7 @@ from analysis_engine import (
 S3_BUCKET_NAME = os.environ.get('S3_BUCKET_NAME')
 AWS_REGION = os.environ.get('AWS_REGION', 'eu-north-1') 
 TARGET_SR = 16000 # Standard sample rate for speech analysis
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") # Get the key once
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") 
 
 # --- Logging Setup ---
 logging.basicConfig(
@@ -67,11 +67,6 @@ except Exception as e:
     logger.error(f"[WORKER] ❌ Failed to initialize emotion model: {e}", exc_info=True)
     EMOTION_MODEL, EMOTION_SCALER = None, None
 
-# --- OpenAI API Key Check ---
-if not OPENAI_API_KEY:
-    logger.warning("[WORKER] ⚠️ OPENAI_API_KEY environment variable not found. LLM features will be disabled.")
-# ------------------------------------
-
 # --- Intelligent Feedback Generation Function (using httpx) ---
 def generate_intelligent_feedback(transcript: str, metrics: Dict[str, Any]) -> List[str]:
     """Generates tailored feedback and recommendations using a direct HTTP request."""
@@ -79,6 +74,7 @@ def generate_intelligent_feedback(transcript: str, metrics: Dict[str, Any]) -> L
         logger.warning("[OPENAI] Skipping feedback generation: OPENAI_API_KEY not set.")
         return ["Error: Feedback service is unavailable (API key not configured)."]
 
+    # ... (Rest of the generate_intelligent_feedback function is identical to the previous version) ...
     acoustic_count = metrics.get('acoustic_disfluency_count', 0)
     
     metrics_summary = json.dumps({
@@ -128,7 +124,7 @@ def generate_intelligent_feedback(transcript: str, metrics: Dict[str, Any]) -> L
         logger.info("[OPENAI] Calling Chat API manually using httpx...")
         
         with httpx.Client(trust_env=False) as client:
-            client.proxies = {} # Explicitly disable proxy injection
+            client.proxies = {} 
             
             response = client.post(
                 api_url,
@@ -162,8 +158,7 @@ def generate_intelligent_feedback(transcript: str, metrics: Dict[str, Any]) -> L
         logger.error(f"[OPENAI] API call or JSON decoding failed: {e.__class__.__name__}: {e}")
         return [f"An error occurred during intelligent feedback generation: {e.__class__.__name__}"]
 
-
-# --- Core Analysis Function (Fixed Audio Loading) ---
+# --- Core Analysis Function ---
 def perform_analysis_job(
     file_id: str, 
     s3_key: str, 
@@ -193,14 +188,14 @@ def perform_analysis_job(
         logger.info(f"⬇️ Downloading s3://{S3_BUCKET_NAME}/{s3_key}...")
         s3_client.download_file(S3_BUCKET_NAME, s3_key, temp_audio_file)
         
-        # 🔥 FIX: Use extract_audio_features (which must use FFprobe/FFmpeg)
-        # to safely get duration of the raw M4A file before conversion/soundfile.read
-        audio_duration = extract_audio_features(temp_audio_file, 0).get('duration_s', 0) 
+        # 3. Safe Duration Check on the raw file
+        audio_features_raw = extract_audio_features(temp_audio_file)
+        audio_duration = audio_features_raw.get('duration_s', 0)
         
         if audio_duration > MAX_DURATION_SECONDS:
-             logger.warning(f"⚠️ Audio duration {audio_duration:.2f}s exceeds limit of {MAX_DURATION_SECONDS}s. It will be truncated.")
+             logger.warning(f"⚠️ Audio duration {audio_duration:.2f}s exceeds limit of {MAX_DURATION_SECONDS}s.")
         
-        # 3. Conversion to WAV (Required for soundfile and ML models)
+        # 4. Conversion to WAV 
         ffmpeg_command = ["ffmpeg", "-i", temp_audio_file, "-ac", "1", "-ar", str(TARGET_SR), "-y", temp_wav_file]
         
         try:
@@ -213,12 +208,12 @@ def perform_analysis_job(
             logger.error("❌ FFmpeg command not found. Ensure FFmpeg is installed and in PATH.")
             raise Exception("FFmpeg not available in the worker environment.")
             
-        # 4. Load the converted WAV file (NOW it's safe to use sf.read)
+        # 5. Load the converted WAV file 
         y, sr = sf.read(temp_wav_file, dtype='float32', always_2d=False)
         if len(y.shape) > 1:
             y = np.mean(y, axis=1)
 
-        # Truncate 'y'
+        # Truncate 'y' (if conversion didn't handle duration limit, or for safety)
         max_samples = sr * MAX_DURATION_SECONDS
         if len(y) > max_samples:
             y = y[:max_samples]
@@ -226,45 +221,56 @@ def perform_analysis_job(
         duration_seconds = len(y) / sr
         speaking_pace_wpm = (total_words / max(1, duration_seconds)) * 60
 
-        # 5. Feature Extraction & Acoustic Analysis
+        # 6. Feature Extraction & Acoustic Analysis
         logger.info("📈 Extracting audio features and metrics...")
         
-        # --- Audio Feature Calculation ---
-        # Recalculate based on truncated/converted 'y' and 'sr'
+        # --- Audio Feature Calculation (Numpy/Librosa based on 'y') ---
         rms = np.sqrt(np.mean(y**2)) 
         avg_amplitude = np.mean(np.abs(y))
         energy_std = np.std(np.abs(y)) 
         
-        y_abs = np.abs(y)
-        amplitude_threshold = np.mean(y_abs) * 0.2
-        silence_ratio = np.sum(y_abs < amplitude_threshold) / len(y_abs)
-        long_pause_count = float(int(silence_ratio * (duration_seconds / 5))) 
+        # Simple silence calculation based on RMS frames
+        frame_len = int(sr * 0.05) # 50ms frames
+        hop_len = int(sr * 0.01)   # 10ms hop
+        rms_frames = librosa.feature.rms(y=y, frame_length=frame_len, hop_length=hop_len)[0]
+        rms_threshold = np.mean(rms_frames) * 0.1 # 10% of average RMS
+        silence_frames = np.sum(rms_frames < rms_threshold)
+        total_frames = len(rms_frames)
+        silence_ratio = silence_frames / total_frames if total_frames > 0 else 0.0
         
-        pitch_mean_proxy, pitch_std_proxy = calculate_pitch_stats(y, sr)
-        pitch_min = 0.0 
-        pitch_max = 0.0 
+        # Simple proxy for long pause count (e.g., more than 0.5s of consecutive silence)
+        frames_per_half_second = int(0.5 / (hop_len / sr))
+        long_pause_count = len([i for i in range(len(rms_frames) - frames_per_half_second) 
+                                if all(rms_frames[i+j] < rms_threshold for j in range(frames_per_half_second))])
+
+        pitch_mean, pitch_std = calculate_pitch_stats(y, sr)
         
-        audio_features = {
+        audio_features_for_score = {
             "rms_mean": float(rms),
             "rms_std": float(energy_std), 
             "speaking_pace_wpm": speaking_pace_wpm,
-            "pitch_std": float(pitch_std_proxy),
-            "pitch_mean": float(pitch_mean_proxy),
-        }
-        fluency_metrics = {
-            "filler_word_count": filler_word_count,
-            "repetition_count": repetition_count,
-            "total_words": total_words,
+            "pitch_std": float(pitch_std),
+            "pitch_mean": float(pitch_mean),
         }
         
-        confidence_score = score_confidence(audio_features, fluency_metrics)
-        emotion = classify_emotion_simple(temp_wav_file, EMOTION_MODEL, EMOTION_SCALER)
-        
-        # Acoustic Disfluency Detection (uses y, sr which is the converted WAV)
+        # Acoustic Disfluency Detection
         acoustic_disfluencies = detect_acoustic_disfluencies(y, sr)
         serializable_disfluencies = [d._asdict() for d in acoustic_disfluencies]
         
-        # 6. Compile Core Metrics for LLM
+        # Recalculate fluency metrics for scoring
+        fluency_metrics_for_score = {
+            "filler_word_count": filler_word_count,
+            "repetition_count": repetition_count,
+            "acoustic_disfluency_count": len(serializable_disfluencies),
+            "total_words": total_words,
+        }
+        
+        confidence_score = score_confidence(audio_features_for_score, fluency_metrics_for_score)
+        
+        # Emotion Classification
+        emotion = classify_emotion_simple(temp_wav_file, EMOTION_MODEL, EMOTION_SCALER)
+        
+        # 7. Compile Core Metrics for LLM
         core_analysis_metrics = {
             "confidence_score": round(confidence_score, 2),
             "speaking_pace": int(round(speaking_pace_wpm)),
@@ -274,13 +280,11 @@ def perform_analysis_job(
             "repetition_words_list": repetition_words_list,
             "acoustic_disfluencies": serializable_disfluencies,
             "acoustic_disfluency_count": len(serializable_disfluencies), 
-            "long_pause_count": long_pause_count,
+            "long_pause_count": float(long_pause_count),
             "silence_ratio": round(silence_ratio, 2),
             "avg_amplitude": round(float(avg_amplitude), 4),
-            "pitch_mean": round(float(pitch_mean_proxy), 2),
-            "pitch_std": round(float(pitch_std_proxy), 2),
-            "pitch_min": pitch_min, 
-            "pitch_max": pitch_max, 
+            "pitch_mean": round(float(pitch_mean), 2),
+            "pitch_std": round(float(pitch_std), 2),
             "emotion": emotion.lower(),
             "energy_std": round(float(energy_std), 4),
             "transcript": transcript,
@@ -288,14 +292,14 @@ def perform_analysis_job(
             "duration_seconds": round(duration_seconds, 2),
         }
         
-        # 7. Generate Intelligent Feedback
+        # 8. Generate Intelligent Feedback
         logger.info("🤖 Generating intelligent feedback using OpenAI...")
         llm_recommendations = generate_intelligent_feedback(
             transcript=transcript, 
             metrics=core_analysis_metrics
         )
         
-        # 8. Compile Final Result
+        # 9. Compile Final Result
         final_result = {
             **core_analysis_metrics,
             "recommendations": llm_recommendations,
@@ -303,7 +307,7 @@ def perform_analysis_job(
 
         logger.info(f"✅ Analysis complete in {round(time.time() - job_start_time, 2)}s.")
         
-        # 9. Cleanup
+        # 10. Cleanup
         if os.path.exists(temp_audio_file): os.remove(temp_audio_file)
         if os.path.exists(temp_wav_file): os.remove(temp_wav_file)
         
