@@ -9,9 +9,7 @@ import soundfile as sf
 import json
 
 # --- IMPORTS FOR OPENAI (MANUAL HTTP) ---
-# We no longer import the OpenAI client, only its errors
 from openai import RateLimitError, APIError 
-# We use httpx to make the request manually
 import httpx
 # ------------------------------------
 
@@ -66,9 +64,7 @@ except Exception as e:
     logger.error(f"[WORKER] ❌ Failed to initialize emotion model: {e}", exc_info=True)
     EMOTION_MODEL, EMOTION_SCALER = None, None
 
-# --- OpenAI Client Initialization ---
-# We no longer initialize a global client. We will create one per request,
-# or simply check if the API key is present.
+# --- OpenAI API Key Check ---
 if not OPENAI_API_KEY:
     logger.warning("[WORKER] ⚠️ OPENAI_API_KEY environment variable not found. LLM features will be disabled.")
 # ------------------------------------
@@ -106,14 +102,12 @@ def generate_intelligent_feedback(transcript: str, metrics: Dict[str, Any]) -> L
         "Based on these, generate a JSON object with a single key 'recommendations' containing a list of 3 specific recommendations."
     )
 
-    # Define API endpoint and headers
     api_url = "https://api.openai.com/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json"
     }
     
-    # Define the request payload
     payload = {
         "model": "gpt-4o-mini",
         "messages": [
@@ -125,24 +119,28 @@ def generate_intelligent_feedback(transcript: str, metrics: Dict[str, Any]) -> L
     }
 
     try:
-        logger.info("[OPENAI] Calling Chat API manually using httpx...")
+        logger.info("[OPENAI] Calling Chat API manually using httpx (Final Workaround)...")
         
-        # Create a clean httpx client that ignores environment proxies
-        with httpx.Client(proxies=None, trust_env=False) as client:
+        # 🔥 FINAL FIX: Create the client without the 'proxies' argument, 
+        # then explicitly disable proxy handling afterwards. This bypasses 
+        # the injected argument error.
+        with httpx.Client(trust_env=False) as client:
+            # Manually set proxies to an empty dictionary to disable them
+            # This is safer than relying on the constructor argument
+            client.proxies = {} 
+            
             response = client.post(
                 api_url,
                 headers=headers,
                 json=payload,
-                timeout=60.0 # 60 second timeout
+                timeout=60.0
             )
         
-        # Check for HTTP errors
         response.raise_for_status() 
         
         feedback_data = response.json()
         feedback_json_str = feedback_data['choices'][0]['message']['content']
         
-        # The content itself is a JSON string, so we parse it again
         recommendation_data = json.loads(feedback_json_str)
         recommendations = recommendation_data.get('recommendations', []) 
         
@@ -164,7 +162,7 @@ def generate_intelligent_feedback(transcript: str, metrics: Dict[str, Any]) -> L
         return [f"An error occurred during intelligent feedback generation: {e.__class__.__name__}"]
 
 
-# --- Core Analysis Function ---
+# --- Core Analysis Function (No changes needed here) ---
 def perform_analysis_job(
     file_id: str, 
     s3_key: str, 
@@ -228,8 +226,8 @@ def perform_analysis_job(
         
         pitch_mean_proxy, pitch_std_proxy = calculate_pitch_stats(y, sr)
         
-        pitch_min = 0.0 # Placeholder
-        pitch_max = 0.0 # Placeholder
+        pitch_min = 0.0 
+        pitch_max = 0.0 
         
         audio_features = {
             "rms_mean": float(rms),
