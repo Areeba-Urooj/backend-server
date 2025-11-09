@@ -174,8 +174,11 @@ def perform_analysis_job(
     temp_audio_file = f"/tmp/{file_id}_{os.path.basename(s3_key)}"
     temp_wav_file = f"/tmp/{file_id}_converted.wav"
     
-    # 1. Fluency analysis first (UPDATED FOR HIGHLIGHTING)
-    total_words = len(transcript.split()) 
+    # 1. Fluency analysis first
+    # FIX: Use a robust split method to avoid errors from punctuation/whitespace
+    import re
+    word_tokens = re.findall(r'\b\w+\b', transcript)
+    total_words = len(word_tokens) 
     
     # Collect all text markers from the updated functions
     filler_apology_markers: List[TextMarker] = detect_fillers_and_apologies(transcript)
@@ -186,13 +189,12 @@ def perform_analysis_job(
     
     # Calculate counts for metrics based on the markers
     filler_word_count = len([m for m in all_text_markers if m.type == 'filler'])
-    # Count specific repetitions and acoustic disfluencies separately as they contribute most to score
     repetition_count = len([m for m in all_text_markers if m.type == 'repetition']) 
     apology_count = len([m for m in all_text_markers if m.type == 'apology']) 
     
     # Initialize values
-    duration_seconds = 0
-    speaking_pace_wpm = 0
+    duration_seconds = 0.0
+    speaking_pace_wpm = 0.0
     emotion = "Neutral"
     confidence_score = 0.0
     
@@ -203,13 +205,12 @@ def perform_analysis_job(
         
         # 3. Safe Duration Check on the raw file
         audio_features_raw = extract_audio_features(temp_audio_file)
-        audio_duration = audio_features_raw.get('duration_s', 0)
+        audio_duration = audio_features_raw.get('duration_s', 0.0)
         
         if audio_duration > MAX_DURATION_SECONDS:
              logger.warning(f"⚠️ Audio duration {audio_duration:.2f}s exceeds limit of {MAX_DURATION_SECONDS}s.")
         
         # 4. Conversion to WAV 
-        # NOTE: FFmpeg MUST be a system dependency installed on the worker.
         ffmpeg_command = ["ffmpeg", "-i", temp_audio_file, "-ac", "1", "-ar", str(TARGET_SR), "-y", temp_wav_file]
         
         try:
@@ -233,7 +234,12 @@ def perform_analysis_job(
             y = y[:max_samples]
             
         duration_seconds = len(y) / sr
-        speaking_pace_wpm = (total_words / max(1, duration_seconds)) * 60
+        
+        # FIX: Calculate WPM defensively
+        if duration_seconds > 0:
+            speaking_pace_wpm = (total_words / duration_seconds) * 60
+        else:
+            speaking_pace_wpm = 0.0
 
         # 6. Feature Extraction & Acoustic Analysis
         logger.info("📈 Extracting audio features and metrics...")
@@ -245,20 +251,41 @@ def perform_analysis_job(
         
         # Simple silence calculation based on RMS frames
         frame_len = int(sr * 0.05) 
-        hop_len = int(sr * 0.01)   
+        hop_len = int(sr * 0.01)    
         
         num_frames = (len(y) - frame_len) // hop_len + 1
         rms_frames = np.array([np.sqrt(np.mean(y[i*hop_len : i*hop_len + frame_len]**2)) for i in range(num_frames)])
         
-        rms_threshold = np.mean(rms_frames) * 0.1 
+        # FIX: Use a more robust threshold or ensure it's not too sensitive
+        rms_threshold = np.mean(rms_frames) * 0.2 # Adjusted from 0.1 to 0.2 for better robustness 
         silence_frames = np.sum(rms_frames < rms_threshold)
         total_frames = len(rms_frames)
         silence_ratio = silence_frames / total_frames if total_frames > 0 else 0.0
         
-        # Simple proxy for long pause count
-        frames_per_half_second = int(0.5 / (hop_len / sr))
-        long_pause_count = len([i for i in range(len(rms_frames) - frames_per_half_second) 
-                                if all(rms_frames[i+j] < rms_threshold for j in range(frames_per_half_second))])
+        # FIX for long_pause_count: Calculate the actual count of DISTINCT long pause events
+        long_pause_duration_frames = int(0.5 / (hop_len / sr)) # 0.5 second pause minimum
+        
+        is_silence = rms_frames < rms_threshold
+        long_pause_count = 0
+        in_long_pause = False
+        pause_start_frame = -1
+
+        for i in range(len(is_silence)):
+            if is_silence[i]:
+                if not in_long_pause:
+                    in_long_pause = True
+                    pause_start_frame = i
+            elif in_long_pause:
+                # End of silence segment
+                pause_duration_frames = i - pause_start_frame
+                if pause_duration_frames >= long_pause_duration_frames:
+                    long_pause_count += 1
+                in_long_pause = False
+
+        # Check for pause at the very end
+        if in_long_pause and (len(is_silence) - pause_start_frame) >= long_pause_duration_frames:
+             long_pause_count += 1
+        # END FIX
 
         # Uses the new NumPy/SciPy function
         pitch_mean, pitch_std = calculate_pitch_stats(y, sr)
@@ -297,7 +324,7 @@ def perform_analysis_job(
             "repetition_count": repetition_count,
             "acoustic_disfluencies": serializable_disfluencies,
             "acoustic_disfluency_count": len(serializable_disfluencies), 
-            "long_pause_count": float(long_pause_count),
+            "long_pause_count": long_pause_count, # Changed to an int, as it is a count
             "silence_ratio": round(silence_ratio, 2),
             "pitch_mean": round(float(pitch_mean), 2),
             "pitch_std": round(float(pitch_std), 2),
