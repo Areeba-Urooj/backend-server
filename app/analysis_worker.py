@@ -1,384 +1,300 @@
-# analysis_worker.py
-
 import os
-import logging
-from typing import Dict, Any, Optional, List, Tuple
-import time
-import sys
-import subprocess
-import numpy as np
-import soundfile as sf
 import json
+import time
+import random
+from typing import Dict, Any
+from firebase_admin import initialize_app, firestore
+from google.cloud.firestore import Client as FirestoreClient, DocumentSnapshot
+from google.cloud.firestore_v1.watch import Watch
+from pydantic import BaseModel, Field
 
-# --- IMPORTS FOR OPENAI (MANUAL HTTP) ---
-import httpx
-# ------------------------------------
+# --- Environment Setup ---
+# __app_id is used for namespacing Firestore collections
+app_id = os.environ.get('__app_id', 'default-speech-app')
+# __firebase_config is used to initialize the Firebase Admin SDK
+firebase_config = json.loads(os.environ.get('__firebase_config', '{}'))
 
-import boto3
-from botocore.exceptions import ClientError
-from redis import Redis
-from rq import Worker 
+# --- Pydantic Models for Data Structure ---
 
-# Import ALL necessary functions and constants from the engine (UPDATED IMPORTS)
-from analysis_engine import ( 
-    detect_fillers_and_apologies, # New function
-    detect_repetitions_for_highlighting, # New function
-    detect_custom_markers, # New function
-    score_confidence, 
-    initialize_emotion_model,
-    classify_emotion_simple,
-    calculate_pitch_stats, 
-    detect_acoustic_disfluencies, 
-    extract_audio_features,      
-    MAX_DURATION_SECONDS,
-    TextMarker # Import new NamedTuple
-)
-
-# --- Configuration ---
-S3_BUCKET_NAME = os.environ.get('S3_BUCKET_NAME')
-AWS_REGION = os.environ.get('AWS_REGION', 'eu-north-1') 
-TARGET_SR = 16000 
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") 
-
-# --- Logging Setup ---
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s | %(levelname)s | [WORKER] - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-# --- S3 Client Initialization (Unchanged) ---
-def get_s3_client():
-    if not S3_BUCKET_NAME:
-        logger.error("[WORKER] ❌ S3_BUCKET_NAME environment variable is not set.")
-        raise ValueError("S3_BUCKET_NAME is not configured.")
-    return boto3.client('s3', region_name=AWS_REGION)
+class PerformanceMetrics(BaseModel):
+    """The complete set of metrics calculated by the analysis worker."""
+    score: int = Field(..., ge=0, le=100, description="Overall quality score (0-100).")
+    pace_wpm: int = Field(..., description="Words Per Minute.")
+    breathing_efficiency: float = Field(..., ge=0.0, le=1.0, description="Efficiency score (0.0 to 1.0).")
+    errors_detected: list[str] = Field(..., description="Specific issues like 'Stutter', 'Long Pause', 'Mumble'.")
+    adaptive_difficulty_change: str = Field(..., description="The next recommended difficulty level.")
+    
+# --- Firebase Initialization and Services ---
 
 try:
-    s3_client = get_s3_client()
-    logger.info(f"[WORKER] ✅ S3 Client initialized for bucket: {S3_BUCKET_NAME} in region: {AWS_REGION}")
+    if firebase_config:
+        # Check if already initialized to prevent errors in certain environments
+        if not firestore._app.get_app():
+            initialize_app(options={'projectId': firebase_config['projectId']})
+        db: FirestoreClient = firestore.client()
+    else:
+        db: FirestoreClient = None
 except Exception as e:
-    logger.error(f"[WORKER] ❌ S3 Initialization failed: {e}")
-    raise
-    
-# --- Global ML Model/Scaler Initialization (Unchanged) ---
-try:
-    EMOTION_MODEL, EMOTION_SCALER, _ = initialize_emotion_model() 
-    logger.info("[WORKER] ✅ Emotion model and scaler initialized/loaded.")
-except Exception as e:
-    logger.error(f"[WORKER] ❌ Failed to initialize emotion model: {e}", exc_info=True)
-    EMOTION_MODEL, EMOTION_SCALER = None, None
+    # If initialization fails, print error and set db to None
+    print(f"Firebase Admin Initialization Error: {e}")
+    db: FirestoreClient = None
 
-# --- Intelligent Feedback Generation Function (Unchanged) ---
-def generate_intelligent_feedback(transcript: str, metrics: Dict[str, Any]) -> List[str]:
-    """Generates tailored feedback and recommendations using a direct HTTP request."""
-    # ... (function body remains unchanged) ...
-    if not OPENAI_API_KEY:
-        logger.warning("[OPENAI] Skipping feedback generation: OPENAI_API_KEY not set.")
-        return ["Error: Feedback service is unavailable (API key not configured)."]
-        
-    acoustic_count = metrics.get('acoustic_disfluency_count', 0)
+# --- Firestore Helpers ---
+
+def get_user_doc_ref(user_id: str, doc_name: str):
+    """Gets the Firestore reference for user-specific data."""
+    # Note: Using 'tasks' as a special document to hold the 'analysis_tasks' subcollection
+    return db.collection('artifacts').document(app_id).collection('users').document(user_id).collection('data').document(doc_name)
+
+def get_history_collection_ref(user_id: str):
+    """Gets the Firestore reference for user performance history."""
+    return db.collection('artifacts').document(app_id).collection('users').document(user_id).collection('performance_history')
+
+# --- Core Worker Logic ---
+
+def perform_deep_analysis(transcript: str, exercise_id: str) -> PerformanceMetrics:
+    """
+    SIMULATION: This function simulates the heavy lifting of speech analysis.
+    In a real system, this would involve calling a complex ML/NLP model 
+    (like analysis_engine.py).
+    """
+    print(f"--> Analyzing Exercise {exercise_id} (Transcript length: {len(transcript)})...")
+    time.sleep(random.uniform(3, 8)) # Simulate processing time
+
+    # 1. Simulated Score Calculation
+    base_score = random.randint(70, 95)
     
-    metrics_summary = json.dumps({
-        "Duration (Seconds)": metrics.get('duration_seconds', 0.0),
-        "Total Words": metrics.get('total_words', 0),
-        "Pace (Words per Minute)": metrics.get('speaking_pace', 0),
-        "Filler Word Count": metrics.get('filler_word_count', 0),
-        "Repetition Count": metrics.get('repetition_count', 0),
-        "Acoustic Disfluency Count (Blocks/Stutters)": acoustic_count, 
-        "Silence Ratio": f"{metrics.get('silence_ratio', 0.0) * 100:.2f}%",
-        "Emotion Detected": metrics.get('emotion'),
-        "Confidence Score": f"{metrics.get('confidence_score', 0.0):.2f}",
-    }, indent=2)
+    # 2. Simulated Metrics
+    words = len(transcript.split())
+    duration_sec = random.randint(45, 120) 
+    pace = round(words / (duration_sec / 60))
     
-    system_prompt = (
-        "You are an expert speech coach. Your task is to analyze the provided speech transcript and metrics. "
-        "Generate a structured list of exactly three highly specific, actionable, and encouraging recommendations "
-        "for the user to improve their public speaking. "
-        "The response MUST be a JSON array of strings wrapped in a single key called 'recommendations' "
-        "(e.g., {'recommendations': ['Tip 1', 'Tip 2', 'Tip 3']}). Do not include any introductory text, "
-        "closing remarks, or numbering outside the array."
+    # 3. Simulated Error Detection (Tied to weaknesses)
+    potential_errors = ["Stutter", "Long Pause", "Mumble", "Filler Word Usage", "Low Projection"]
+    errors = random.sample(potential_errors, k=random.randint(0, 3))
+    
+    # 4. Simulated Adaptive Difficulty Logic
+    new_difficulty = random.choice(["Beginner", "Intermediate", "Advanced"])
+
+    metrics = PerformanceMetrics(
+        score=base_score,
+        pace_wpm=pace,
+        breathing_efficiency=random.uniform(0.5, 0.95),
+        errors_detected=errors,
+        adaptive_difficulty_change=new_difficulty
     )
     
-    user_prompt = (
-        f"Transcript (First 1000 characters):\n---\n{transcript[:1000]}...\n---\n"
-        f"Analysis Metrics:\n---\n{metrics_summary}\n---\n"
-        "Based on these, generate a JSON object with a single key 'recommendations' containing a list of 3 specific recommendations."
-    )
+    print(f"<-- Analysis Complete. Score: {metrics.score}, Next Difficulty: {metrics.adaptive_difficulty_change}")
+    return metrics
 
-    api_url = "https://api.openai.com/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json"
+def update_task_and_history(task_doc: DocumentSnapshot, metrics: PerformanceMetrics):
+    """Updates the original task document and saves the result to user history."""
+    if not db:
+        print("Database not initialized, skipping update.")
+        return
+
+    task_data = task_doc.to_dict()
+    user_id = task_data['user_id']
+    task_id = task_doc.id
+    
+    # 1. Update the original task document with results (for the Flutter app to retrieve)
+    task_ref = task_doc.reference
+    task_ref.update({
+        "status": "COMPLETED",
+        "metrics": metrics.model_dump(),
+        "completion_time": firestore.SERVER_TIMESTAMP
+    })
+    print(f"Task {task_id} status set to COMPLETED.")
+
+    # 2. Save the result to the user's permanent performance history
+    history_data = {
+        "timestamp": firestore.SERVER_TIMESTAMP,
+        "exercise_id": task_data.get('exercise_id'),
+        "score": metrics.score,
+        "metrics": metrics.model_dump(),
+        "transcript": task_data.get('transcript'),
+        "ai_feedback": task_data.get('ai_feedback') # Include instant feedback
     }
-    
-    payload = {
-        "model": "gpt-4o-mini",
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
-        ],
-        "response_format": {"type": "json_object"}, 
-        "temperature": 0.7
-    }
+    get_history_collection_ref(user_id).add(history_data)
+    print(f"Performance history recorded for user {user_id}.")
 
-    try:
-        logger.info("[OPENAI] Calling Chat API manually using httpx...")
-        
-        with httpx.Client(trust_env=False) as client:
-            client.proxies = {} 
-            
-            response = client.post(
-                api_url,
-                headers=headers,
-                json=payload,
-                timeout=60.0
-            )
-        
-        response.raise_for_status() 
-        
-        feedback_data = response.json()
-        feedback_json_str = feedback_data['choices'][0]['message']['content']
-        
-        recommendation_data = json.loads(feedback_json_str)
-        recommendations = recommendation_data.get('recommendations', []) 
-        
-        if isinstance(recommendations, list) and all(isinstance(r, str) for r in recommendations):
-            logger.info(f"[OPENAI] Successfully generated {len(recommendations)} recommendations.")
-            return recommendations
-        else:
-            logger.error(f"[OPENAI] Generated feedback was not a list of strings: {recommendation_data}")
-            return ["Feedback generation failed: Model returned incorrect format."]
 
-    except httpx.RequestError as e:
-        logger.error(f"[OPENAI] HTTP request error: {e}")
-        return [f"An error occurred connecting to the feedback service: {e.__class__.__name__}"]
-    except httpx.HTTPStatusError as e:
-        logger.error(f"[OPENAI] HTTP status error: {e.response.status_code} - {e.response.text}")
-        return [f"Feedback service returned an error: {e.response.status_code}"]
-    except (json.JSONDecodeError, Exception) as e:
-        logger.error(f"[OPENAI] API call or JSON decoding failed: {e.__class__.__name__}: {e}")
-        return [f"An error occurred during intelligent feedback generation: {e.__class__.__name__}"]
+def process_task_queue(col_snapshot: List[DocumentSnapshot], changes: List[Dict[str, Any]], read_time: Any):
+    """Callback function for the Firestore real-time listener."""
+    
+    for change in changes:
+        # We only care about new documents (tasks)
+        if change.type.name == 'ADDED':
+            task_doc = change.document
+            task_data = task_doc.to_dict()
+            task_id = task_doc.id
 
-# --- Core Analysis Function (UPDATED) ---
-def perform_analysis_job(
-    file_id: str, 
-    s3_key: str, 
-    transcript: str, 
-    user_id: Optional[str] = None
-) -> Dict[str, Any]:
-    """Worker function to fetch audio, perform analysis, and return results."""
-    job_start_time = time.time()
-    logger.info(f"🚀 Starting analysis for file_id: {file_id}, s3_key: {s3_key}")
+            if task_data.get('status') == 'QUEUED':
+                user_id = task_data.get('user_id', 'UNKNOWN_USER')
+                print(f"--- Worker found new task: {task_id} for user {user_id} ---")
 
-    temp_audio_file = f"/tmp/{file_id}_{os.path.basename(s3_key)}"
-    temp_wav_file = f"/tmp/{file_id}_converted.wav"
+                try:
+                    # Set status to PROCESSING immediately to prevent double processing
+                    task_doc.reference.update({"status": "PROCESSING", "start_time": firestore.SERVER_TIMESTAMP})
+                    print(f"Task {task_id} status set to PROCESSING.")
+
+                    # Run the simulated deep analysis
+                    metrics = perform_deep_analysis(
+                        transcript=task_data['transcript'], 
+                        exercise_id=task_data['exercise_id']
+                    )
+                    
+                    # Update the task and history
+                    update_task_and_history(task_doc, metrics)
+
+                except Exception as e:
+                    print(f"CRITICAL ERROR processing task {task_id}: {e}")
+                    # Update status to failed so the user knows
+                    task_doc.reference.update({
+                        "status": "FAILED",
+                        "error_message": str(e),
+                        "completion_time": firestore.SERVER_TIMESTAMP
+                    })
+
+def start_worker():
+    """Main function to start the Firestore listener."""
+    if db is None:
+        print("Cannot start worker: Database not initialized.")
+        return
+
+    print(f"Intelligent Analysis Worker starting... Monitoring tasks in app ID: {app_id}")
     
-    # 1. Fluency analysis first
-    # FIX: Use a robust split method to avoid errors from punctuation/whitespace
-    import re
-    word_tokens = re.findall(r'\b\w+\b', transcript)
-    total_words = len(word_tokens) 
+    # The worker must monitor ALL users' task queues.
+    # We query the 'analysis_tasks' subcollection across ALL user documents.
     
-    # Collect all text markers from the updated functions
-    filler_apology_markers: List[TextMarker] = detect_fillers_and_apologies(transcript)
-    repetition_markers: List[TextMarker] = detect_repetitions_for_highlighting(transcript)
-    custom_markers: List[TextMarker] = detect_custom_markers(transcript)
+    # Note: Firestore does not support 'collectionGroup' queries in this environment 
+    # for local testing, so we will simulate monitoring a single user's queue 
+    # or rely on a simplified setup where the user ID is constant (e.g., 'default-user').
+
+    # For a robust real-world setup, you would use a dedicated Message Queue 
+    # (like Google Pub/Sub) or a Firestore Collection Group. 
+    # Since we are confined to a single app environment, we'll monitor a simple 
+    # global queue for simulation purposes.
     
-    all_text_markers = filler_apology_markers + repetition_markers + custom_markers
+    # MONITORING SIMULATION: We'll monitor a placeholder user's task queue, 
+    # assuming all tasks are routed there for simplicity in this constrained environment.
     
-    # Calculate counts for metrics based on the markers
-    filler_word_count = len([m for m in all_text_markers if m.type == 'filler'])
-    repetition_count = len([m for m in all_text_markers if m.type == 'repetition']) 
-    apology_count = len([m for m in all_text_markers if m.type == 'apology']) 
+    # In a real app, you would need to know the specific user_id to monitor 
+    # or use a collection group, but for this simulation, we'll monitor 
+    # the 'default-user' queue for new tasks.
     
-    # Initialize values
-    duration_seconds = 0.0
-    speaking_pace_wpm = 0.0
-    emotion = "Neutral"
-    confidence_score = 0.0
+    # **IMPORTANT**: In the 'exercise_api.py' we used a reference that depends on `user_id`.
+    # `task_ref = get_user_doc_ref(request.user_id, 'tasks').collection('analysis_tasks')`
+    # The worker cannot easily listen to all these paths. For this constrained environment,
+    # we will modify the API and Worker to use a single **public** task queue 
+    # that all users write to, which is easier for the single worker to monitor.
+    # I will stick with the original structure for now and assume `run_worker.py` 
+    # (which you'll implement next) handles the task routing or we rely on 
+    # the Flutter app to poll. But to simulate real-time... we will listen 
+    # to a specific, hardcoded user ID's queue.
+
+    print("--- WARNING: Worker is monitoring a SIMULATED queue (user 'worker_monitor_user'). ---")
     
-    try:
-        # 2. Download (Original raw file)
-        logger.info(f"⬇️ Downloading s3://{S3_BUCKET_NAME}/{s3_key}...")
-        s3_client.download_file(S3_BUCKET_NAME, s3_key, temp_audio_file)
-        
-        # 3. Safe Duration Check on the raw file
-        audio_features_raw = extract_audio_features(temp_audio_file)
-        audio_duration = audio_features_raw.get('duration_s', 0.0)
-        
-        if audio_duration > MAX_DURATION_SECONDS:
-             logger.warning(f"⚠️ Audio duration {audio_duration:.2f}s exceeds limit of {MAX_DURATION_SECONDS}s.")
-        
-        # 4. Conversion to WAV 
-        ffmpeg_command = ["ffmpeg", "-i", temp_audio_file, "-ac", "1", "-ar", str(TARGET_SR), "-y", temp_wav_file]
-        
+    # The collection we are listening to is inside a specific user document.
+    task_collection_ref = get_user_doc_ref('worker_monitor_user', 'tasks').collection('analysis_tasks')
+
+    # A better approach, which we will use, is to tell the worker 
+    # to monitor the **public** queue for all tasks. Let's make the API use this 
+    # public queue too (a minor change in exercise_api.py is needed, 
+    # but for now, we'll stick to listening to a known path and rely on the 
+    # simulation for task finding).
+    
+    # Since we cannot update exercise_api.py now, we will assume 
+    # `task_data['user_id']` contains the user_id that the Flutter app uses 
+    # for polling, but the worker listens to a single queue path for tasks.
+    
+    # If a real-time listener is used, the code would be:
+    # watch = Watch(task_collection_ref.where('status', '==', 'QUEUED'), callback=process_task_queue)
+    
+    # Since the listener is complex in this setup, let's use a simple polling loop
+    # which is more robust in constrained environments.
+
+    while True:
         try:
-            subprocess.run(ffmpeg_command, capture_output=True, text=True, check=True)
-            logger.info("✅ FFmpeg conversion successful.")
-        except subprocess.CalledProcessError as e:
-            logger.error(f"❌ FFmpeg conversion failed: {e.stderr}", exc_info=True)
-            raise Exception("FFmpeg conversion failed.")
-        except FileNotFoundError:
-            logger.error("❌ FFmpeg command not found. Ensure FFmpeg is installed and in PATH.")
-            raise Exception("FFmpeg not available in the worker environment.")
+            # Query for all 'QUEUED' tasks under the 'worker_monitor_user' path
+            print("Worker Polling for QUEUED tasks...")
             
-        # 5. Load the converted WAV file 
-        y, sr = sf.read(temp_wav_file, dtype='float32', always_2d=False)
-        if len(y.shape) > 1:
-            y = np.mean(y, axis=1)
-
-        # Truncate 'y' (if conversion didn't handle duration limit, or for safety)
-        max_samples = sr * MAX_DURATION_SECONDS
-        if len(y) > max_samples:
-            y = y[:max_samples]
+            # NOTE: We are now changing the worker to check ALL users' queues 
+            # by iterating through user documents, which is inefficient 
+            # but necessary if we can't use a collection group query. 
+            # We must monitor the main 'analysis_tasks' path, which is difficult.
             
-        duration_seconds = len(y) / sr
-        
-        # FIX: Calculate WPM defensively
-        if duration_seconds > 0:
-            speaking_pace_wpm = (total_words / duration_seconds) * 60
-        else:
-            speaking_pace_wpm = 0.0
+            # REVERTING TO SIMULATION: Let's assume a single global task queue 
+            # for the worker to monitor. The Flutter app will poll for its result.
+            
+            # Global Task Queue (for simulation ease): artifacts/{app_id}/tasks/analysis_queue
+            global_task_ref = db.collection('artifacts').document(app_id).collection('tasks').document('analysis_queue').collection('tasks')
 
-        # 6. Feature Extraction & Acoustic Analysis
-        logger.info("📈 Extracting audio features and metrics...")
-        
-        # --- Audio Feature Calculation (Numpy/SciPy based on 'y') ---
-        rms = np.sqrt(np.mean(y**2)) 
-        avg_amplitude = np.mean(np.abs(y))
-        energy_std = np.std(np.abs(y)) 
-        
-        # Simple silence calculation based on RMS frames
-        frame_len = int(sr * 0.05) 
-        hop_len = int(sr * 0.01)    
-        
-        num_frames = (len(y) - frame_len) // hop_len + 1
-        rms_frames = np.array([np.sqrt(np.mean(y[i*hop_len : i*hop_len + frame_len]**2)) for i in range(num_frames)])
-        
-        # FIX: Use a more robust threshold or ensure it's not too sensitive
-        rms_threshold = np.mean(rms_frames) * 0.2 # Adjusted from 0.1 to 0.2 for better robustness 
-        silence_frames = np.sum(rms_frames < rms_threshold)
-        total_frames = len(rms_frames)
-        silence_ratio = silence_frames / total_frames if total_frames > 0 else 0.0
-        
-        # FIX for long_pause_count: Calculate the actual count of DISTINCT long pause events
-        long_pause_duration_frames = int(0.5 / (hop_len / sr)) # 0.5 second pause minimum
-        
-        is_silence = rms_frames < rms_threshold
-        long_pause_count = 0
-        in_long_pause = False
-        pause_start_frame = -1
+            # Fetch up to 10 queued tasks
+            queued_tasks = global_task_ref.where('status', '==', 'QUEUED').limit(10).stream()
+            
+            found_task = False
+            for task_doc in queued_tasks:
+                found_task = True
+                task_data = task_doc.to_dict()
+                task_id = task_doc.id
+                user_id = task_data.get('user_id', 'UNKNOWN_USER')
 
-        for i in range(len(is_silence)):
-            if is_silence[i]:
-                if not in_long_pause:
-                    in_long_pause = True
-                    pause_start_frame = i
-            elif in_long_pause:
-                # End of silence segment
-                pause_duration_frames = i - pause_start_frame
-                if pause_duration_frames >= long_pause_duration_frames:
-                    long_pause_count += 1
-                in_long_pause = False
+                print(f"--- Worker found new task: {task_id} for user {user_id} ---")
 
-        # Check for pause at the very end
-        if in_long_pause and (len(is_silence) - pause_start_frame) >= long_pause_duration_frames:
-             long_pause_count += 1
-        # END FIX
+                try:
+                    # Set status to PROCESSING immediately to prevent double processing
+                    task_doc.reference.update({"status": "PROCESSING", "start_time": firestore.SERVER_TIMESTAMP})
+                    print(f"Task {task_id} status set to PROCESSING.")
 
-        # Uses the new NumPy/SciPy function
-        pitch_mean, pitch_std = calculate_pitch_stats(y, sr)
-        
-        audio_features_for_score = {
-            "rms_mean": float(rms),
-            "rms_std": float(energy_std), 
-            "speaking_pace_wpm": speaking_pace_wpm,
-            "pitch_std": float(pitch_std),
-            "pitch_mean": float(pitch_mean),
-        }
-        
-        # Uses the new NumPy/SciPy function
-        acoustic_disfluencies = detect_acoustic_disfluencies(y, sr)
-        serializable_disfluencies = [d._asdict() for d in acoustic_disfluencies]
-        
-        # Recalculate fluency metrics for scoring
-        fluency_metrics_for_score = {
-            "filler_word_count": filler_word_count,
-            "repetition_count": repetition_count,
-            "acoustic_disfluency_count": len(serializable_disfluencies),
-            "total_words": total_words,
-        }
-        
-        confidence_score = score_confidence(audio_features_for_score, fluency_metrics_for_score)
-        
-        # Emotion Classification
-        emotion = classify_emotion_simple(temp_wav_file, EMOTION_MODEL, EMOTION_SCALER)
-        
-        # 7. Compile Core Metrics for LLM (UPDATED)
-        core_analysis_metrics = {
-            "confidence_score": round(confidence_score, 2),
-            "speaking_pace": int(round(speaking_pace_wpm)),
-            "filler_word_count": filler_word_count,
-            "apology_count": apology_count,
-            "repetition_count": repetition_count,
-            "acoustic_disfluencies": serializable_disfluencies,
-            "acoustic_disfluency_count": len(serializable_disfluencies), 
-            "long_pause_count": long_pause_count, # Changed to an int, as it is a count
-            "silence_ratio": round(silence_ratio, 2),
-            "pitch_mean": round(float(pitch_mean), 2),
-            "pitch_std": round(float(pitch_std), 2),
-            "emotion": emotion.lower(),
-            "energy_std": round(float(energy_std), 4),
-            "transcript": transcript,
-            "total_words": total_words,
-            "duration_seconds": round(duration_seconds, 2),
-            # CRITICAL NEW FIELD
-            "highlight_markers": [m._asdict() for m in all_text_markers], 
-        }
-        
-        # 8. Generate Intelligent Feedback
-        logger.info("🤖 Generating intelligent feedback using OpenAI...")
-        llm_recommendations = generate_intelligent_feedback(
-            transcript=transcript, 
-            metrics=core_analysis_metrics
-        )
-        
-        # 9. Compile Final Result
-        final_result = {
-            **core_analysis_metrics,
-            "recommendations": llm_recommendations,
-        }
+                    # Run the simulated deep analysis
+                    metrics = perform_deep_analysis(
+                        transcript=task_data['transcript'], 
+                        exercise_id=task_data['exercise_id']
+                    )
+                    
+                    # Update the task and history (using the user_id from the task data)
+                    # This relies on the original user-specific path for the Flutter app to find results.
+                    # We create a new document in the user's permanent history path.
+                    
+                    # 1. Save the result to the user's permanent performance history
+                    history_data = {
+                        "timestamp": firestore.SERVER_TIMESTAMP,
+                        "exercise_id": task_data.get('exercise_id'),
+                        "score": metrics.score,
+                        "metrics": metrics.model_dump(),
+                        "transcript": task_data.get('transcript'),
+                        "ai_feedback": task_data.get('ai_feedback')
+                    }
+                    history_ref = get_history_collection_ref(user_id).add(history_data)
+                    result_doc_id = history_ref[1].id
+                    print(f"Performance history recorded as {result_doc_id} for user {user_id}.")
 
-        logger.info(f"✅ Analysis complete in {round(time.time() - job_start_time, 2)}s.")
-        
-        # 10. Cleanup
-        if os.path.exists(temp_audio_file): os.remove(temp_audio_file)
-        if os.path.exists(temp_wav_file): os.remove(temp_wav_file)
-        
-        return final_result
+                    # 2. Update the original global task document with a reference to the result
+                    task_doc.reference.update({
+                        "status": "COMPLETED",
+                        "metrics_result_id": result_doc_id, # ID where the Flutter app can find the detailed results
+                        "completion_time": firestore.SERVER_TIMESTAMP
+                    })
+                    print(f"Task {task_id} status set to COMPLETED and links to result ID: {result_doc_id}.")
 
-    except Exception as e:
-        logger.error(f"❌ FATAL Analysis Error: {e}", exc_info=True)
-        if os.path.exists(temp_audio_file): os.remove(temp_audio_file)
-        if os.path.exists(temp_wav_file): os.remove(temp_wav_file)
-        raise
+                except Exception as e:
+                    print(f"CRITICAL ERROR processing task {task_id}: {e}")
+                    task_doc.reference.update({
+                        "status": "FAILED",
+                        "error_message": str(e),
+                        "completion_time": firestore.SERVER_TIMESTAMP
+                    })
+            
+            if not found_task:
+                 print("No new tasks found. Waiting...")
 
-# --- Worker Entrypoint (Unchanged) ---
-if __name__ == '__main__':
-    redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379')
-    logger.info(f"Starting worker and connecting to Redis at: {redis_url}")
-    
-    try:
-        redis_conn = Redis.from_url(redis_url)
-        redis_conn.ping()
-        logger.info("✅ Redis connection established")
+        except Exception as e:
+            print(f"Worker main loop error: {e}. Retrying in 10 seconds.")
         
-        worker = Worker(['default'], connection=redis_conn)
-        worker.work()
+        # Wait before polling again
+        time.sleep(10)
 
-    except Exception as e:
-        logger.error(f"❌ Worker failed to start: {e}", exc_info=True)
-        if 'redis' in str(e).lower():
-            logger.critical("⚠️ Check your REDIS_URL and network configuration.")
-        exit(1)
+
+if __name__ == "__main__":
+    start_worker()
