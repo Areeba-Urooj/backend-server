@@ -20,15 +20,12 @@ from pydantic import BaseModel, Field, ValidationError
 
 # ⭐ NEW: Import the router from your exercise module (assuming 'exercise.py')
 try:
+    # Ensure app path is included before import attempt
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from app.exercise import router as exercise_router
 except ImportError as e:
-    # This try/except block handles cases where the exercise module might not be fully present yet
-    # This is fine for development but should be resolved before production.
     logging.warning(f"Could not import exercise router: {e}. Exercise endpoints will be unavailable.")
 
-
-# Ensure app path is included
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # --- Pydantic Models for Data Structures ---
 class TextMarker(BaseModel):
@@ -88,7 +85,7 @@ def get_redis_connection():
         return conn
     except Exception as e:
         logger.error(f"[MAIN] ❌ Failed to connect to Redis: {e}", exc_info=True)
-        raise RuntimeError("Failed to connect to Redis for RQ.") from e
+        raise RuntimeError("Failed to connect to Redis for RQ.") from e 
 
 try:
     redis_conn = get_redis_connection()
@@ -96,20 +93,34 @@ try:
 except RuntimeError:
     redis_conn = None
     queue = None
+except Exception as e:
+    logger.error(f"[MAIN] ❌ Unexpected error during Redis/RQ setup: {e}", exc_info=True)
+    redis_conn = None
+    queue = None
 
-# --- S3 Client Initialization ---
-def get_s3_client():
-    """Initializes and returns the S3 client."""
+
+# --- S3 Client Initialization (Revised for better error handling) ---
+s3_client = None
+s3_init_error = None
+
+def init_s3_client():
+    """Initializes S3 client and stores any error message."""
+    global s3_client, s3_init_error
     if not S3_BUCKET_NAME:
-        logger.error("[MAIN] ❌ S3_BUCKET_NAME environment variable is not set.")
-        raise ValueError("S3_BUCKET_NAME is not configured.")
-    return boto3.client('s3', region_name=AWS_REGION)
+        s3_init_error = "S3_BUCKET_NAME environment variable is not set."
+        logger.error(f"[MAIN] ❌ {s3_init_error}")
+        return
+    try:
+        s3_client = boto3.client('s3', region_name=AWS_REGION)
+        # Optional: Perform a quick check to see if credentials work
+        # s3_client.list_buckets()
+        logger.info(f"[MAIN] ✅ S3 Client initialized for bucket: {S3_BUCKET_NAME} in region: {AWS_REGION}")
+    except Exception as e:
+        s3_init_error = f"Boto3 initialization failed: {e.__class__.__name__} - {str(e)}"
+        logger.error(f"[MAIN] ❌ S3 initialization failed: {s3_init_error}", exc_info=True)
 
-try:
-    s3_client = get_s3_client()
-    logger.info(f"[MAIN] ✅ S3 Client initialized for bucket: {S3_BUCKET_NAME} in region: {AWS_REGION}")
-except ValueError:
-    s3_client = None
+# Run S3 Initialization
+init_s3_client()
 
 # --- FastAPI App Initialization ---
 app = FastAPI(
@@ -119,10 +130,10 @@ app = FastAPI(
 )
 
 # ⭐ NEW: Include the exercise router here!
-# This mounts all endpoints from exercise.py (like /exercises/recommend) onto the main app.
 try:
-    app.include_router(exercise_router)
-    logger.info("[MAIN] ✅ Exercise router included.")
+    if 'exercise_router' in locals() or 'exercise_router' in globals():
+        app.include_router(exercise_router)
+        logger.info("[MAIN] ✅ Exercise router included.")
 except NameError:
     logger.warning("[MAIN] ⚠️ Could not include exercise router (NameError). Check imports.")
 
@@ -159,8 +170,18 @@ async def upload_audio_file(
     file: UploadFile = File(...)
 ):
     """Receives an audio file and uploads it to S3."""
+    # ⭐ MODIFIED: Check s3_init_error to give a clearer 503 response
+    if s3_init_error:
+        # We now raise a 503 error with the reason for the S3 failure.
+        logger.error(f"[API] ❌ Rejecting /upload: S3 storage service is unavailable. Reason: {s3_init_error}")
+        raise HTTPException(
+            status_code=503, 
+            detail=f"S3 storage service is unavailable. Initialization Error: {s3_init_error}"
+        )
+    
+    # Redundant check, but safe
     if not s3_client or not S3_BUCKET_NAME:
-        raise HTTPException(status_code=503, detail="S3 storage service is unavailable.")
+         raise HTTPException(status_code=503, detail="S3 storage service is unavailable due to configuration issue.")
     
     file_extension = os.path.splitext(file.filename)[1] or ".m4a"
     file_uuid = str(uuid4())
