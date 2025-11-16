@@ -1,5 +1,3 @@
-# analysis_worker.py
-
 import os
 import logging
 from typing import Dict, Any, Optional, List, Tuple
@@ -19,19 +17,17 @@ from botocore.exceptions import ClientError
 from redis import Redis
 from rq import Worker 
 
-# Import ALL necessary functions and constants from the engine (UPDATED IMPORTS)
+# Import ALL necessary functions and constants from the engine
 from analysis_engine import ( 
-    detect_fillers_and_apologies, # New function
-    detect_repetitions_for_highlighting, # New function
-    detect_custom_markers, # New function
+    detect_fillers, 
+    detect_repetitions, 
     score_confidence, 
     initialize_emotion_model,
     classify_emotion_simple,
-    calculate_pitch_stats, 
-    detect_acoustic_disfluencies, 
+    calculate_pitch_stats, # Now NumPy/SciPy based
+    detect_acoustic_disfluencies, # Now NumPy/SciPy based
     extract_audio_features,      
-    MAX_DURATION_SECONDS,
-    TextMarker # Import new NamedTuple
+    MAX_DURATION_SECONDS         
 )
 
 # --- Configuration ---
@@ -47,7 +43,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- S3 Client Initialization (Unchanged) ---
+# --- S3 Client Initialization ---
 def get_s3_client():
     if not S3_BUCKET_NAME:
         logger.error("[WORKER] ❌ S3_BUCKET_NAME environment variable is not set.")
@@ -61,7 +57,7 @@ except Exception as e:
     logger.error(f"[WORKER] ❌ S3 Initialization failed: {e}")
     raise
     
-# --- Global ML Model/Scaler Initialization (Unchanged) ---
+# --- Global ML Model/Scaler Initialization ---
 try:
     EMOTION_MODEL, EMOTION_SCALER, _ = initialize_emotion_model() 
     logger.info("[WORKER] ✅ Emotion model and scaler initialized/loaded.")
@@ -69,10 +65,9 @@ except Exception as e:
     logger.error(f"[WORKER] ❌ Failed to initialize emotion model: {e}", exc_info=True)
     EMOTION_MODEL, EMOTION_SCALER = None, None
 
-# --- Intelligent Feedback Generation Function (Unchanged) ---
+# --- Intelligent Feedback Generation Function (using httpx) ---
 def generate_intelligent_feedback(transcript: str, metrics: Dict[str, Any]) -> List[str]:
     """Generates tailored feedback and recommendations using a direct HTTP request."""
-    # ... (function body remains unchanged) ...
     if not OPENAI_API_KEY:
         logger.warning("[OPENAI] Skipping feedback generation: OPENAI_API_KEY not set.")
         return ["Error: Feedback service is unavailable (API key not configured)."]
@@ -160,7 +155,7 @@ def generate_intelligent_feedback(transcript: str, metrics: Dict[str, Any]) -> L
         logger.error(f"[OPENAI] API call or JSON decoding failed: {e.__class__.__name__}: {e}")
         return [f"An error occurred during intelligent feedback generation: {e.__class__.__name__}"]
 
-# --- Core Analysis Function (UPDATED) ---
+# --- Core Analysis Function ---
 def perform_analysis_job(
     file_id: str, 
     s3_key: str, 
@@ -175,26 +170,13 @@ def perform_analysis_job(
     temp_wav_file = f"/tmp/{file_id}_converted.wav"
     
     # 1. Fluency analysis first
-    # FIX: Use a robust split method to avoid errors from punctuation/whitespace
-    import re
-    word_tokens = re.findall(r'\b\w+\b', transcript)
-    total_words = len(word_tokens) 
-    
-    # Collect all text markers from the updated functions
-    filler_apology_markers: List[TextMarker] = detect_fillers_and_apologies(transcript)
-    repetition_markers: List[TextMarker] = detect_repetitions_for_highlighting(transcript)
-    custom_markers: List[TextMarker] = detect_custom_markers(transcript)
-    
-    all_text_markers = filler_apology_markers + repetition_markers + custom_markers
-    
-    # Calculate counts for metrics based on the markers
-    filler_word_count = len([m for m in all_text_markers if m.type == 'filler'])
-    repetition_count = len([m for m in all_text_markers if m.type == 'repetition']) 
-    apology_count = len([m for m in all_text_markers if m.type == 'apology']) 
+    total_words = len(transcript.split()) 
+    filler_words_list, filler_word_count = detect_fillers(transcript)
+    repetition_words_list, repetition_count = detect_repetitions(transcript)
     
     # Initialize values
-    duration_seconds = 0.0
-    speaking_pace_wpm = 0.0
+    duration_seconds = 0
+    speaking_pace_wpm = 0
     emotion = "Neutral"
     confidence_score = 0.0
     
@@ -205,12 +187,13 @@ def perform_analysis_job(
         
         # 3. Safe Duration Check on the raw file
         audio_features_raw = extract_audio_features(temp_audio_file)
-        audio_duration = audio_features_raw.get('duration_s', 0.0)
+        audio_duration = audio_features_raw.get('duration_s', 0)
         
         if audio_duration > MAX_DURATION_SECONDS:
              logger.warning(f"⚠️ Audio duration {audio_duration:.2f}s exceeds limit of {MAX_DURATION_SECONDS}s.")
         
         # 4. Conversion to WAV 
+        # NOTE: FFmpeg MUST be a system dependency installed on the worker.
         ffmpeg_command = ["ffmpeg", "-i", temp_audio_file, "-ac", "1", "-ar", str(TARGET_SR), "-y", temp_wav_file]
         
         try:
@@ -234,12 +217,7 @@ def perform_analysis_job(
             y = y[:max_samples]
             
         duration_seconds = len(y) / sr
-        
-        # FIX: Calculate WPM defensively
-        if duration_seconds > 0:
-            speaking_pace_wpm = (total_words / duration_seconds) * 60
-        else:
-            speaking_pace_wpm = 0.0
+        speaking_pace_wpm = (total_words / max(1, duration_seconds)) * 60
 
         # 6. Feature Extraction & Acoustic Analysis
         logger.info("📈 Extracting audio features and metrics...")
@@ -251,41 +229,21 @@ def perform_analysis_job(
         
         # Simple silence calculation based on RMS frames
         frame_len = int(sr * 0.05) 
-        hop_len = int(sr * 0.01)    
+        hop_len = int(sr * 0.01)   
         
+        # Use simple NumPy RMS calculation, avoiding Librosa
         num_frames = (len(y) - frame_len) // hop_len + 1
         rms_frames = np.array([np.sqrt(np.mean(y[i*hop_len : i*hop_len + frame_len]**2)) for i in range(num_frames)])
         
-        # FIX: Use a more robust threshold or ensure it's not too sensitive
-        rms_threshold = np.mean(rms_frames) * 0.2 # Adjusted from 0.1 to 0.2 for better robustness 
+        rms_threshold = np.mean(rms_frames) * 0.1 
         silence_frames = np.sum(rms_frames < rms_threshold)
         total_frames = len(rms_frames)
         silence_ratio = silence_frames / total_frames if total_frames > 0 else 0.0
         
-        # FIX for long_pause_count: Calculate the actual count of DISTINCT long pause events
-        long_pause_duration_frames = int(0.5 / (hop_len / sr)) # 0.5 second pause minimum
-        
-        is_silence = rms_frames < rms_threshold
-        long_pause_count = 0
-        in_long_pause = False
-        pause_start_frame = -1
-
-        for i in range(len(is_silence)):
-            if is_silence[i]:
-                if not in_long_pause:
-                    in_long_pause = True
-                    pause_start_frame = i
-            elif in_long_pause:
-                # End of silence segment
-                pause_duration_frames = i - pause_start_frame
-                if pause_duration_frames >= long_pause_duration_frames:
-                    long_pause_count += 1
-                in_long_pause = False
-
-        # Check for pause at the very end
-        if in_long_pause and (len(is_silence) - pause_start_frame) >= long_pause_duration_frames:
-             long_pause_count += 1
-        # END FIX
+        # Simple proxy for long pause count
+        frames_per_half_second = int(0.5 / (hop_len / sr))
+        long_pause_count = len([i for i in range(len(rms_frames) - frames_per_half_second) 
+                                if all(rms_frames[i+j] < rms_threshold for j in range(frames_per_half_second))])
 
         # Uses the new NumPy/SciPy function
         pitch_mean, pitch_std = calculate_pitch_stats(y, sr)
@@ -315,17 +273,19 @@ def perform_analysis_job(
         # Emotion Classification
         emotion = classify_emotion_simple(temp_wav_file, EMOTION_MODEL, EMOTION_SCALER)
         
-        # 7. Compile Core Metrics for LLM (UPDATED)
+        # 7. Compile Core Metrics for LLM
         core_analysis_metrics = {
             "confidence_score": round(confidence_score, 2),
             "speaking_pace": int(round(speaking_pace_wpm)),
             "filler_word_count": filler_word_count,
-            "apology_count": apology_count,
+            "filler_words_list": filler_words_list,
             "repetition_count": repetition_count,
+            "repetition_words_list": repetition_words_list,
             "acoustic_disfluencies": serializable_disfluencies,
             "acoustic_disfluency_count": len(serializable_disfluencies), 
-            "long_pause_count": long_pause_count, # Changed to an int, as it is a count
+            "long_pause_count": float(long_pause_count),
             "silence_ratio": round(silence_ratio, 2),
+            "avg_amplitude": round(float(avg_amplitude), 4),
             "pitch_mean": round(float(pitch_mean), 2),
             "pitch_std": round(float(pitch_std), 2),
             "emotion": emotion.lower(),
@@ -333,8 +293,6 @@ def perform_analysis_job(
             "transcript": transcript,
             "total_words": total_words,
             "duration_seconds": round(duration_seconds, 2),
-            # CRITICAL NEW FIELD
-            "highlight_markers": [m._asdict() for m in all_text_markers], 
         }
         
         # 8. Generate Intelligent Feedback
@@ -364,7 +322,7 @@ def perform_analysis_job(
         if os.path.exists(temp_wav_file): os.remove(temp_wav_file)
         raise
 
-# --- Worker Entrypoint (Unchanged) ---
+# --- Worker Entrypoint ---
 if __name__ == '__main__':
     redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379')
     logger.info(f"Starting worker and connecting to Redis at: {redis_url}")
