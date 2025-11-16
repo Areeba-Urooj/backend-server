@@ -8,6 +8,7 @@ aiofiles==25.1.0
 loguru==0.7.3
 
 openai==1.35.13
+firebase-admin
 
 # CRITICAL FIX: Add setuptools (contains pkg_resources)
 setuptools>=69.0.3
