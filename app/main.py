@@ -4,7 +4,7 @@ import os
 import sys
 import logging
 from uuid import uuid4
-from typing import Dict, Any, Optional, List 
+from typing import Dict, Any, Optional, List # Import List for Pydantic list[T]
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form
 from fastapi.responses import JSONResponse
@@ -16,23 +16,18 @@ from botocore.exceptions import ClientError
 import redis
 from rq import Queue
 from rq.job import Job
-from pydantic import BaseModel, Field, ValidationError 
+from pydantic import BaseModel # Ensure pydantic is imported
 
-# ⭐ NEW: Import the router from your exercise module (assuming 'exercise.py')
-try:
-    # Ensure app path is included before import attempt
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from app.exercise import router as exercise_router
-except ImportError as e:
-    logging.warning(f"Could not import exercise router: {e}. Exercise endpoints will be unavailable.")
-
+# Ensure app path is included
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # --- Pydantic Models for Data Structures ---
+# 🔥 FIX: New model to handle highlight markers
 class TextMarker(BaseModel):
+    start: int
+    end: int
     type: str
-    word: str 
-    start_char_index: int
-    end_char_index: int
+    text: str
 
 class AnalysisResult(BaseModel):
     confidence_score: float
@@ -41,16 +36,17 @@ class AnalysisResult(BaseModel):
     repetition_count: int
     long_pause_count: float
     silence_ratio: float
-    # 🔥 FINAL CRITICAL FIX: Make avg_amplitude optional to stop the validation error.
-    avg_amplitude: Optional[float] = None 
+    avg_amplitude: float
     pitch_mean: float
     pitch_std: float
     emotion: str
     energy_std: float
     recommendations: List[str]
     transcript: str
-    highlight_markers: List[TextMarker] = Field(default_factory=list)
-    duration_seconds: Optional[float] = None
+    # 🔥 FIX: Add the new field to match the worker's output
+    highlight_markers: List[TextMarker] = [] 
+    # Add duration_seconds here if the worker returns it directly
+    duration_seconds: Optional[float] = None 
 
 
 class AnalysisStatusResponse(BaseModel):
@@ -59,6 +55,7 @@ class AnalysisStatusResponse(BaseModel):
     enqueued_at: Optional[str] = None
     started_at: Optional[str] = None
     ended_at: Optional[str] = None
+    # Use the corrected AnalysisResult model
     result: Optional[AnalysisResult] = None 
     error: Optional[str] = None
 
@@ -85,7 +82,7 @@ def get_redis_connection():
         return conn
     except Exception as e:
         logger.error(f"[MAIN] ❌ Failed to connect to Redis: {e}", exc_info=True)
-        raise RuntimeError("Failed to connect to Redis for RQ.") from e 
+        raise RuntimeError("Failed to connect to Redis for RQ.") from e
 
 try:
     redis_conn = get_redis_connection()
@@ -93,34 +90,20 @@ try:
 except RuntimeError:
     redis_conn = None
     queue = None
-except Exception as e:
-    logger.error(f"[MAIN] ❌ Unexpected error during Redis/RQ setup: {e}", exc_info=True)
-    redis_conn = None
-    queue = None
 
-
-# --- S3 Client Initialization (Revised for better error handling) ---
-s3_client = None
-s3_init_error = None
-
-def init_s3_client():
-    """Initializes S3 client and stores any error message."""
-    global s3_client, s3_init_error
+# --- S3 Client Initialization ---
+def get_s3_client():
+    """Initializes and returns the S3 client."""
     if not S3_BUCKET_NAME:
-        s3_init_error = "S3_BUCKET_NAME environment variable is not set."
-        logger.error(f"[MAIN] ❌ {s3_init_error}")
-        return
-    try:
-        s3_client = boto3.client('s3', region_name=AWS_REGION)
-        # Optional: Perform a quick check to see if credentials work
-        # s3_client.list_buckets()
-        logger.info(f"[MAIN] ✅ S3 Client initialized for bucket: {S3_BUCKET_NAME} in region: {AWS_REGION}")
-    except Exception as e:
-        s3_init_error = f"Boto3 initialization failed: {e.__class__.__name__} - {str(e)}"
-        logger.error(f"[MAIN] ❌ S3 initialization failed: {s3_init_error}", exc_info=True)
+        logger.error("[MAIN] ❌ S3_BUCKET_NAME environment variable is not set.")
+        raise ValueError("S3_BUCKET_NAME is not configured.")
+    return boto3.client('s3', region_name=AWS_REGION)
 
-# Run S3 Initialization
-init_s3_client()
+try:
+    s3_client = get_s3_client()
+    logger.info(f"[MAIN] ✅ S3 Client initialized for bucket: {S3_BUCKET_NAME} in region: {AWS_REGION}")
+except ValueError:
+    s3_client = None
 
 # --- FastAPI App Initialization ---
 app = FastAPI(
@@ -128,15 +111,6 @@ app = FastAPI(
     version="1.0.0",
     description="API for uploading audio and queuing analysis jobs."
 )
-
-# ⭐ NEW: Include the exercise router here!
-try:
-    if 'exercise_router' in locals() or 'exercise_router' in globals():
-        app.include_router(exercise_router)
-        logger.info("[MAIN] ✅ Exercise router included.")
-except NameError:
-    logger.warning("[MAIN] ⚠️ Could not include exercise router (NameError). Check imports.")
-
 
 # CORS configuration
 app.add_middleware(
@@ -170,18 +144,8 @@ async def upload_audio_file(
     file: UploadFile = File(...)
 ):
     """Receives an audio file and uploads it to S3."""
-    # ⭐ MODIFIED: Check s3_init_error to give a clearer 503 response
-    if s3_init_error:
-        # We now raise a 503 error with the reason for the S3 failure.
-        logger.error(f"[API] ❌ Rejecting /upload: S3 storage service is unavailable. Reason: {s3_init_error}")
-        raise HTTPException(
-            status_code=503, 
-            detail=f"S3 storage service is unavailable. Initialization Error: {s3_init_error}"
-        )
-    
-    # Redundant check, but safe
     if not s3_client or not S3_BUCKET_NAME:
-         raise HTTPException(status_code=503, detail="S3 storage service is unavailable due to configuration issue.")
+        raise HTTPException(status_code=503, detail="S3 storage service is unavailable.")
     
     file_extension = os.path.splitext(file.filename)[1] or ".m4a"
     file_uuid = str(uuid4())
@@ -233,6 +197,7 @@ async def submit_analysis_job(
     file_id = os.path.splitext(os.path.basename(s3_key))[0]
 
     try:
+        # Job enqueuing logic is already correct from your snippet
         job = queue.enqueue(
             'app.analysis_worker.perform_analysis_job', 
             kwargs={
@@ -255,6 +220,8 @@ async def submit_analysis_job(
 
     except Exception as e:
         logger.error(f"[API] ❌ Error during job enqueue: {e}", exc_info=True)
+        # This is where a submission error (like incorrect worker import path) might trigger
+        # the immediate 'finished' status on a subsequent poll due to immediate failure.
         raise HTTPException(
             status_code=500,
             detail=f"Failed to submit analysis job: {str(e)}"
@@ -284,33 +251,23 @@ def get_analysis_status(job_id: str):
             job_result = job.result
             
             if job_result and isinstance(job_result, dict):
-                
+                # We attempt to create the Pydantic model with the job result
                 try:
-                    # Attempt to create the Pydantic model with the job result
+                    # Pass the whole dictionary to the Pydantic model for validation
+                    # The Pydantic model will handle defaults for missing fields.
                     analysis_result = AnalysisResult(**job_result)
                     response_data.result = analysis_result
-                
-                except ValidationError as e:
-                    error_message = f"{e.__class__.__name__} for AnalysisResult:\n{e.errors()}"
-                    logger.error(f"[API] ❌ FAILED to map job result to AnalysisResult model for job {job_id}:\n{error_message}", exc_info=True)
-                    
-                    response_data.status = 'failed'
-                    response_data.error = f"Result processing error (API): {str(e)}. Worker result keys/types are likely mismatched."
-                
                 except Exception as e:
-                    logger.error(f"[API] ❌ General error processing job result for job {job_id}: {e}", exc_info=True)
+                    # Log failure to map worker result to Pydantic model
+                    logger.error(f"[API] ❌ FAILED to map job result to AnalysisResult model for job {job_id}: {e}", exc_info=True)
                     response_data.status = 'failed'
-                    response_data.error = f"General result processing error (API): {str(e)}"
-            
-            elif status == 'finished' and not job_result:
-                logger.error(f"[API] Job {job_id} finished, but result was None.")
-                response_data.status = 'failed'
-                response_data.error = "Job finished successfully, but worker returned no result data."
+                    response_data.error = f"Result processing error (API): {str(e)}. Worker result was likely malformed."
 
-        # Explicitly handle 'failed' status from the worker
-        if status == 'failed' and job.exc_info:
+        # Explicitly handle 'failed' status to ensure error information is returned
+        if status == 'failed':
             response_data.error = job.exc_info
-            logger.error(f"[API] Full exception info for worker job {job_id}:\n{job.exc_info}")
+            # This check is critical for debugging worker failures
+            logger.error(f"[API] Full exception info for job {job_id}:\n{job.exc_info}")
             
         return response_data
         
@@ -318,7 +275,9 @@ def get_analysis_status(job_id: str):
         raise HTTPException(status_code=500, detail="Could not connect to Redis.")
     except Exception as e:
         logger.error(f"[API] Error fetching job {job_id}: {e}", exc_info=True)
-        if 'No such job' in str(e) or 'NoneType' in str(e): 
-              raise HTTPException(status_code=404, detail=f"Job with ID {job_id} not found.")
+        # Check if the job actually exists in Redis (i.e., not a NotFoundError)
+        # RQ Job.fetch throws a generic Exception if the key is not found
+        if 'No such job' in str(e):
+             raise HTTPException(status_code=404, detail=f"Job with ID {job_id} not found.")
         else:
-              raise HTTPException(status_code=500, detail=f"Internal error fetching job status: {str(e)}")
+             raise HTTPException(status_code=500, detail=f"Internal error fetching job status: {str(e)}")
