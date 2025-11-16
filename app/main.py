@@ -18,6 +18,15 @@ from rq import Queue
 from rq.job import Job
 from pydantic import BaseModel, Field, ValidationError 
 
+# ⭐ NEW: Import the router from your exercise module (assuming 'exercise.py')
+try:
+    from app.exercise import router as exercise_router
+except ImportError as e:
+    # This try/except block handles cases where the exercise module might not be fully present yet
+    # This is fine for development but should be resolved before production.
+    logging.warning(f"Could not import exercise router: {e}. Exercise endpoints will be unavailable.")
+
+
 # Ensure app path is included
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -108,6 +117,15 @@ app = FastAPI(
     version="1.0.0",
     description="API for uploading audio and queuing analysis jobs."
 )
+
+# ⭐ NEW: Include the exercise router here!
+# This mounts all endpoints from exercise.py (like /exercises/recommend) onto the main app.
+try:
+    app.include_router(exercise_router)
+    logger.info("[MAIN] ✅ Exercise router included.")
+except NameError:
+    logger.warning("[MAIN] ⚠️ Could not include exercise router (NameError). Check imports.")
+
 
 # CORS configuration
 app.add_middleware(
@@ -280,6 +298,6 @@ def get_analysis_status(job_id: str):
     except Exception as e:
         logger.error(f"[API] Error fetching job {job_id}: {e}", exc_info=True)
         if 'No such job' in str(e) or 'NoneType' in str(e): 
-             raise HTTPException(status_code=404, detail=f"Job with ID {job_id} not found.")
+              raise HTTPException(status_code=404, detail=f"Job with ID {job_id} not found.")
         else:
-             raise HTTPException(status_code=500, detail=f"Internal error fetching job status: {str(e)}")
+              raise HTTPException(status_code=500, detail=f"Internal error fetching job status: {str(e)}")
