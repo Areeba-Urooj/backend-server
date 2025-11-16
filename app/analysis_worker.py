@@ -7,6 +7,7 @@ from firebase_admin import initialize_app, firestore
 from google.cloud.firestore import Client as FirestoreClient, DocumentSnapshot
 from google.cloud.firestore_v1.watch import Watch
 from pydantic import BaseModel, Field
+from typing import List, Dict, Any
 
 # --- Environment Setup ---
 # __app_id is used for namespacing Firestore collections
