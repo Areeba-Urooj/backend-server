@@ -332,6 +332,5 @@ def score_confidence(audio_features: Dict[str, Any], fluency_metrics: Dict[str, 
         (energy_score * WEIGHTS['ENERGY_STD'])
     )
 
-    # FIX: Return a default low score (0.3) only if all inputs were zero (highly unlikely now)
-    # The default score of 0.3 was likely a placeholder. Now it will calculate correctly.
+    # The score should now calculate correctly, clamped between 0.0 and 1.0
     return min(1.0, max(0.0, final_score))
