@@ -123,7 +123,7 @@ def detect_fillers_and_apologies(transcript: str) -> List[TextMarker]:
 
     # Use re.finditer to get word matches with their start/end indices
     # Updated regex to catch hyphenated words and contractions
-    for match in re.finditer(r'\b\w+(?:[-']\w+)*\b', transcript.lower()):
+    for match in re.finditer(r"\b\w+(?:[-']\w+)*\b", transcript.lower()):
         word = match.group(0)
         start_index = match.start()
         end_index = match.end()
