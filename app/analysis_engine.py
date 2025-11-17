@@ -65,21 +65,71 @@ def extract_audio_features(file_path: str) -> Dict[str, Any]:
 
 def detect_fillers_and_apologies(transcript: str) -> List[TextMarker]:
     """
-    Detects filler words and common apologetic phrases, returning TextMarkers with indices.
+    Detects filler words, laughter, and common apologetic phrases, returning TextMarkers with indices.
+    Uses comprehensive lists of common filler words and patterns that work for any speaker.
     """
-    filler_set = {"um", "uh", "like", "so", "you know", "i mean", "right", "basically", "actually", "oh"} # Added 'oh'
-    apology_set = {"sorry", "excuse me", "apologize", "apology"} 
-    
+    # Comprehensive filler word set - covers most common verbal fillers that people use naturally
+    filler_set = {
+        # Hesitation fillers (most common)
+        "um", "uh", "er", "erm", "emm", "hmm", "huh", "mm", "mhm",
+        # Discourse markers and conversational fillers
+        "like", "so", "you know", "i mean", "right", "okay", "alright", "ok",
+        "well", "now", "anyway", "actually", "basically", "literally", "totally",
+        "seriously", "honestly", "really", "just", "sort of", "kind of",
+        "you see", "see", "look", "listen", "hey", "oh", "ah", "eh",
+        "uh-huh", "yep", "nope", "yeah", "yup", "sure", "absolutely",
+        # Vocal fillers and sounds
+        "ho", "ha", "hee", "hi", "whoa", "wow", "oops", "whoops",
+        # More hesitation sounds
+        "uhm", "hum", "huh", "phew", "whew",
+        # Additional comprehensive fillers from user data
+        "ugh", "argh", "eek", "ooh", "aah", "eww", "yay", "psst", "shh", "shhh", "tsk", "tut", "tut-tut", "pfft", "psh", "gah", "blah", "bah", "pah", "duh", "duh-duh", "yeah-yeah", "huh-huh", "hah", "hehe", "haha", "hehehehe", "lol", "la", "la-la", "da", "da-da", "ba", "ba-ba", "na", "na-na", "ta", "ta-ta", "ding", "dong", "ting", "tang", "boing", "boom", "pow", "zap", "splat", "thud", "thump", "bump", "bang", "crash", "smash", "whack", "whoosh", "swish", "swoosh", "zoom", "vroom", "beep", "boop", "bleep", "bloop", "click", "clack", "tick", "tock", "ticking", "tocking", "pitter-patter", "rat-a-tat", "tap-tap", "tap-tap-tap", "knock-knock", "rap-rap", "pat-pat", "pit-pit", "tat-tat", "tit-tat", "toot", "toot-toot", "honk", "honk-honk", "meow", "woof", "bark", "baa", "moo", "oink", "quack", "chirp", "tweet", "tweet-tweet", "chirp-chirp", "screech", "squawk", "hiss", "buzz", "bzzzz", "whirr", "whirrr", "hum", "hummmm", "drone", "groan", "moan", "sigh", "sighhhh", "gasp", "pant", "panting", "wheeze", "cough", "cough-cough", "hack", "hack-hack", "achoo", "achoo-achoo", "sniff", "sniffle", "snore", "snoring", "snort", "snorting", "burp", "burp-burp", "hiccup", "hiccup-hiccup", "gulp", "glug", "glug-glug", "slurp", "slurp-slurp", "munch", "munch-munch", "crunch", "crunch-crunch", "chomp", "chomp-chomp", "chew", "chew-chew", "smack", "smack-smack", "nom", "nom-nom", "slosh", "sloshing", "splash", "splash-splash", "plop", "plop-plop", "splurge", "splurging", "squirt", "squirt-squirt", "spritz", "spritzing", "spray", "spraying", "drip", "drip-drip", "dripping", "drop", "drop-drop", "dropping", "plink", "plink-plink", "plunk", "plunk-plunk", "ping", "ping-ping", "pong", "pong-pong", "boing-boing", "bounce", "bouncing", "whomp", "whomp-whomp", "whomping", "thwack", "thwack-thwack", "swat", "swat-swat", "smack", "smacking", "crack", "cracking", "snap", "snap-snap", "snapping", "pop", "pop-pop", "popping", "crackle", "crackling", "fizz", "fizz-fizz", "fizzle", "fizzling", "sizzle", "sizzling", "fry", "frying", "sear", "searing", "burn", "burning", "blaze", "blazing", "flame", "flaming", "spark", "sparking", "flicker", "flickering", "glimmer", "glimmering", "shimmer", "shimmering", "glisten", "glistening", "shine", "shining", "glow", "glowing", "twinkle", "twinkling", "flash", "flashing", "flare", "flaring", "burst", "bursting", "explode", "exploding", "erupt", "erupting", "rumble", "rumbling", "roar", "roaring", "thunder", "thundering", "lightning", "crackle-crackle", "pop-pop-pop", "bang-bang-bang", "boom-boom", "boom-boom-boom", "kaboom", "ker-blam", "pow-pow", "bam-bam", "wham-wham", "thud-thud", "thump-thump", "bump-bump", "crash-crash", "smash-smash", "crack-crack", "snap-snap", "pop-pop", "click-click", "clack-clack", "tick-tick", "tock-tock", "ding-ding", "dong-dong", "ting-ting", "tang-tang", "ping-ping", "pong-pong", "ping-pong", "beep-beep", "boop-boop", "bleep-bleep", "bloop-bloop", "whirr-whirr", "buzz-buzz", "hum-hum", "drone-drone", "zoom-zoom", "vroom-vroom", "whoosh-whoosh", "swish-swish", "swoosh-swoosh", "meow-meow", "woof-woof", "bark-bark", "baa-baa", "moo-moo", "oink-oink", "quack-quack", "chirp-chirp", "tweet-tweet", "screech-screech", "squawk-squawk", "hiss-hiss", "groan-groan", "moan-moan", "sigh-sigh", "gasp-gasp", "pant-pant", "wheeze-wheeze", "cough-cough", "hack-hack", "achoo-achoo", "sniff-sniff", "sniffle-sniffle", "snore-snore", "snort-snort", "burp-burp", "hiccup-hiccup", "gulp-gulp", "glug-glug", "slurp-slurp", "munch-munch", "crunch-crunch", "chomp-chomp", "chew-chew", "smack-smack", "nom-nom", "splash-splash", "plop-plop", "squirt-squirt", "spritz-spritz", "spray-spray", "drip-drip", "drop-drop", "plink-plink", "plunk-plunk", "thwack-thwack", "swat-swat", "crack-crack", "fizz-fizz", "sizzle-sizzle", "fry-fry", "spark-spark", "flicker-flicker", "shimmer-shimmer", "glisten-glisten", "shine-shine", "glow-glow", "twinkle-twinkle", "flash-flash", "flare-flare", "burst-burst", "rumble-rumble", "roar-roar", "thunder-thunder", "lalala", "lalalala", "doodoodoo", "doodoodoodoo", "nanana", "nananana", "tatata", "tatatata", "blahblah", "blahblahblah", "yada", "yada-yada", "yada-yada-yada", "yadda", "yadda-yadda", "yadda-yadda-yadda", "like-like", "you-know", "y-know", "I-mean", "y-see", "um-like", "uh-like", "um-yeah", "uh-yeah", "um-so", "uh-so", "um-I-mean", "uh-I-mean", "um-you-know", "uh-you-know", "um-basically", "uh-basically", "um-actually", "uh-actually", "um-literally", "uh-literally", "um-right", "uh-right", "um-okay", "uh-okay", "um-well", "uh-well", "um-anyway", "uh-anyway", "um-I-guess", "uh-I-guess", "um-I-think", "uh-I-think", "um-I-dunno", "uh-I-dunno", "um-thing", "uh-thing", "um-stuff", "uh-stuff", "um-whatnot", "uh-whatnot", "um-something", "uh-something", "um-whatever", "uh-whatever", "um-or-something", "uh-or-something", "um-or-like", "uh-or-like", "um-kinda", "uh-kinda", "um-sorta", "uh-sorta", "um-I-suppose", "uh-I-suppose", "um-probably", "uh-probably", "um-maybe", "uh-maybe", "um-perhaps", "uh-perhaps", "um-possibly", "uh-possibly", "um-apparently", "uh-apparently", "um-seemingly", "uh-seemingly", "um-clearly", "uh-clearly", "um-obviously", "uh-obviously", "um-certainly", "uh-certainly", "um-definitely", "uh-definitely", "um-absolutely", "uh-absolutely", "um-totally", "uh-totally", "um-completely", "uh-completely", "um-entirely", "uh-entirely", "um-quite", "uh-quite", "um-rather", "uh-rather", "um-pretty", "uh-pretty", "um-very", "uh-very", "um-really", "uh-really", "um-truly", "uh-truly", "um-genuinely", "uh-genuinely", "um-honestly", "uh-honestly", "um-frankly", "uh-frankly", "um-frankly-speaking", "uh-frankly-speaking", "um-to-be-honest", "uh-to-be-honest", "um-to-be-frank", "uh-to-be-frank"
+    }
+
+    apology_set = {"sorry", "excuse me", "apologize", "apology", "pardon", "forgive", "my bad"}
+
     markers: List[TextMarker] = []
-    
+
+    # Detect laughter patterns - flexible regex that catches various laughter forms
+    # This will match "haha", "hehe", "hihi", "hoho", "ha ha", "heehee", "lol", etc.
+    laughter_pattern = r'\b(?:ha|he|hi|ho|hee|lol|rofl|lmao){2,}\b|\b(?:ha|he|hi|ho)\s*(?:ha|he|hi|ho)+\b'
+    for match in re.finditer(laughter_pattern, transcript, re.IGNORECASE):
+        markers.append(TextMarker(
+            type='filler',
+            word=match.group(0),
+            start_char_index=match.start(),
+            end_char_index=match.end()
+        ))
+
+    # Detect other vocal sounds and exclamations like "uh-oh", "oh boy", etc.
+    vocal_pattern = r'\b(?:uh-oh|oh boy|oh man|oh god|oh no|oh dear|goodness|gosh|wow|oops|whoops|jeez|geez|darn|shoot)\b'
+    for match in re.finditer(vocal_pattern, transcript, re.IGNORECASE):
+        markers.append(TextMarker(
+            type='filler',
+            word=match.group(0),
+            start_char_index=match.start(),
+            end_char_index=match.end()
+        ))
+
+    # Detect repeated syllables like "la-la-la" or "da-da-da"
+    repeated_syllable_pattern = r'\b(\w{1,3})\s*(?:-\s*\1|\s+\1){2,}\b'
+    for match in re.finditer(repeated_syllable_pattern, transcript, re.IGNORECASE):
+        markers.append(TextMarker(
+            type='filler',
+            word=match.group(0),
+            start_char_index=match.start(),
+            end_char_index=match.end()
+        ))
+
     # Use re.finditer to get word matches with their start/end indices
-    for match in re.finditer(r'\b\w+\b', transcript.lower()):
+    # Updated regex to catch hyphenated words and contractions
+    for match in re.finditer(r'\b\w+(?:[-']\w+)*\b', transcript.lower()):
         word = match.group(0)
         start_index = match.start()
         end_index = match.end()
-        
+
         marker_type: Optional[str] = None
-        
+
         if word in filler_set:
             marker_type = 'filler'
         elif word in apology_set:
@@ -87,12 +137,12 @@ def detect_fillers_and_apologies(transcript: str) -> List[TextMarker]:
 
         if marker_type:
             markers.append(TextMarker(
-                type=marker_type, 
-                word=match.group(0), # Use the original casing for the word field
-                start_char_index=start_index, 
+                type=marker_type,
+                word=transcript[start_index:end_index],  # Preserve original casing
+                start_char_index=start_index,
                 end_char_index=end_index
             ))
-            
+
     return markers
 
 def detect_repetitions_for_highlighting(transcript: str) -> List[TextMarker]:
@@ -100,15 +150,15 @@ def detect_repetitions_for_highlighting(transcript: str) -> List[TextMarker]:
     Detects repeated adjacent words, returning TextMarkers.
     """
     markers: List[TextMarker] = []
-    
+
     # Tokenize the transcript while keeping track of original indices
     token_matches = list(re.finditer(r'(\w+)(\W*)', transcript))
-    
+
     i = 0
     while i < len(token_matches) - 1:
         word1_lower = token_matches[i].group(1).lower()
         word2_lower = token_matches[i+1].group(1).lower()
-        
+
         if word1_lower == word2_lower and len(word1_lower) > 2: # Ignore single letter repeats
             # Repetition found: highlight the full phrase including the second instance.
             start_char_index = token_matches[i].start(1)
@@ -120,11 +170,30 @@ def detect_repetitions_for_highlighting(transcript: str) -> List[TextMarker]:
                 start_char_index=start_char_index,
                 end_char_index=end_char_index
             ))
-            
+
             i += 2 # Skip both repeated words
         else:
             i += 1
-            
+
+    # Also detect non-adjacent repetitions like "wait, wait, wait"
+    word_positions = {}
+    for match in re.finditer(r'\b(\w+)\b', transcript):
+        word = match.group(1).lower()
+        if word not in word_positions:
+            word_positions[word] = []
+        word_positions[word].append((match.start(), match.end()))
+
+    for word, positions in word_positions.items():
+        if len(positions) >= 3 and len(word) > 2:  # At least 3 occurrences
+            # Mark all occurrences of the repeated word
+            for start_idx, end_idx in positions:
+                markers.append(TextMarker(
+                    type='repetition',
+                    word=transcript[start_idx:end_idx],
+                    start_char_index=start_idx,
+                    end_char_index=end_idx
+                ))
+
     return markers
 
 def detect_custom_markers(transcript: str) -> List[TextMarker]:
