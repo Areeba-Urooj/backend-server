@@ -19,11 +19,11 @@ class SubmissionResponse(BaseModel):
 
 # --- 3. Analysis Result Model ---
 class AnalysisResult(BaseModel):
-    confidence_score: float
-    speaking_pace: int
+    confidence_score: float  # 0-100 scale (fixed from 0-1)
+    speaking_pace: int       # words per minute
     filler_word_count: int
     repetition_count: int
-    long_pause_count: float
+    long_pause_count: int    # Changed from float to int (count of pauses)
     silence_ratio: float
     avg_amplitude: float
     pitch_mean: float
@@ -32,6 +32,8 @@ class AnalysisResult(BaseModel):
     energy_std: float
     recommendations: List[str]
     transcript: str
+    # Optional fields for additional data
+    transcript_markers: Optional[List[Dict]] = None
 
 # --- 4. Analysis Status/Result Model (Output) ---
 class AnalysisStatusResponse(BaseModel):
