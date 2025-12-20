@@ -32,67 +32,51 @@ class TextMarker(NamedTuple):
     end_char_index: int
 
 
-# --- 1. Core Feature Extraction (NumPy/SciPy only - no librosa) ---
+# --- 1. Core Feature Extraction (ffprobe only for metadata) ---
 def extract_audio_features(file_path: str) -> Dict[str, Any]:
     """
-    Extract audio features using soundfile and NumPy/SciPy (no librosa).
-    Compatible with Render.com deployment.
+    Extract audio duration using ffprobe ONLY.
+    Soundfile doesn't support M4A, so we use ffprobe for metadata.
+    Works for M4A, MP3, WAV, FLAC, OGG, etc.
     """
     features: Dict[str, Any] = {
         'duration_s': 0.0,
         'sample_rate': TARGET_SR,
-        'rms_mean': 0.0,
-        'rms_std': 0.0,
-        'zcr_mean': 0.0,
     }
 
     try:
-        # Load audio file with soundfile
-        audio, sr = sf.read(file_path, dtype='float32')
+        # Use ffprobe to get duration and sample rate (works for all audio formats)
+        command = [
+            'ffprobe', '-v', 'error',
+            '-show_entries', 'format=duration:stream=sample_rate',
+            '-of', 'json', file_path
+        ]
+        result = subprocess.run(command, capture_output=True, text=True, check=True)
+        probe_data = json.loads(result.stdout)
 
-        # Handle stereo -> mono conversion
-        if len(audio.shape) > 1:
-            audio = np.mean(audio, axis=1)
+        # Extract duration
+        duration = float(probe_data['format'].get('duration', 0.0))
+        features['duration_s'] = duration
 
-        # Basic resampling if needed (simple linear interpolation)
-        if sr != TARGET_SR:
-            original_length = len(audio)
-            new_length = int(len(audio) * TARGET_SR / sr)
-            indices = np.linspace(0, original_length - 1, new_length)
-            audio = np.interp(indices, np.arange(original_length), audio)
-            sr = TARGET_SR
+        logger.info(f"✅ Audio duration extracted: {duration:.2f}s")
 
-        # Calculate duration
-        duration = len(audio) / sr
-        features['duration_s'] = float(duration)
-        features['sample_rate'] = sr
+        # Extract sample rate
+        if 'streams' in probe_data and probe_data['streams']:
+            sr = int(probe_data['streams'][0].get('sample_rate', TARGET_SR))
+            features['sample_rate'] = sr
+            logger.info(f"✅ Sample rate extracted: {sr}Hz")
+        else:
+            features['sample_rate'] = TARGET_SR
+            logger.warning(f"⚠️ Could not extract sample rate, using default: {TARGET_SR}Hz")
 
-        # Frame-based feature extraction
-        frame_length = int(0.025 * sr)  # 25ms frames
-        hop_length = int(0.010 * sr)    # 10ms hop
-
-        # Extract frames
-        frames = np.array([
-            audio[i:i+frame_length]
-            for i in range(0, len(audio)-frame_length, hop_length)
-        ])
-
-        if len(frames) == 0:
-            logger.error("No frames extracted - audio too short")
-            return features
-
-        # Calculate RMS energy per frame
-        rms_frames = np.sqrt(np.mean(frames**2, axis=1))
-        features['rms_mean'] = float(np.mean(rms_frames))
-        features['rms_std'] = float(np.std(rms_frames))
-
-        # Calculate zero-crossing rate per frame
-        zcr_frames = np.mean(np.abs(np.diff(np.sign(frames), axis=1)), axis=1) / 2
-        features['zcr_mean'] = float(np.mean(zcr_frames))
-
-        logger.info(f"✅ Audio features extracted: {duration:.2f}s, RMS={features['rms_mean']:.4f}, ZCR={features['zcr_mean']:.4f}")
         return features
 
+    except subprocess.CalledProcessError as e:
+        logger.error(f"❌ ffprobe failed: {e.stderr}")
+        raise RuntimeError(f"ffprobe extraction failed: {e.stderr}")
+    except json.JSONDecodeError as e:
+        logger.error(f"❌ Failed to parse ffprobe JSON: {e}")
+        raise RuntimeError(f"Failed to parse ffprobe output: {e}")
     except Exception as e:
         logger.error(f"❌ Feature extraction failed: {e}", exc_info=True)
         raise RuntimeError(f"Feature extraction failed: {e}")
