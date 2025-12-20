@@ -160,225 +160,350 @@ def generate_intelligent_feedback(transcript: str, metrics: Dict[str, Any]) -> L
         logger.error(f"[OPENAI] API call or JSON decoding failed: {e.__class__.__name__}: {e}")
         return [f"An error occurred during intelligent feedback generation: {e.__class__.__name__}"]
 
-# --- Core Analysis Function (UPDATED) ---
+# --- Core Analysis Function (WITH COMPREHENSIVE DEBUG LOGGING) ---
 def perform_analysis_job(
-    file_id: str, 
-    s3_key: str, 
-    transcript: str, 
+    file_id: str,
+    s3_key: str,
+    transcript: str,
     user_id: Optional[str] = None
 ) -> Dict[str, Any]:
     """Worker function to fetch audio, perform analysis, and return results."""
     job_start_time = time.time()
-    logger.info(f"🚀 Starting analysis for file_id: {file_id}, s3_key: {s3_key}")
+    logger.info(f"🚀 [JOB START] file_id={file_id}, s3_key={s3_key}, user_id={user_id}")
 
     temp_audio_file = f"/tmp/{file_id}_{os.path.basename(s3_key)}"
     temp_wav_file = f"/tmp/{file_id}_converted.wav"
-    
-    # 1. Fluency analysis first
-    # FIX: Use a robust split method to avoid errors from punctuation/whitespace
-    import re
-    word_tokens = re.findall(r'\b\w+\b', transcript)
-    total_words = len(word_tokens) 
-    
-    # Collect all text markers from the updated functions
-    filler_apology_markers: List[TextMarker] = detect_fillers_and_apologies(transcript)
-    repetition_markers: List[TextMarker] = detect_repetitions_for_highlighting(transcript)
-    custom_markers: List[TextMarker] = detect_custom_markers(transcript)
-    
-    all_text_markers = filler_apology_markers + repetition_markers + custom_markers
-    
-    # Calculate counts for metrics based on the markers
-    filler_word_count = len([m for m in all_text_markers if m.type == 'filler'])
-    repetition_count = len([m for m in all_text_markers if m.type == 'repetition']) 
-    apology_count = len([m for m in all_text_markers if m.type == 'apology']) 
-    
-    # Initialize values
-    duration_seconds = 0.0
-    speaking_pace_wpm = 0.0
-    emotion = "Neutral"
-    confidence_score = 0.0
-    
+
     try:
-        # 2. Download (Original raw file)
-        logger.info(f"⬇️ Downloading s3://{S3_BUCKET_NAME}/{s3_key}...")
-        s3_client.download_file(S3_BUCKET_NAME, s3_key, temp_audio_file)
-        
-        # 3. Safe Duration Check on the raw file
-        audio_features_raw = extract_audio_features(temp_audio_file)
-        audio_duration = audio_features_raw.get('duration_s', 0.0)
-        
-        if audio_duration > MAX_DURATION_SECONDS:
-             logger.warning(f"⚠️ Audio duration {audio_duration:.2f}s exceeds limit of {MAX_DURATION_SECONDS}s.")
-        
-        # 4. Conversion to WAV 
-        ffmpeg_command = ["ffmpeg", "-i", temp_audio_file, "-ac", "1", "-ar", str(TARGET_SR), "-y", temp_wav_file]
-        
+        # STEP 1: Transcript Analysis
+        logger.info("[STEP 1] Starting transcript analysis...")
         try:
-            subprocess.run(ffmpeg_command, capture_output=True, text=True, check=True)
-            logger.info("✅ FFmpeg conversion successful.")
+            import re
+            word_tokens = re.findall(r'\b\w+\b', transcript)
+            total_words = len(word_tokens)
+            logger.info(f"✅ [STEP 1] Transcript tokenized: {total_words} words found")
+
+            # Fluency analysis
+            filler_apology_markers: List[TextMarker] = detect_fillers_and_apologies(transcript)
+            logger.info(f"✅ [STEP 1] Fillers/apologies detected: {len(filler_apology_markers)}")
+
+            repetition_markers: List[TextMarker] = detect_repetitions_for_highlighting(transcript)
+            logger.info(f"✅ [STEP 1] Repetitions detected: {len(repetition_markers)}")
+
+            custom_markers: List[TextMarker] = detect_custom_markers(transcript)
+            logger.info(f"✅ [STEP 1] Custom markers detected: {len(custom_markers)}")
+
+            all_text_markers = filler_apology_markers + repetition_markers + custom_markers
+            filler_word_count = len([m for m in all_text_markers if m.type == 'filler'])
+            repetition_count = len([m for m in all_text_markers if m.type == 'repetition'])
+            apology_count = len([m for m in all_text_markers if m.type == 'apology'])
+
+            logger.info(f"✅ [STEP 1] Complete: fillers={filler_word_count}, reps={repetition_count}, apologies={apology_count}")
+        except Exception as e:
+            logger.error(f"❌ [STEP 1] FAILED: {e}", exc_info=True)
+            raise
+
+        # STEP 2: Download from S3
+        logger.info(f"[STEP 2] Downloading S3 file: s3://{S3_BUCKET_NAME}/{s3_key}")
+        try:
+            s3_client.download_file(S3_BUCKET_NAME, s3_key, temp_audio_file)
+            file_size = os.path.getsize(temp_audio_file)
+            logger.info(f"✅ [STEP 2] Downloaded successfully: {file_size} bytes")
+        except ClientError as e:
+            logger.error(f"❌ [STEP 2] S3 download failed: {e}", exc_info=True)
+            raise
+        except Exception as e:
+            logger.error(f"❌ [STEP 2] FAILED: {e}", exc_info=True)
+            raise
+
+        # STEP 3: Check duration with ffprobe
+        logger.info("[STEP 3] Extracting audio features (ffprobe)...")
+        try:
+            audio_features_raw = extract_audio_features(temp_audio_file)
+            audio_duration = audio_features_raw.get('duration_s', 0.0)
+            logger.info(f"✅ [STEP 3] Audio duration: {audio_duration:.2f}s")
+
+            if audio_duration > MAX_DURATION_SECONDS:
+                logger.warning(f"⚠️ [STEP 3] Audio exceeds limit: {audio_duration:.2f}s > {MAX_DURATION_SECONDS}s")
+
+            if audio_duration < 1.0:
+                logger.error(f"❌ [STEP 3] Audio too short: {audio_duration:.2f}s < 1.0s")
+                raise ValueError(f"Audio duration too short: {audio_duration:.2f}s")
+        except Exception as e:
+            logger.error(f"❌ [STEP 3] FAILED: {e}", exc_info=True)
+            raise
+
+        # STEP 4: FFmpeg Conversion
+        logger.info("[STEP 4] Converting audio with FFmpeg...")
+        try:
+            ffmpeg_command = ["ffmpeg", "-i", temp_audio_file, "-ac", "1", "-ar", str(TARGET_SR), "-y", temp_wav_file]
+            logger.info(f"[STEP 4] Running: {' '.join(ffmpeg_command)}")
+
+            result = subprocess.run(ffmpeg_command, capture_output=True, text=True, check=True)
+            logger.info(f"[STEP 4] FFmpeg stdout: {result.stdout[:200]}")
+
+            if os.path.exists(temp_wav_file):
+                wav_size = os.path.getsize(temp_wav_file)
+                logger.info(f"✅ [STEP 4] WAV file created: {wav_size} bytes")
+            else:
+                raise FileNotFoundError(f"WAV file not created at {temp_wav_file}")
+
         except subprocess.CalledProcessError as e:
-            logger.error(f"❌ FFmpeg conversion failed: {e.stderr}", exc_info=True)
-            raise Exception("FFmpeg conversion failed.")
+            logger.error(f"❌ [STEP 4] FFmpeg failed: {e.stderr}", exc_info=True)
+            raise Exception(f"FFmpeg conversion failed: {e.stderr}")
         except FileNotFoundError:
-            logger.error("❌ FFmpeg command not found. Ensure FFmpeg is installed and in PATH.")
-            raise Exception("FFmpeg not available in the worker environment.")
-            
-        # 5. Load the converted WAV file 
-        y, sr = sf.read(temp_wav_file, dtype='float32', always_2d=False)
-        if len(y.shape) > 1:
-            y = np.mean(y, axis=1)
+            logger.error("❌ [STEP 4] FFmpeg command not found. Ensure FFmpeg is installed and in PATH.")
+            raise
+        except Exception as e:
+            logger.error(f"❌ [STEP 4] FAILED: {e}", exc_info=True)
+            raise
 
-        # Truncate 'y' (if conversion didn't handle duration limit, or for safety)
-        max_samples = sr * MAX_DURATION_SECONDS
-        if len(y) > max_samples:
-            y = y[:max_samples]
-            
-        duration_seconds = len(y) / sr
-        
-        # FIX: Calculate WPM defensively
-        if duration_seconds > 0:
-            speaking_pace_wpm = (total_words / duration_seconds) * 60
-        else:
-            speaking_pace_wpm = 0.0
+        # STEP 5: Load WAV with soundfile
+        logger.info("[STEP 5] Loading WAV file with soundfile...")
+        try:
+            y, sr = sf.read(temp_wav_file, dtype='float32', always_2d=False)
+            logger.info(f"✅ [STEP 5] WAV loaded: shape={y.shape}, sr={sr}Hz")
 
-        # 6. Feature Extraction & Acoustic Analysis using librosa
-        logger.info("📈 Extracting audio features using librosa...")
+            if len(y.shape) > 1:
+                y = np.mean(y, axis=1)
+                logger.info(f"[STEP 5] Converted stereo to mono: new shape={y.shape}")
 
-        # Use librosa to extract comprehensive features from the converted WAV file
-        audio_features = extract_audio_features(temp_wav_file)
+            # Check audio validity
+            if len(y) == 0:
+                raise ValueError("Audio array is empty")
 
-        # Validate that we got proper features
-        if audio_features['duration_s'] <= 0:
-            logger.error("❌ Audio feature extraction failed - invalid duration")
-            raise Exception("Audio feature extraction failed")
+            max_samples = sr * MAX_DURATION_SECONDS
+            if len(y) > max_samples:
+                y = y[:max_samples]
+                logger.info(f"[STEP 5] Truncated to {MAX_DURATION_SECONDS}s")
 
-        logger.info(f"✅ Audio features extracted: duration={audio_features['duration_s']:.2f}s, RMS={audio_features['rms_mean']:.4f}")
+            duration_seconds = len(y) / sr
+            logger.info(f"✅ [STEP 5] Audio ready: {duration_seconds:.2f}s, shape={y.shape}")
 
-        # Reload audio with librosa for consistency (proper normalization and mono conversion)
-        y_librosa, sr_librosa = librosa.load(temp_wav_file, sr=None, mono=True)
+        except Exception as e:
+            logger.error(f"❌ [STEP 5] WAV loading failed: {e}", exc_info=True)
+            raise
 
-        # Verify audio data integrity
-        if len(y_librosa) == 0 or np.max(np.abs(y_librosa)) < 0.001:
-            logger.error("❌ Audio data appears to be silent or corrupted")
-            raise Exception("Audio data is silent or corrupted")
+        # STEP 6: Calculate Speaking Pace
+        logger.info("[STEP 6] Calculating speaking pace...")
+        try:
+            if duration_seconds > 0:
+                speaking_pace_wpm = (total_words / duration_seconds) * 60
+            else:
+                speaking_pace_wpm = 0.0
+            logger.info(f"✅ [STEP 6] Speaking pace: {speaking_pace_wpm:.1f} WPM")
+        except Exception as e:
+            logger.error(f"❌ [STEP 6] FAILED: {e}", exc_info=True)
+            raise
 
-        # Calculate speaking pace properly
-        if duration_seconds > 0 and total_words > 0:
-            speaking_pace_wpm = (total_words / duration_seconds) * 60
-        else:
-            speaking_pace_wpm = 120  # Default reasonable pace
+        # STEP 7: Extract Audio Features
+        logger.info("[STEP 7] Extracting audio features from WAV...")
+        try:
+            # Use NumPy/SciPy only features from the converted WAV file
+            audio_features = extract_audio_features(temp_wav_file)
 
-        # Calculate silence ratio using proper RMS thresholding
-        rms_frames = librosa.feature.rms(y=y_librosa, frame_length=1024, hop_length=512)[0]
-        silence_threshold = np.mean(rms_frames) * 0.15  # More robust threshold
-        silence_frames = np.sum(rms_frames < silence_threshold)
-        silence_ratio = silence_frames / len(rms_frames)
+            # Validate that we got proper features
+            if audio_features['duration_s'] <= 0:
+                logger.error("❌ Audio feature extraction failed - invalid duration")
+                raise Exception("Audio feature extraction failed")
 
-        # Calculate long pause count using proper silence detection
-        min_pause_duration = int(0.5 * sr_librosa)  # 0.5 second minimum
-        hop_length = 512
+            logger.info(f"✅ [STEP 7] Audio features extracted: duration={audio_features['duration_s']:.2f}s, RMS={audio_features['rms_mean']:.4f}")
 
-        # Find silent regions
-        is_silent = rms_frames < silence_threshold
-        long_pause_count = 0
+        except Exception as e:
+            logger.error(f"❌ [STEP 7] FAILED: {e}", exc_info=True)
+            raise
 
-        # Count contiguous silent regions longer than minimum duration
-        silent_start = None
-        for i, silent in enumerate(is_silent):
-            if silent and silent_start is None:
-                silent_start = i
-            elif not silent and silent_start is not None:
-                # Check duration of silent region
-                silent_samples = (i - silent_start) * hop_length
-                if silent_samples >= min_pause_duration:
-                    long_pause_count += 1
+        # STEP 8: Calculate Silence and Pauses
+        logger.info("[STEP 8] Calculating silence and pauses...")
+        try:
+            # Calculate silence ratio using proper RMS thresholding
+            frame_length = int(0.025 * sr)  # 25ms frames
+            hop_length_calc = int(0.010 * sr)    # 10ms hop
+
+            # Extract frames for silence analysis
+            frames = np.array([
+                y[i:i+frame_length]
+                for i in range(0, len(y)-frame_length, hop_length_calc)
+            ])
+
+            if len(frames) > 0:
+                rms_frames = np.sqrt(np.mean(frames**2, axis=1))
+                silence_threshold = np.mean(rms_frames) * 0.15  # Robust threshold
+                silence_frames = np.sum(rms_frames < silence_threshold)
+                total_frames = len(rms_frames)
+                silence_ratio = silence_frames / total_frames if total_frames > 0 else 0.0
+                logger.info(f"✅ [STEP 8] Silence ratio: {silence_ratio:.2%} ({silence_frames}/{total_frames} frames)")
+
+                # Long pause detection
+                min_pause_samples = int(0.5 * sr)  # 0.5 second minimum
+
+                # Find silent regions
+                is_silent = rms_frames < silence_threshold
+                long_pause_count = 0
+
+                # Count contiguous silent regions longer than minimum duration
                 silent_start = None
+                for i, silent in enumerate(is_silent):
+                    if silent and silent_start is None:
+                        silent_start = i
+                    elif not silent and silent_start is not None:
+                        # Check duration of silent region
+                        silent_samples = (i - silent_start) * hop_length_calc
+                        if silent_samples >= min_pause_samples:
+                            long_pause_count += 1
+                        silent_start = None
 
-        # Check for silence at the end
-        if silent_start is not None:
-            silent_samples = (len(is_silent) - silent_start) * hop_length
-            if silent_samples >= min_pause_duration:
-                long_pause_count += 1
+                # Check for silence at the end
+                if silent_start is not None:
+                    silent_samples = (len(is_silent) - silent_start) * hop_length_calc
+                    if silent_samples >= min_pause_samples:
+                        long_pause_count += 1
 
-        # Extract pitch statistics
-        pitch_mean, pitch_std = calculate_pitch_stats(y_librosa, sr_librosa)
+                logger.info(f"✅ [STEP 8] Long pauses detected: {long_pause_count}")
+            else:
+                silence_ratio = 0.0
+                long_pause_count = 0
 
-        # Detect acoustic disfluencies
-        acoustic_disfluencies = detect_acoustic_disfluencies(y_librosa, sr_librosa)
-        serializable_disfluencies = [d._asdict() for d in acoustic_disfluencies]
+        except Exception as e:
+            logger.error(f"❌ [STEP 8] FAILED: {e}", exc_info=True)
+            raise
 
-        logger.info(f"🎵 Acoustic analysis: pitch={pitch_mean:.1f}±{pitch_std:.1f}Hz, pauses={long_pause_count}, disfluencies={len(serializable_disfluencies)}")
+        # STEP 9: Calculate Pitch Stats
+        logger.info("[STEP 9] Calculating pitch statistics...")
+        try:
+            pitch_mean, pitch_std = calculate_pitch_stats(y, sr)
+            logger.info(f"✅ [STEP 9] Pitch: mean={pitch_mean:.1f}Hz, std={pitch_std:.1f}Hz")
+        except Exception as e:
+            logger.error(f"❌ [STEP 9] FAILED: {e}", exc_info=True)
+            pitch_mean, pitch_std = 185.0, 15.0  # Safe defaults
+            logger.warning("[STEP 9] Using fallback pitch values")
 
-        # Prepare features for confidence scoring
-        audio_features_for_score = {
-            "speaking_pace_wpm": speaking_pace_wpm,
-            "pitch_mean": pitch_mean,
-            "pitch_std": pitch_std,
-            "energy_std": audio_features['rms_std'],
-        }
+        # STEP 10: Detect Acoustic Disfluencies
+        logger.info("[STEP 10] Detecting acoustic disfluencies...")
+        try:
+            acoustic_disfluencies = detect_acoustic_disfluencies(y, sr)
+            logger.info(f"✅ [STEP 10] Acoustic disfluencies: {len(acoustic_disfluencies)} detected")
+        except Exception as e:
+            logger.error(f"❌ [STEP 10] FAILED: {e}", exc_info=True)
+            acoustic_disfluencies = []
 
-        fluency_metrics_for_score = {
-            "filler_word_count": filler_word_count,
-            "repetition_count": repetition_count,
-            "acoustic_disfluency_count": len(serializable_disfluencies),
-            "total_words": total_words,
-        }
+        # STEP 11: Score Confidence
+        logger.info("[STEP 11] Calculating confidence score...")
+        try:
+            audio_features_for_score = {
+                "speaking_pace_wpm": speaking_pace_wpm,
+                "pitch_mean": pitch_mean,
+                "pitch_std": pitch_std,
+                "energy_std": audio_features['rms_std'],
+                "rms_mean": audio_features['rms_mean'],
+            }
 
-        # Calculate confidence score (now returns 0-100)
-        confidence_score = score_confidence(audio_features_for_score, fluency_metrics_for_score)
-        logger.info(f"🏆 Final confidence score: {confidence_score:.1f}/100")
+            fluency_metrics_for_score = {
+                "filler_word_count": filler_word_count,
+                "repetition_count": repetition_count,
+                "acoustic_disfluency_count": len(acoustic_disfluencies),
+                "total_words": total_words,
+            }
 
-        # Emotion Classification
-        emotion = classify_emotion_simple(temp_wav_file, EMOTION_MODEL, EMOTION_SCALER)
-        logger.info(f"😊 Detected emotion: {emotion}")
-        
-        # 7. Compile Core Metrics for LLM (UPDATED)
-        core_analysis_metrics = {
-            "confidence_score": round(confidence_score, 2),
-            "speaking_pace": int(round(speaking_pace_wpm)),
-            "filler_word_count": filler_word_count,
-            "apology_count": apology_count,
-            "repetition_count": repetition_count,
-            "acoustic_disfluencies": serializable_disfluencies,
-            "acoustic_disfluency_count": len(serializable_disfluencies), 
-            "long_pause_count": long_pause_count, # Changed to an int, as it is a count
-            "silence_ratio": round(silence_ratio, 2),
-            "pitch_mean": round(float(pitch_mean), 2),
-            "pitch_std": round(float(pitch_std), 2),
-            "emotion": emotion.lower(),
-            "energy_std": round(float(energy_std), 4),
-            "transcript": transcript,
-            "total_words": total_words,
-            "duration_seconds": round(duration_seconds, 2),
-            # CRITICAL NEW FIELD
-            "highlight_markers": [m._asdict() for m in all_text_markers], 
-        }
-        
-        # 8. Generate Intelligent Feedback
-        logger.info("🤖 Generating intelligent feedback using OpenAI...")
-        llm_recommendations = generate_intelligent_feedback(
-            transcript=transcript, 
-            metrics=core_analysis_metrics
-        )
-        
-        # 9. Compile Final Result
-        final_result = {
-            **core_analysis_metrics,
-            "recommendations": llm_recommendations,
-        }
+            confidence_score = score_confidence(audio_features_for_score, fluency_metrics_for_score)
+            logger.info(f"✅ [STEP 11] Confidence score: {confidence_score:.1f}/100")
+        except Exception as e:
+            logger.error(f"❌ [STEP 11] FAILED: {e}", exc_info=True)
+            raise
 
-        logger.info(f"✅ Analysis complete in {round(time.time() - job_start_time, 2)}s.")
-        
-        # 10. Cleanup
-        if os.path.exists(temp_audio_file): os.remove(temp_audio_file)
-        if os.path.exists(temp_wav_file): os.remove(temp_wav_file)
-        
+        # STEP 12: Emotion Classification
+        logger.info("[STEP 12] Classifying emotion...")
+        try:
+            emotion = classify_emotion_simple(temp_wav_file, EMOTION_MODEL, EMOTION_SCALER)
+            logger.info(f"✅ [STEP 12] Emotion: {emotion}")
+        except Exception as e:
+            logger.error(f"❌ [STEP 12] FAILED: {e}", exc_info=True)
+            emotion = "neutral"
+
+        # STEP 13: Compile Final Result
+        logger.info("[STEP 13] Compiling final result...")
+        try:
+            core_analysis_metrics = {
+                "confidence_score": round(confidence_score, 2),
+                "speaking_pace": int(round(speaking_pace_wpm)),
+                "filler_word_count": filler_word_count,
+                "apology_count": apology_count,
+                "repetition_count": repetition_count,
+                "acoustic_disfluencies": [d._asdict() for d in acoustic_disfluencies],
+                "acoustic_disfluency_count": len(acoustic_disfluencies),
+                "long_pause_count": long_pause_count,
+                "silence_ratio": round(silence_ratio, 2),
+                "pitch_mean": round(float(pitch_mean), 2),
+                "pitch_std": round(float(pitch_std), 2),
+                "emotion": emotion.lower(),
+                "energy_std": round(float(audio_features['rms_std']), 4),
+                "transcript": transcript,
+                "total_words": total_words,
+                "duration_seconds": round(duration_seconds, 2),
+                "highlight_markers": [m._asdict() for m in all_text_markers],
+            }
+
+            logger.info(f"✅ [STEP 13] Result compiled successfully")
+        except Exception as e:
+            logger.error(f"❌ [STEP 13] FAILED: {e}", exc_info=True)
+            raise
+
+        # STEP 14: Generate Intelligent Feedback
+        logger.info("[STEP 14] Generating AI feedback...")
+        try:
+            llm_recommendations = generate_intelligent_feedback(
+                transcript=transcript,
+                metrics=core_analysis_metrics
+            )
+            logger.info(f"✅ [STEP 14] Generated {len(llm_recommendations)} recommendations")
+        except Exception as e:
+            logger.error(f"❌ [STEP 14] FAILED: {e}", exc_info=True)
+            llm_recommendations = ["Unable to generate feedback at this time."]
+
+        # STEP 15: Final Compilation
+        logger.info("[STEP 15] Creating final result...")
+        try:
+            final_result = {
+                **core_analysis_metrics,
+                "recommendations": llm_recommendations,
+            }
+            logger.info(f"✅ [STEP 15] Final result created")
+        except Exception as e:
+            logger.error(f"❌ [STEP 15] FAILED: {e}", exc_info=True)
+            raise
+
+        # STEP 16: Cleanup
+        logger.info("[STEP 16] Cleaning up temporary files...")
+        try:
+            if os.path.exists(temp_audio_file):
+                os.remove(temp_audio_file)
+                logger.info(f"✅ Removed {temp_audio_file}")
+            if os.path.exists(temp_wav_file):
+                os.remove(temp_wav_file)
+                logger.info(f"✅ Removed {temp_wav_file}")
+        except Exception as e:
+            logger.warning(f"⚠️ Cleanup failed: {e}")
+
+        elapsed = round(time.time() - job_start_time, 2)
+        logger.info(f"🏆 [JOB COMPLETE] Analysis finished in {elapsed}s. Confidence={confidence_score:.1f}/100")
+
         return final_result
 
     except Exception as e:
-        logger.error(f"❌ FATAL Analysis Error: {e}", exc_info=True)
-        if os.path.exists(temp_audio_file): os.remove(temp_audio_file)
-        if os.path.exists(temp_wav_file): os.remove(temp_wav_file)
+        logger.error(f"❌ [JOB FAILED] Fatal error: {e}", exc_info=True)
+
+        # Cleanup on error
+        if os.path.exists(temp_audio_file):
+            try:
+                os.remove(temp_audio_file)
+            except:
+                pass
+        if os.path.exists(temp_wav_file):
+            try:
+                os.remove(temp_wav_file)
+            except:
+                pass
+
         raise
 
 # --- Worker Entrypoint (Unchanged) ---
