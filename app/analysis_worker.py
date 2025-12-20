@@ -453,30 +453,54 @@ def perform_analysis_job(
             logger.error(f"❌ [STEP 12] FAILED: {e}", exc_info=True)
             emotion = "neutral"
 
-        # STEP 13: Compile Final Result
-        logger.info("[STEP 13] Compiling final result...")
+        # STEP 13: Compile Final Result with ALL metrics
+        logger.info("[STEP 13] Compiling complete analysis result...")
         try:
-            core_analysis_metrics = {
+            final_result = {
+                # Core metrics
                 "confidence_score": round(confidence_score, 2),
                 "speaking_pace": int(round(speaking_pace_wpm)),
-                "filler_word_count": filler_word_count,
-                "apology_count": apology_count,
-                "repetition_count": repetition_count,
-                "acoustic_disfluencies": [d._asdict() for d in acoustic_disfluencies],
-                "acoustic_disfluency_count": len(acoustic_disfluencies),
-                "long_pause_count": long_pause_count,
-                "silence_ratio": round(silence_ratio, 2),
-                "pitch_mean": round(float(pitch_mean), 2),
-                "pitch_std": round(float(pitch_std), 2),
-                "emotion": emotion.lower(),
-                "energy_std": round(float(audio_features['rms_std']), 4),
-                "transcript": transcript,
                 "total_words": total_words,
                 "duration_seconds": round(duration_seconds, 2),
-                "highlight_markers": [m._asdict() for m in all_text_markers],
+
+                # Fluency metrics
+                "filler_word_count": filler_word_count,
+                "repetition_count": repetition_count,
+                "apology_count": apology_count,
+
+                # Acoustic metrics
+                "long_pause_count": int(long_pause_count),
+                "silence_ratio": round(silence_ratio, 4),
+                "acoustic_disfluency_count": len(acoustic_disfluencies),
+
+                # Audio features
+                "pitch_mean": round(float(pitch_mean), 2),
+                "pitch_std": round(float(pitch_std), 2),
+                "avg_amplitude": round(float(audio_features['rms_mean']), 6),
+                "energy_std": round(float(audio_features['rms_std']), 6),
+
+                # Analysis details
+                "emotion": emotion.lower(),
+
+                # Text and recommendations
+                "transcript": transcript,
+                "transcript_markers": [m._asdict() for m in all_text_markers],
             }
 
-            logger.info(f"✅ [STEP 13] Result compiled successfully")
+            # Log all metrics for debugging
+            logger.info(
+                f"✅ [STEP 13] Complete result compiled:\n"
+                f"  - Confidence: {confidence_score:.1f}/100\n"
+                f"  - Speaking Pace: {speaking_pace_wpm:.1f} WPM\n"
+                f"  - Total Words: {total_words}\n"
+                f"  - Filler Words: {filler_word_count}\n"
+                f"  - Repetitions: {repetition_count}\n"
+                f"  - Long Pauses: {long_pause_count}\n"
+                f"  - Silence Ratio: {silence_ratio:.2%}\n"
+                f"  - Pitch: {pitch_mean:.1f}Hz ±{pitch_std:.1f}Hz\n"
+                f"  - Energy Std: {audio_features['rms_std']:.6f}"
+            )
+
         except Exception as e:
             logger.error(f"❌ [STEP 13] FAILED: {e}", exc_info=True)
             raise
@@ -486,24 +510,13 @@ def perform_analysis_job(
         try:
             llm_recommendations = generate_intelligent_feedback(
                 transcript=transcript,
-                metrics=core_analysis_metrics
+                metrics=final_result
             )
+            final_result["recommendations"] = llm_recommendations
             logger.info(f"✅ [STEP 14] Generated {len(llm_recommendations)} recommendations")
         except Exception as e:
             logger.error(f"❌ [STEP 14] FAILED: {e}", exc_info=True)
-            llm_recommendations = ["Unable to generate feedback at this time."]
-
-        # STEP 15: Final Compilation
-        logger.info("[STEP 15] Creating final result...")
-        try:
-            final_result = {
-                **core_analysis_metrics,
-                "recommendations": llm_recommendations,
-            }
-            logger.info(f"✅ [STEP 15] Final result created")
-        except Exception as e:
-            logger.error(f"❌ [STEP 15] FAILED: {e}", exc_info=True)
-            raise
+            final_result["recommendations"] = ["Unable to generate feedback at this time."]
 
         # STEP 16: Cleanup
         logger.info("[STEP 16] Cleaning up temporary files...")
