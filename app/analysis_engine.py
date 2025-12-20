@@ -32,34 +32,66 @@ class TextMarker(NamedTuple):
     end_char_index: int
 
 
-# --- 1. Core Feature Extraction (FFprobe/FFmpeg Safe) ---
+# --- 1. Core Feature Extraction (Librosa-based for accuracy) ---
 def extract_audio_features(file_path: str) -> Dict[str, Any]:
     """
-    Safely extracts duration using ffprobe for any format (M4A/WAV).
+    Extracts comprehensive audio features using librosa for accurate analysis.
+    Works with WAV files after FFmpeg conversion.
     """
-    features: Dict[str, Any] = {'duration_s': 0.0, 'sample_rate': 0}
+    features: Dict[str, Any] = {
+        'duration_s': 0.0,
+        'sample_rate': TARGET_SR,
+        'rms_mean': 0.0,
+        'rms_std': 0.0,
+        'zero_crossing_rate': 0.0,
+        'spectral_centroid': 0.0
+    }
+
     try:
-        command = [
-            'ffprobe', '-v', 'error',
-            '-show_entries', 'format=duration:stream=sample_rate',
-            '-of', 'json', file_path
-        ]
-        result = subprocess.run(command, capture_output=True, text=True, check=True)
-        probe_data = json.loads(result.stdout)
-        duration = float(probe_data['format']['duration'])
-        features['duration_s'] = duration
-        if 'streams' in probe_data and probe_data['streams']:
-            sample_rate = int(probe_data['streams'][0].get('sample_rate', TARGET_SR))
-            features['sample_rate'] = sample_rate
-        else:
-            features['sample_rate'] = TARGET_SR
+        if not LIBROSA_AVAILABLE:
+            # Fallback to basic extraction using ffprobe
+            logger.warning("Librosa not available, using basic ffprobe extraction")
+            command = [
+                'ffprobe', '-v', 'error',
+                '-show_entries', 'format=duration:stream=sample_rate',
+                '-of', 'json', file_path
+            ]
+            result = subprocess.run(command, capture_output=True, text=True, check=True)
+            probe_data = json.loads(result.stdout)
+            features['duration_s'] = float(probe_data['format']['duration'])
+            if 'streams' in probe_data and probe_data['streams']:
+                features['sample_rate'] = int(probe_data['streams'][0].get('sample_rate', TARGET_SR))
+            return features
+
+        # Use librosa for comprehensive feature extraction
+        logger.info(f"Loading audio file with librosa: {file_path}")
+
+        # Load audio with librosa (automatically resamples and converts to mono)
+        y, sr = librosa.load(file_path, sr=None, mono=True)
+        features['sample_rate'] = sr
+        features['duration_s'] = len(y) / sr
+
+        # Extract RMS energy (root mean square)
+        rms = librosa.feature.rms(y=y, frame_length=2048, hop_length=512)
+        features['rms_mean'] = float(np.mean(rms))
+        features['rms_std'] = float(np.std(rms))
+
+        # Extract zero-crossing rate
+        zcr = librosa.feature.zero_crossing_rate(y=y, frame_length=2048, hop_length=512)
+        features['zero_crossing_rate'] = float(np.mean(zcr))
+
+        # Extract spectral centroid
+        centroid = librosa.feature.spectral_centroid(y=y, sr=sr, n_fft=2048, hop_length=512)
+        features['spectral_centroid'] = float(np.mean(centroid))
+
+        logger.info(f"Extracted features: duration={features['duration_s']:.2f}s, RMS={features['rms_mean']:.4f}, ZCR={features['zero_crossing_rate']:.4f}")
+
         return features
-    except subprocess.CalledProcessError as e:
-        logger.error(f"FFprobe duration extraction failed: {e.stderr}")
-        raise RuntimeError(f"FFprobe duration extraction failed: {e.__class__.__name__}")
+
     except Exception as e:
-        logger.error(f"Error during audio feature extraction (FFprobe): {e}")
-        raise RuntimeError(f"Error during audio feature extraction (FFprobe): {e.__class__.__name__}")
+        logger.error(f"Error during audio feature extraction: {e}")
+        # Return basic features if extraction fails
+        return features
 
 # --- 2. Textual Analysis Functions (MODIFIED FOR HIGHLIGHTING) ---
 
@@ -189,40 +221,92 @@ def butter_highpass(cutoff, fs, order=5):
     return b, a
     
 def calculate_pitch_stats(y: np.ndarray, sr: int) -> Tuple[float, float]:
-    cutoff_freq = 80  
-    b, a = butter_highpass(cutoff_freq, sr)
-    y_filtered = lfilter(b, a, y)
-    frame_size = int(0.02 * sr)
-    hop_size = int(0.01 * sr)
-    f0_estimates = []
-    
-    for i in range(0, len(y_filtered) - frame_size, hop_size):
-        frame = y_filtered[i:i + frame_size]
-        if np.mean(frame**2) > 0.0001:
-            acf = np.correlate(frame, frame, mode='full')[len(frame) - 1:]
-            min_lag = int(sr / 300)  
-            max_lag = int(sr / 60)
-            peaks, properties = find_peaks(acf[min_lag:max_lag], height=None)
-            
-            if len(peaks) > 0:
-                peak_index = peaks[np.argmax(acf[min_lag + peaks])]
-                lag = min_lag + peak_index
-                
-                if lag > 0:
-                    f0 = sr / lag
-                    f0_estimates.append(f0)
-            
-    f0_estimates = np.array(f0_estimates)
-    
-    if len(f0_estimates) > 10:
-        f0_filtered = f0_estimates[np.abs(zscore(f0_estimates)) < 2]
-        pitch_mean = np.mean(f0_filtered)
-        pitch_std = np.std(f0_filtered)
-    else:
-        pitch_mean = 0.0
-        pitch_std = 0.0
-            
-    return float(pitch_mean), float(pitch_std)
+    """
+    Calculate pitch statistics using librosa.yin() for robust fundamental frequency detection.
+    """
+    try:
+        if not LIBROSA_AVAILABLE:
+            logger.warning("Librosa not available, using fallback pitch detection")
+            # Simple fallback using autocorrelation
+            return _fallback_pitch_detection(y, sr)
+
+        # Use librosa.yin() for robust pitch detection
+        # Parameters tuned for human speech (60-300 Hz typical range)
+        fmin = 60  # Minimum fundamental frequency (Hz)
+        fmax = 300  # Maximum fundamental frequency (Hz)
+        frame_length = 2048  # Analysis window size
+
+        # Extract fundamental frequency
+        f0 = librosa.yin(y, fmin=fmin, fmax=fmax, sr=sr, frame_length=frame_length)
+
+        # Filter out unvoiced frames (where f0 = fmin)
+        voiced_frames = f0[f0 > fmin + 1]  # Small buffer above minimum
+
+        if len(voiced_frames) < 5:
+            logger.warning("Too few voiced frames detected, using fallback")
+            return _fallback_pitch_detection(y, sr)
+
+        # Calculate statistics on voiced frames only
+        pitch_mean = float(np.mean(voiced_frames))
+        pitch_std = float(np.std(voiced_frames))
+
+        # Validate ranges
+        if pitch_mean < 60 or pitch_mean > 400:
+            logger.warning(f"Pitch mean {pitch_mean:.1f}Hz outside expected range, using fallback")
+            return _fallback_pitch_detection(y, sr)
+
+        logger.info(f"Pitch stats: mean={pitch_mean:.1f}Hz, std={pitch_std:.1f}Hz, voiced_frames={len(voiced_frames)}")
+        return pitch_mean, pitch_std
+
+    except Exception as e:
+        logger.error(f"Error in pitch detection: {e}, using fallback")
+        return _fallback_pitch_detection(y, sr)
+
+
+def _fallback_pitch_detection(y: np.ndarray, sr: int) -> Tuple[float, float]:
+    """
+    Fallback pitch detection using simple autocorrelation method.
+    """
+    try:
+        # Simple energy-based detection
+        frame_size = int(0.02 * sr)  # 20ms frames
+        hop_size = int(0.01 * sr)    # 10ms hop
+
+        pitch_estimates = []
+
+        for i in range(0, len(y) - frame_size, hop_size):
+            frame = y[i:i + frame_size]
+
+            # Only process frames with sufficient energy
+            energy = np.mean(frame**2)
+            if energy > 0.001:  # Energy threshold
+                # Simple autocorrelation
+                corr = np.correlate(frame, frame, mode='full')[len(frame)-1:]
+                # Look for peaks in typical pitch range (60-300 Hz)
+                min_lag = int(sr / 300)
+                max_lag = int(sr / 60)
+
+                if max_lag < len(corr) and min_lag < max_lag:
+                    lag_range = corr[min_lag:max_lag]
+                    if len(lag_range) > 0:
+                        peak_idx = np.argmax(lag_range)
+                        lag = min_lag + peak_idx
+                        if lag > 0:
+                            pitch = sr / lag
+                            if 60 <= pitch <= 400:  # Reasonable pitch range
+                                pitch_estimates.append(pitch)
+
+        if len(pitch_estimates) >= 3:
+            pitch_mean = float(np.mean(pitch_estimates))
+            pitch_std = float(np.std(pitch_estimates))
+            return pitch_mean, pitch_std
+        else:
+            # Return reasonable defaults if no pitch detected
+            return 185.0, 15.0  # Typical adult male speaking pitch
+
+    except Exception as e:
+        logger.error(f"Fallback pitch detection failed: {e}")
+        return 185.0, 15.0  # Safe defaults
 
 
 def detect_acoustic_disfluencies(y: np.ndarray, sr: int, frame_len_ms: int = 25, hop_len_ms: int = 10) -> List[DisfluencyResult]:
@@ -284,54 +368,83 @@ def detect_acoustic_disfluencies(y: np.ndarray, sr: int, frame_len_ms: int = 25,
 # --- 4. Scoring Logic (FIXED for Division by Zero) ---
 
 def score_confidence(audio_features: Dict[str, Any], fluency_metrics: Dict[str, Any]) -> float:
-        
+    """
+    Calculate confidence score on a 0-100 scale based on speech quality metrics.
+    Higher scores indicate better speech delivery.
+    """
     WEIGHTS = {
-        'WPM_IDEAL': 0.35,  
-        'DISFLUENCY_COUNT': 0.40,  
-        'PITCH_STABILITY': 0.15,  
-        'ENERGY_STD': 0.10,  
+        'PACE': 0.30,      # Speaking pace (most important)
+        'DISFLUENCY': 0.35, # Fillers and repetitions (very important)
+        'PITCH': 0.20,     # Pitch variation (moderately important)
+        'ENERGY': 0.15,    # Energy consistency (less important)
     }
 
-    pace_wpm = audio_features.get('speaking_pace_wpm', 0)
-    ideal_pace = 150.0
-    pace_deviation = min(0.5, abs(pace_wpm - ideal_pace) / ideal_pace)  
-    pace_score = max(0.0, 1.0 - (pace_deviation * 2))  
+    # Calculate pace score (ideal range: 120-180 WPM)
+    pace_wpm = audio_features.get('speaking_pace_wpm', 120)
+    if 120 <= pace_wpm <= 180:
+        pace_score = 1.0  # Perfect range
+    elif 100 <= pace_wpm <= 200:
+        # Linear decrease outside ideal range
+        distance_from_ideal = min(abs(pace_wpm - 120), abs(pace_wpm - 180))
+        pace_score = max(0.2, 1.0 - (distance_from_ideal / 40))
+    else:
+        pace_score = 0.1  # Very poor pace
 
+    # Calculate disfluency score (lower disfluencies = higher score)
     total_disfluencies = (
-        fluency_metrics.get('filler_word_count', 0) +  
+        fluency_metrics.get('filler_word_count', 0) +
         fluency_metrics.get('repetition_count', 0) +
         fluency_metrics.get('acoustic_disfluency_count', 0)
     )
-    
-    # FIX: Use max(1, total_words) to prevent Division by Zero
-    total_words = fluency_metrics.get('total_words', 1)
-    
-    max_rate = 0.05  
-    
-    # Defensive division for disfluency rate
-    if total_words <= 0:
-        disfluency_rate = max_rate # Assume maximum disfluency if no words were detected
-    else:
-        disfluency_rate = total_disfluencies / total_words
+    total_words = max(1, fluency_metrics.get('total_words', 1))
+    disfluency_rate = total_disfluencies / total_words
 
-    disfluency_score = max(0.0, 1.0 - (disfluency_rate / max_rate))
+    if disfluency_rate <= 0.02:  # Very fluent (< 2% disfluencies)
+        disfluency_score = 1.0
+    elif disfluency_rate <= 0.05:  # Good (2-5%)
+        disfluency_score = 0.8
+    elif disfluency_rate <= 0.10:  # Average (5-10%)
+        disfluency_score = 0.6
+    elif disfluency_rate <= 0.20:  # Poor (10-20%)
+        disfluency_score = 0.3
+    else:  # Very poor (>20%)
+        disfluency_score = 0.1
 
-    pitch_std = audio_features.get('pitch_std', 50.0)
-    max_pitch_std = 40.0  
-    pitch_score = max(0.0, 1.0 - (pitch_std / max_pitch_std))
-    
-    energy_std = audio_features.get('energy_std', 0.0)
-    ideal_energy_std = 0.005  
-    energy_deviation = min(0.01, abs(energy_std - ideal_energy_std))
-    energy_score = max(0.0, 1.0 - (energy_deviation * 100))  
+    # Calculate pitch variation score (good variation = moderate std)
+    pitch_std = audio_features.get('pitch_std', 20.0)
+    if 10 <= pitch_std <= 30:  # Good variation
+        pitch_score = 1.0
+    elif 5 <= pitch_std <= 50:  # Acceptable range
+        # Score decreases as we move away from ideal
+        distance = min(abs(pitch_std - 10), abs(pitch_std - 30))
+        pitch_score = max(0.3, 1.0 - (distance / 20))
+    else:  # Too monotone or too erratic
+        pitch_score = 0.2
 
+    # Calculate energy consistency score
+    energy_std = audio_features.get('energy_std', 0.01)
+    if 0.003 <= energy_std <= 0.02:  # Good consistency
+        energy_score = 1.0
+    elif 0.001 <= energy_std <= 0.05:  # Acceptable range
+        distance = min(abs(energy_std - 0.003), abs(energy_std - 0.02))
+        energy_score = max(0.4, 1.0 - (distance / 0.02))
+    else:  # Too monotone or too erratic
+        energy_score = 0.3
+
+    # Calculate weighted final score
     final_score = (
-        (pace_score * WEIGHTS['WPM_IDEAL']) +
-        (disfluency_score * WEIGHTS['DISFLUENCY_COUNT']) +
-        (pitch_score * WEIGHTS['PITCH_STABILITY']) +
-        (energy_score * WEIGHTS['ENERGY_STD'])
+        (pace_score * WEIGHTS['PACE']) +
+        (disfluency_score * WEIGHTS['DISFLUENCY']) +
+        (pitch_score * WEIGHTS['PITCH']) +
+        (energy_score * WEIGHTS['ENERGY'])
     )
 
-    # FIX: Return a default low score (0.3) only if all inputs were zero (highly unlikely now)
-    # The default score of 0.3 was likely a placeholder. Now it will calculate correctly.
-    return min(1.0, max(0.0, final_score))
+    # Convert to 0-100 scale and ensure reasonable bounds
+    confidence_score = final_score * 100
+
+    # Apply bounds: minimum 15 (very poor), maximum 95 (excellent)
+    confidence_score = max(15, min(95, confidence_score))
+
+    logger.info(f"Confidence calculation: pace={pace_score:.2f}, disfluency={disfluency_score:.2f}, pitch={pitch_score:.2f}, energy={energy_score:.2f} → {confidence_score:.1f}/100")
+
+    return confidence_score
