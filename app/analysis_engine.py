@@ -32,66 +32,70 @@ class TextMarker(NamedTuple):
     end_char_index: int
 
 
-# --- 1. Core Feature Extraction (Librosa-based for accuracy) ---
+# --- 1. Core Feature Extraction (NumPy/SciPy only - no librosa) ---
 def extract_audio_features(file_path: str) -> Dict[str, Any]:
     """
-    Extracts comprehensive audio features using librosa for accurate analysis.
-    Works with WAV files after FFmpeg conversion.
+    Extract audio features using soundfile and NumPy/SciPy (no librosa).
+    Compatible with Render.com deployment.
     """
     features: Dict[str, Any] = {
         'duration_s': 0.0,
         'sample_rate': TARGET_SR,
         'rms_mean': 0.0,
         'rms_std': 0.0,
-        'zero_crossing_rate': 0.0,
-        'spectral_centroid': 0.0
+        'zcr_mean': 0.0,
     }
 
     try:
-        if not LIBROSA_AVAILABLE:
-            # Fallback to basic extraction using ffprobe
-            logger.warning("Librosa not available, using basic ffprobe extraction")
-            command = [
-                'ffprobe', '-v', 'error',
-                '-show_entries', 'format=duration:stream=sample_rate',
-                '-of', 'json', file_path
-            ]
-            result = subprocess.run(command, capture_output=True, text=True, check=True)
-            probe_data = json.loads(result.stdout)
-            features['duration_s'] = float(probe_data['format']['duration'])
-            if 'streams' in probe_data and probe_data['streams']:
-                features['sample_rate'] = int(probe_data['streams'][0].get('sample_rate', TARGET_SR))
+        # Load audio file with soundfile
+        audio, sr = sf.read(file_path, dtype='float32')
+
+        # Handle stereo -> mono conversion
+        if len(audio.shape) > 1:
+            audio = np.mean(audio, axis=1)
+
+        # Basic resampling if needed (simple linear interpolation)
+        if sr != TARGET_SR:
+            original_length = len(audio)
+            new_length = int(len(audio) * TARGET_SR / sr)
+            indices = np.linspace(0, original_length - 1, new_length)
+            audio = np.interp(indices, np.arange(original_length), audio)
+            sr = TARGET_SR
+
+        # Calculate duration
+        duration = len(audio) / sr
+        features['duration_s'] = float(duration)
+        features['sample_rate'] = sr
+
+        # Frame-based feature extraction
+        frame_length = int(0.025 * sr)  # 25ms frames
+        hop_length = int(0.010 * sr)    # 10ms hop
+
+        # Extract frames
+        frames = np.array([
+            audio[i:i+frame_length]
+            for i in range(0, len(audio)-frame_length, hop_length)
+        ])
+
+        if len(frames) == 0:
+            logger.error("No frames extracted - audio too short")
             return features
 
-        # Use librosa for comprehensive feature extraction
-        logger.info(f"Loading audio file with librosa: {file_path}")
+        # Calculate RMS energy per frame
+        rms_frames = np.sqrt(np.mean(frames**2, axis=1))
+        features['rms_mean'] = float(np.mean(rms_frames))
+        features['rms_std'] = float(np.std(rms_frames))
 
-        # Load audio with librosa (automatically resamples and converts to mono)
-        y, sr = librosa.load(file_path, sr=None, mono=True)
-        features['sample_rate'] = sr
-        features['duration_s'] = len(y) / sr
+        # Calculate zero-crossing rate per frame
+        zcr_frames = np.mean(np.abs(np.diff(np.sign(frames), axis=1)), axis=1) / 2
+        features['zcr_mean'] = float(np.mean(zcr_frames))
 
-        # Extract RMS energy (root mean square)
-        rms = librosa.feature.rms(y=y, frame_length=2048, hop_length=512)
-        features['rms_mean'] = float(np.mean(rms))
-        features['rms_std'] = float(np.std(rms))
-
-        # Extract zero-crossing rate
-        zcr = librosa.feature.zero_crossing_rate(y=y, frame_length=2048, hop_length=512)
-        features['zero_crossing_rate'] = float(np.mean(zcr))
-
-        # Extract spectral centroid
-        centroid = librosa.feature.spectral_centroid(y=y, sr=sr, n_fft=2048, hop_length=512)
-        features['spectral_centroid'] = float(np.mean(centroid))
-
-        logger.info(f"Extracted features: duration={features['duration_s']:.2f}s, RMS={features['rms_mean']:.4f}, ZCR={features['zero_crossing_rate']:.4f}")
-
+        logger.info(f"✅ Audio features extracted: {duration:.2f}s, RMS={features['rms_mean']:.4f}, ZCR={features['zcr_mean']:.4f}")
         return features
 
     except Exception as e:
-        logger.error(f"Error during audio feature extraction: {e}")
-        # Return basic features if extraction fails
-        return features
+        logger.error(f"❌ Feature extraction failed: {e}", exc_info=True)
+        raise RuntimeError(f"Feature extraction failed: {e}")
 
 # --- 2. Textual Analysis Functions (MODIFIED FOR HIGHLIGHTING) ---
 
@@ -222,146 +226,165 @@ def butter_highpass(cutoff, fs, order=5):
     
 def calculate_pitch_stats(y: np.ndarray, sr: int) -> Tuple[float, float]:
     """
-    Calculate pitch statistics using librosa.yin() for robust fundamental frequency detection.
+    Calculate pitch statistics using autocorrelation method (NumPy only).
+    Compatible with Render.com - no librosa dependency.
     """
     try:
-        if not LIBROSA_AVAILABLE:
-            logger.warning("Librosa not available, using fallback pitch detection")
-            # Simple fallback using autocorrelation
-            return _fallback_pitch_detection(y, sr)
+        # Frame-based processing
+        frame_length = int(0.04 * sr)  # 40ms frames for better pitch detection
+        hop_length = int(0.01 * sr)    # 10ms hop
 
-        # Use librosa.yin() for robust pitch detection
-        # Parameters tuned for human speech (60-300 Hz typical range)
-        fmin = 60  # Minimum fundamental frequency (Hz)
-        fmax = 300  # Maximum fundamental frequency (Hz)
-        frame_length = 2048  # Analysis window size
+        f0_values = []
 
-        # Extract fundamental frequency
-        f0 = librosa.yin(y, fmin=fmin, fmax=fmax, sr=sr, frame_length=frame_length)
+        # Process each frame
+        for start in range(0, len(y) - frame_length, hop_length):
+            frame = y[start:start + frame_length]
 
-        # Filter out unvoiced frames (where f0 = fmin)
-        voiced_frames = f0[f0 > fmin + 1]  # Small buffer above minimum
+            # Skip silent frames (energy threshold)
+            energy = np.sqrt(np.mean(frame**2))
+            if energy < 0.001:
+                continue
 
-        if len(voiced_frames) < 5:
-            logger.warning("Too few voiced frames detected, using fallback")
-            return _fallback_pitch_detection(y, sr)
+            # Apply Hanning window
+            window = np.hanning(len(frame))
+            frame = frame * window
 
-        # Calculate statistics on voiced frames only
-        pitch_mean = float(np.mean(voiced_frames))
-        pitch_std = float(np.std(voiced_frames))
+            # Compute autocorrelation
+            correlation = np.correlate(frame, frame, mode='full')
+            correlation = correlation[len(correlation)//2:]  # Second half only
+            correlation = correlation / correlation[0]  # Normalize
 
-        # Validate ranges
-        if pitch_mean < 60 or pitch_mean > 400:
-            logger.warning(f"Pitch mean {pitch_mean:.1f}Hz outside expected range, using fallback")
-            return _fallback_pitch_detection(y, sr)
+            # Define pitch range (50-300 Hz for human speech)
+            min_period = int(sr / 300)  # Minimum frequency
+            max_period = int(sr / 50)   # Maximum frequency
 
-        logger.info(f"Pitch stats: mean={pitch_mean:.1f}Hz, std={pitch_std:.1f}Hz, voiced_frames={len(voiced_frames)}")
+            if max_period < len(correlation):
+                # Look for peak in valid range
+                r = correlation[min_period:max_period]
+                if len(r) > 0:
+                    period = min_period + np.argmax(r)
+
+                    # Convert period to frequency
+                    if period > 0:
+                        f0 = sr / period
+                        # Only keep reasonable frequencies
+                        if 60 <= f0 <= 300:
+                            f0_values.append(f0)
+
+        # Calculate statistics from valid pitch values
+        if len(f0_values) > 5:
+            f0_values = np.array(f0_values)
+            # Remove outliers using IQR method
+            q75, q25 = np.percentile(f0_values, [75, 25])
+            iqr = q75 - q25
+            lower_bound = q25 - 1.5 * iqr
+            upper_bound = q75 + 1.5 * iqr
+            filtered = f0_values[(f0_values >= lower_bound) & (f0_values <= upper_bound)]
+
+            if len(filtered) >= 3:
+                pitch_mean = float(np.mean(filtered))
+                pitch_std = float(np.std(filtered))
+            else:
+                pitch_mean = float(np.mean(f0_values))
+                pitch_std = float(np.std(f0_values))
+        else:
+            # Return reasonable defaults if insufficient pitch data
+            pitch_mean = 185.0  # Typical adult male speaking pitch
+            pitch_std = 15.0    # Typical variation
+
+        logger.info(f"🎵 Pitch stats: mean={pitch_mean:.1f}Hz, std={pitch_std:.1f}Hz, valid_frames={len(f0_values)}")
         return pitch_mean, pitch_std
 
     except Exception as e:
-        logger.error(f"Error in pitch detection: {e}, using fallback")
-        return _fallback_pitch_detection(y, sr)
-
-
-def _fallback_pitch_detection(y: np.ndarray, sr: int) -> Tuple[float, float]:
-    """
-    Fallback pitch detection using simple autocorrelation method.
-    """
-    try:
-        # Simple energy-based detection
-        frame_size = int(0.02 * sr)  # 20ms frames
-        hop_size = int(0.01 * sr)    # 10ms hop
-
-        pitch_estimates = []
-
-        for i in range(0, len(y) - frame_size, hop_size):
-            frame = y[i:i + frame_size]
-
-            # Only process frames with sufficient energy
-            energy = np.mean(frame**2)
-            if energy > 0.001:  # Energy threshold
-                # Simple autocorrelation
-                corr = np.correlate(frame, frame, mode='full')[len(frame)-1:]
-                # Look for peaks in typical pitch range (60-300 Hz)
-                min_lag = int(sr / 300)
-                max_lag = int(sr / 60)
-
-                if max_lag < len(corr) and min_lag < max_lag:
-                    lag_range = corr[min_lag:max_lag]
-                    if len(lag_range) > 0:
-                        peak_idx = np.argmax(lag_range)
-                        lag = min_lag + peak_idx
-                        if lag > 0:
-                            pitch = sr / lag
-                            if 60 <= pitch <= 400:  # Reasonable pitch range
-                                pitch_estimates.append(pitch)
-
-        if len(pitch_estimates) >= 3:
-            pitch_mean = float(np.mean(pitch_estimates))
-            pitch_std = float(np.std(pitch_estimates))
-            return pitch_mean, pitch_std
-        else:
-            # Return reasonable defaults if no pitch detected
-            return 185.0, 15.0  # Typical adult male speaking pitch
-
-    except Exception as e:
-        logger.error(f"Fallback pitch detection failed: {e}")
+        logger.error(f"❌ Pitch detection failed: {e}")
         return 185.0, 15.0  # Safe defaults
 
 
 def detect_acoustic_disfluencies(y: np.ndarray, sr: int, frame_len_ms: int = 25, hop_len_ms: int = 10) -> List[DisfluencyResult]:
     """
-    Detects basic acoustic disfluencies (blocks/prolongations) using Energy and ZCR (NumPy/SciPy).
+    Detects acoustic disfluencies (blocks/prolongations) using Energy and ZCR (NumPy/SciPy only).
+    Compatible with Render.com - no librosa dependency.
     """
     results: List[DisfluencyResult] = []
-    
+
+    # Frame-based processing
     frame_length = int(sr * frame_len_ms / 1000)
     hop_length = int(sr * hop_len_ms / 1000)
 
-    y_frames = np.array([y[i:i + frame_length] for i in range(0, len(y) - frame_length, hop_length)])
+    # Extract frames
+    frames = np.array([y[i:i + frame_length] for i in range(0, len(y) - frame_length, hop_length)])
 
-    rms_frames = np.sqrt(np.mean(y_frames**2, axis=1))
-    zcr_frames = np.mean(np.diff(np.sign(y_frames), axis=1) != 0, axis=1)
+    if len(frames) == 0:
+        return results
 
-    energy_threshold = np.mean(rms_frames) * 0.1
-    zcr_threshold = np.mean(zcr_frames) * 0.5  
-    
-    min_event_frames = int(0.3 / (hop_len_ms / 1000))
-    
-    is_event = False
-    event_start_frame = 0
-    
+    # Calculate RMS energy per frame
+    rms_frames = np.sqrt(np.mean(frames**2, axis=1))
+
+    # Calculate zero-crossing rate per frame
+    zcr_frames = np.mean(np.abs(np.diff(np.sign(frames), axis=1)), axis=1) / 2
+
+    # Adaptive thresholds based on audio statistics
+    rms_mean = np.mean(rms_frames)
+    rms_std = np.std(rms_frames)
+
+    # Silence threshold: mean - 1.5*std (more robust)
+    silence_threshold = max(rms_mean - 1.5 * rms_std, 0.001)
+
+    # Loud threshold: mean + 1*std (for prolongations)
+    loud_threshold = rms_mean + 1 * rms_std
+
+    zcr_mean = np.mean(zcr_frames)
+    zcr_low_threshold = zcr_mean * 0.5  # Low ZCR indicates less variation (prolongation)
+
+    # Minimum event duration (300ms)
+    min_duration_frames = int(0.3 / (hop_len_ms / 1000))
+
+    # Detect contiguous regions
+    in_event = False
+    event_start = 0
+    event_type = None
+
     for i in range(len(rms_frames)):
-        
-        is_block_candidate = (rms_frames[i] < energy_threshold)
-        is_prolongation_candidate = (rms_frames[i] > energy_threshold * 2) and (zcr_frames[i] < zcr_threshold)
+        is_silence = rms_frames[i] < silence_threshold
+        is_loud_low_zcr = rms_frames[i] > loud_threshold and zcr_frames[i] < zcr_low_threshold
 
-        if is_block_candidate or is_prolongation_candidate:
-            if not is_event:
-                is_event = True
-                event_start_frame = i
+        if is_silence:
+            if not in_event:
+                in_event = True
+                event_start = i
+                event_type = 'block'
+        elif is_loud_low_zcr:
+            if not in_event:
+                in_event = True
+                event_start = i
+                event_type = 'prolongation'
         else:
-            if is_event:
-                event_duration_frames = i - event_start_frame
-                
-                if event_duration_frames >= min_event_frames:
-                    
-                    start_time_s = event_start_frame * (hop_len_ms / 1000)
-                    duration_s = event_duration_frames * (hop_len_ms / 1000)
-                    
-                    if np.mean(rms_frames[event_start_frame:i]) < energy_threshold:
-                        event_type = 'block'
-                    else:
-                        event_type = 'prolongation'
-                        
+            if in_event:
+                duration_frames = i - event_start
+                if duration_frames >= min_duration_frames:
+                    start_time = event_start * (hop_len_ms / 1000)
+                    duration = duration_frames * (hop_len_ms / 1000)
+
                     results.append(DisfluencyResult(
-                        type=event_type,  
-                        start_time_s=round(start_time_s, 2),  
-                        duration_s=round(duration_s, 2)
+                        type=event_type or 'block',
+                        start_time_s=round(start_time, 2),
+                        duration_s=round(duration, 2)
                     ))
-                    
-                is_event = False
-                
+                in_event = False
+
+    # Handle event at end of audio
+    if in_event:
+        duration_frames = len(rms_frames) - event_start
+        if duration_frames >= min_duration_frames:
+            start_time = event_start * (hop_len_ms / 1000)
+            duration = duration_frames * (hop_len_ms / 1000)
+            results.append(DisfluencyResult(
+                type=event_type or 'block',
+                start_time_s=round(start_time, 2),
+                duration_s=round(duration, 2)
+            ))
+
+    logger.info(f"🎤 Detected {len(results)} acoustic disfluencies")
     return results
 
 
@@ -369,82 +392,97 @@ def detect_acoustic_disfluencies(y: np.ndarray, sr: int, frame_len_ms: int = 25,
 
 def score_confidence(audio_features: Dict[str, Any], fluency_metrics: Dict[str, Any]) -> float:
     """
-    Calculate confidence score on a 0-100 scale based on speech quality metrics.
-    Higher scores indicate better speech delivery.
+    Calculate confidence score (0-100 scale, not 0-1) using proper component scoring.
+    Compatible with Render.com - uses only NumPy.
     """
-    WEIGHTS = {
-        'PACE': 0.30,      # Speaking pace (most important)
-        'DISFLUENCY': 0.35, # Fillers and repetitions (very important)
-        'PITCH': 0.20,     # Pitch variation (moderately important)
-        'ENERGY': 0.15,    # Energy consistency (less important)
+
+    # Component weights
+    weights = {
+        'pace': 0.30,
+        'fluency': 0.40,
+        'pitch': 0.20,
+        'energy': 0.10,
     }
 
-    # Calculate pace score (ideal range: 120-180 WPM)
-    pace_wpm = audio_features.get('speaking_pace_wpm', 120)
-    if 120 <= pace_wpm <= 180:
-        pace_score = 1.0  # Perfect range
-    elif 100 <= pace_wpm <= 200:
-        # Linear decrease outside ideal range
-        distance_from_ideal = min(abs(pace_wpm - 120), abs(pace_wpm - 180))
-        pace_score = max(0.2, 1.0 - (distance_from_ideal / 40))
+    # 1. PACE SCORE (0-100)
+    pace_wpm = audio_features.get('speaking_pace_wpm', 0)
+    ideal_pace = 150  # WPM
+    pace_min, pace_max = 100, 200
+
+    if pace_wpm < pace_min:
+        pace_score = max(0, (pace_wpm / pace_min) * 50)  # 0-50
+    elif pace_wpm > pace_max:
+        pace_score = max(0, 100 - ((pace_wpm - pace_max) / (pace_max * 0.5)) * 50)  # 0-50
     else:
-        pace_score = 0.1  # Very poor pace
+        pace_score = 50 + (1 - abs(pace_wpm - ideal_pace) / (pace_max - ideal_pace)) * 50  # 50-100
 
-    # Calculate disfluency score (lower disfluencies = higher score)
-    total_disfluencies = (
-        fluency_metrics.get('filler_word_count', 0) +
-        fluency_metrics.get('repetition_count', 0) +
-        fluency_metrics.get('acoustic_disfluency_count', 0)
-    )
+    pace_score = np.clip(pace_score, 0, 100)
+
+    # 2. FLUENCY SCORE (0-100)
     total_words = max(1, fluency_metrics.get('total_words', 1))
-    disfluency_rate = total_disfluencies / total_words
+    fillers = fluency_metrics.get('filler_word_count', 0)
+    repetitions = fluency_metrics.get('repetition_count', 0)
+    acoustic = fluency_metrics.get('acoustic_disfluency_count', 0)
 
-    if disfluency_rate <= 0.02:  # Very fluent (< 2% disfluencies)
-        disfluency_score = 1.0
-    elif disfluency_rate <= 0.05:  # Good (2-5%)
-        disfluency_score = 0.8
-    elif disfluency_rate <= 0.10:  # Average (5-10%)
-        disfluency_score = 0.6
-    elif disfluency_rate <= 0.20:  # Poor (10-20%)
-        disfluency_score = 0.3
-    else:  # Very poor (>20%)
-        disfluency_score = 0.1
+    disfluency_rate = (fillers + repetitions + acoustic) / total_words
 
-    # Calculate pitch variation score (good variation = moderate std)
-    pitch_std = audio_features.get('pitch_std', 20.0)
-    if 10 <= pitch_std <= 30:  # Good variation
-        pitch_score = 1.0
-    elif 5 <= pitch_std <= 50:  # Acceptable range
-        # Score decreases as we move away from ideal
-        distance = min(abs(pitch_std - 10), abs(pitch_std - 30))
-        pitch_score = max(0.3, 1.0 - (distance / 20))
-    else:  # Too monotone or too erratic
-        pitch_score = 0.2
+    # Perfect = 0 disfluencies, 0.05 (5%) is acceptable, 0.10 (10%) is poor
+    if disfluency_rate == 0:
+        fluency_score = 100
+    elif disfluency_rate < 0.05:
+        fluency_score = 100 - (disfluency_rate / 0.05) * 20  # 80-100
+    elif disfluency_rate < 0.10:
+        fluency_score = 80 - ((disfluency_rate - 0.05) / 0.05) * 30  # 50-80
+    else:
+        fluency_score = max(20, 50 - (disfluency_rate - 0.10) * 100)
 
-    # Calculate energy consistency score
-    energy_std = audio_features.get('energy_std', 0.01)
-    if 0.003 <= energy_std <= 0.02:  # Good consistency
-        energy_score = 1.0
-    elif 0.001 <= energy_std <= 0.05:  # Acceptable range
-        distance = min(abs(energy_std - 0.003), abs(energy_std - 0.02))
-        energy_score = max(0.4, 1.0 - (distance / 0.02))
-    else:  # Too monotone or too erratic
-        energy_score = 0.3
+    fluency_score = np.clip(fluency_score, 20, 100)
 
-    # Calculate weighted final score
+    # 3. PITCH SCORE (0-100)
+    pitch_std = audio_features.get('pitch_std', 0)
+    pitch_mean = audio_features.get('pitch_mean', 0)
+
+    # Good pitch variation: 15-40 Hz std
+    # Poor: < 5 Hz (monotone) or > 50 Hz (too variable)
+    if pitch_std < 5:
+        pitch_score = pitch_std * 10  # 0-50 for monotone
+    elif pitch_std > 40:
+        pitch_score = max(50, 100 - (pitch_std - 40) * 2)  # 50-70
+    else:
+        pitch_score = 60 + ((pitch_std - 5) / 35) * 40  # 60-100
+
+    pitch_score = np.clip(pitch_score, 0, 100)
+
+    # 4. ENERGY SCORE (0-100)
+    energy_std = audio_features.get('energy_std', 0)
+    rms_mean = audio_features.get('rms_mean', 0)
+
+    # Good: consistent energy with some variation
+    # RMS should be between 0.01 and 0.3 (moderate volume)
+    if rms_mean < 0.005:
+        energy_score = 30  # Too quiet
+    elif rms_mean > 0.5:
+        energy_score = 50  # Too loud
+    else:
+        energy_score = 70 + (energy_std / 0.02) * 30  # 70-100 with variation
+
+    energy_score = np.clip(energy_score, 0, 100)
+
+    # FINAL SCORE (weighted average, 0-100)
     final_score = (
-        (pace_score * WEIGHTS['PACE']) +
-        (disfluency_score * WEIGHTS['DISFLUENCY']) +
-        (pitch_score * WEIGHTS['PITCH']) +
-        (energy_score * WEIGHTS['ENERGY'])
+        pace_score * weights['pace'] +
+        fluency_score * weights['fluency'] +
+        pitch_score * weights['pitch'] +
+        energy_score * weights['energy']
     )
 
-    # Convert to 0-100 scale and ensure reasonable bounds
-    confidence_score = final_score * 100
+    final_score = np.clip(final_score, 20, 100)  # Min 20, Max 100
 
-    # Apply bounds: minimum 15 (very poor), maximum 95 (excellent)
-    confidence_score = max(15, min(95, confidence_score))
+    logger.info(
+        f"📊 Confidence components: "
+        f"pace={pace_score:.1f}, fluency={fluency_score:.1f}, "
+        f"pitch={pitch_score:.1f}, energy={energy_score:.1f} "
+        f"→ Final={final_score:.1f}"
+    )
 
-    logger.info(f"Confidence calculation: pace={pace_score:.2f}, disfluency={disfluency_score:.2f}, pitch={pitch_score:.2f}, energy={energy_score:.2f} → {confidence_score:.1f}/100")
-
-    return confidence_score
+    return round(final_score, 1)
