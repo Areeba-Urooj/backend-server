@@ -241,79 +241,96 @@ def perform_analysis_job(
         else:
             speaking_pace_wpm = 0.0
 
-        # 6. Feature Extraction & Acoustic Analysis
-        logger.info("📈 Extracting audio features and metrics...")
-        
-        # --- Audio Feature Calculation (Numpy/SciPy based on 'y') ---
-        rms = np.sqrt(np.mean(y**2)) 
-        avg_amplitude = np.mean(np.abs(y))
-        energy_std = np.std(np.abs(y)) 
-        
-        # Simple silence calculation based on RMS frames
-        frame_len = int(sr * 0.05) 
-        hop_len = int(sr * 0.01)    
-        
-        num_frames = (len(y) - frame_len) // hop_len + 1
-        rms_frames = np.array([np.sqrt(np.mean(y[i*hop_len : i*hop_len + frame_len]**2)) for i in range(num_frames)])
-        
-        # FIX: Use a more robust threshold or ensure it's not too sensitive
-        rms_threshold = np.mean(rms_frames) * 0.2 # Adjusted from 0.1 to 0.2 for better robustness 
-        silence_frames = np.sum(rms_frames < rms_threshold)
-        total_frames = len(rms_frames)
-        silence_ratio = silence_frames / total_frames if total_frames > 0 else 0.0
-        
-        # FIX for long_pause_count: Calculate the actual count of DISTINCT long pause events
-        long_pause_duration_frames = int(0.5 / (hop_len / sr)) # 0.5 second pause minimum
-        
-        is_silence = rms_frames < rms_threshold
+        # 6. Feature Extraction & Acoustic Analysis using librosa
+        logger.info("📈 Extracting audio features using librosa...")
+
+        # Use librosa to extract comprehensive features from the converted WAV file
+        audio_features = extract_audio_features(temp_wav_file)
+
+        # Validate that we got proper features
+        if audio_features['duration_s'] <= 0:
+            logger.error("❌ Audio feature extraction failed - invalid duration")
+            raise Exception("Audio feature extraction failed")
+
+        logger.info(f"✅ Audio features extracted: duration={audio_features['duration_s']:.2f}s, RMS={audio_features['rms_mean']:.4f}")
+
+        # Reload audio with librosa for consistency (proper normalization and mono conversion)
+        y_librosa, sr_librosa = librosa.load(temp_wav_file, sr=None, mono=True)
+
+        # Verify audio data integrity
+        if len(y_librosa) == 0 or np.max(np.abs(y_librosa)) < 0.001:
+            logger.error("❌ Audio data appears to be silent or corrupted")
+            raise Exception("Audio data is silent or corrupted")
+
+        # Calculate speaking pace properly
+        if duration_seconds > 0 and total_words > 0:
+            speaking_pace_wpm = (total_words / duration_seconds) * 60
+        else:
+            speaking_pace_wpm = 120  # Default reasonable pace
+
+        # Calculate silence ratio using proper RMS thresholding
+        rms_frames = librosa.feature.rms(y=y_librosa, frame_length=1024, hop_length=512)[0]
+        silence_threshold = np.mean(rms_frames) * 0.15  # More robust threshold
+        silence_frames = np.sum(rms_frames < silence_threshold)
+        silence_ratio = silence_frames / len(rms_frames)
+
+        # Calculate long pause count using proper silence detection
+        min_pause_duration = int(0.5 * sr_librosa)  # 0.5 second minimum
+        hop_length = 512
+
+        # Find silent regions
+        is_silent = rms_frames < silence_threshold
         long_pause_count = 0
-        in_long_pause = False
-        pause_start_frame = -1
 
-        for i in range(len(is_silence)):
-            if is_silence[i]:
-                if not in_long_pause:
-                    in_long_pause = True
-                    pause_start_frame = i
-            elif in_long_pause:
-                # End of silence segment
-                pause_duration_frames = i - pause_start_frame
-                if pause_duration_frames >= long_pause_duration_frames:
+        # Count contiguous silent regions longer than minimum duration
+        silent_start = None
+        for i, silent in enumerate(is_silent):
+            if silent and silent_start is None:
+                silent_start = i
+            elif not silent and silent_start is not None:
+                # Check duration of silent region
+                silent_samples = (i - silent_start) * hop_length
+                if silent_samples >= min_pause_duration:
                     long_pause_count += 1
-                in_long_pause = False
+                silent_start = None
 
-        # Check for pause at the very end
-        if in_long_pause and (len(is_silence) - pause_start_frame) >= long_pause_duration_frames:
-             long_pause_count += 1
-        # END FIX
+        # Check for silence at the end
+        if silent_start is not None:
+            silent_samples = (len(is_silent) - silent_start) * hop_length
+            if silent_samples >= min_pause_duration:
+                long_pause_count += 1
 
-        # Uses the new NumPy/SciPy function
-        pitch_mean, pitch_std = calculate_pitch_stats(y, sr)
-        
-        audio_features_for_score = {
-            "rms_mean": float(rms),
-            "rms_std": float(energy_std), 
-            "speaking_pace_wpm": speaking_pace_wpm,
-            "pitch_std": float(pitch_std),
-            "pitch_mean": float(pitch_mean),
-        }
-        
-        # Uses the new NumPy/SciPy function
-        acoustic_disfluencies = detect_acoustic_disfluencies(y, sr)
+        # Extract pitch statistics
+        pitch_mean, pitch_std = calculate_pitch_stats(y_librosa, sr_librosa)
+
+        # Detect acoustic disfluencies
+        acoustic_disfluencies = detect_acoustic_disfluencies(y_librosa, sr_librosa)
         serializable_disfluencies = [d._asdict() for d in acoustic_disfluencies]
-        
-        # Recalculate fluency metrics for scoring
+
+        logger.info(f"🎵 Acoustic analysis: pitch={pitch_mean:.1f}±{pitch_std:.1f}Hz, pauses={long_pause_count}, disfluencies={len(serializable_disfluencies)}")
+
+        # Prepare features for confidence scoring
+        audio_features_for_score = {
+            "speaking_pace_wpm": speaking_pace_wpm,
+            "pitch_mean": pitch_mean,
+            "pitch_std": pitch_std,
+            "energy_std": audio_features['rms_std'],
+        }
+
         fluency_metrics_for_score = {
             "filler_word_count": filler_word_count,
             "repetition_count": repetition_count,
             "acoustic_disfluency_count": len(serializable_disfluencies),
             "total_words": total_words,
         }
-        
+
+        # Calculate confidence score (now returns 0-100)
         confidence_score = score_confidence(audio_features_for_score, fluency_metrics_for_score)
-        
+        logger.info(f"🏆 Final confidence score: {confidence_score:.1f}/100")
+
         # Emotion Classification
         emotion = classify_emotion_simple(temp_wav_file, EMOTION_MODEL, EMOTION_SCALER)
+        logger.info(f"😊 Detected emotion: {emotion}")
         
         # 7. Compile Core Metrics for LLM (UPDATED)
         core_analysis_metrics = {
