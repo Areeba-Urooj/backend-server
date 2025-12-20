@@ -4,7 +4,7 @@ import os
 import sys
 import logging
 from uuid import uuid4
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List 
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form
 from fastapi.responses import JSONResponse
@@ -16,14 +16,45 @@ from botocore.exceptions import ClientError
 import redis
 from rq import Queue
 from rq.job import Job
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, ValidationError 
 
-# Ensure analysis_worker can be imported
+# Ensure app path is included
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import analysis_worker  # Worker module is now correctly imported
 
-# Import models
-from app.models import AnalysisStatusResponse, AnalysisResult
+# --- Pydantic Models for Data Structures ---
+class TextMarker(BaseModel):
+    type: str
+    word: str 
+    start_char_index: int
+    end_char_index: int
+
+class AnalysisResult(BaseModel):
+    confidence_score: float
+    speaking_pace: int
+    filler_word_count: int
+    repetition_count: int
+    long_pause_count: float
+    silence_ratio: float
+    # 🔥 FINAL CRITICAL FIX: Make avg_amplitude optional to stop the validation error.
+    avg_amplitude: Optional[float] = None 
+    pitch_mean: float
+    pitch_std: float
+    emotion: str
+    energy_std: float
+    recommendations: List[str]
+    transcript: str
+    highlight_markers: List[TextMarker] = Field(default_factory=list)
+    duration_seconds: Optional[float] = None
+
+
+class AnalysisStatusResponse(BaseModel):
+    job_id: str
+    status: str
+    enqueued_at: Optional[str] = None
+    started_at: Optional[str] = None
+    ended_at: Optional[str] = None
+    result: Optional[AnalysisResult] = None 
+    error: Optional[str] = None
 
 # --- Configuration ---
 S3_BUCKET_NAME = os.environ.get('S3_BUCKET_NAME')
@@ -52,10 +83,8 @@ def get_redis_connection():
 
 try:
     redis_conn = get_redis_connection()
-    # Use the established connection for the Queue
     queue = Queue('default', connection=redis_conn) 
 except RuntimeError:
-    # If connection fails, allow FastAPI to start, but job submission will fail
     redis_conn = None
     queue = None
 
@@ -89,15 +118,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Pydantic Models ---
+# --- Pydantic Models for Response ---
 class SubmissionResponse(BaseModel):
     file_id: str
     job_id: str
     message: str
 
 class UploadResponse(BaseModel):
-    file_id: str # This should be the S3 Key (e.g., "uploads/uuid.m4a")
-    s3_key: str # Redundant, but kept for compatibility with original logs
+    file_id: str
+    s3_key: str
     message: str
 
 # --- API Endpoints ---
@@ -115,7 +144,6 @@ async def upload_audio_file(
     if not s3_client or not S3_BUCKET_NAME:
         raise HTTPException(status_code=503, detail="S3 storage service is unavailable.")
     
-    # Generate S3 key based on file extension
     file_extension = os.path.splitext(file.filename)[1] or ".m4a"
     file_uuid = str(uuid4())
     s3_key = f"uploads/{file_uuid}{file_extension}"
@@ -123,20 +151,20 @@ async def upload_audio_file(
     try:
         logger.info(f"[API] ⬆️ Starting S3 upload to key: {s3_key}")
         
-        # Read file content into memory. For large files, use upload_fileobj with a temporary file.
-        file_content = await file.read() 
-        
-        s3_client.put_object(
+        s3_client.upload_fileobj(
+            Fileobj=file.file,
             Bucket=S3_BUCKET_NAME,
             Key=s3_key,
-            Body=file_content,
-            ContentType=file.content_type
+            ExtraArgs={
+                'ContentType': file.content_type
+            }
         )
+        
         logger.info(f"[API] ✅ S3 upload complete for S3 Key: {s3_key}")
 
         return JSONResponse(content={
-            "file_id": file_uuid, # Return UUID for simple reference
-            "s3_key": s3_key,     # Return full S3 Key for job submission
+            "file_id": file_uuid,
+            "s3_key": s3_key,
             "message": "File uploaded successfully."
         }, status_code=200)
 
@@ -155,7 +183,7 @@ async def upload_audio_file(
 
 @app.post("/api/v1/analysis/submit", response_model=SubmissionResponse)
 async def submit_analysis_job(
-    s3_key: str = Form(..., description="The S3 Key (path/filename) of the file returned by the /upload endpoint."),
+    s3_key: str = Form(..., description="The S3 Key of the uploaded file."),
     transcript: str = Form(..., description="The full transcription of the audio file."),
     user_id: str = Form(..., description="The ID of the authenticated user.")
 ):
@@ -163,18 +191,19 @@ async def submit_analysis_job(
     if not queue:
         raise HTTPException(status_code=503, detail="RQ/Redis service is unavailable.")
 
-    # Extract file_id (UUID) from s3_key for internal tracking/logging
     file_id = os.path.splitext(os.path.basename(s3_key))[0]
 
     try:
-        # Enqueue the analysis job, passing the full S3 key
         job = queue.enqueue(
-            analysis_worker.perform_analysis_job,
-            file_id=file_id,
-            s3_key=s3_key, # Pass the full S3 key
-            transcript=transcript,
-            user_id=user_id,
-            job_timeout='30m'
+            'app.analysis_worker.perform_analysis_job', 
+            kwargs={
+                'file_id': file_id,
+                's3_key': s3_key,
+                'transcript': transcript,
+                'user_id': user_id,
+            },
+            job_timeout='30m', 
+            serializer='json' 
         )
         
         logger.info(f"[API] 📝 Job enqueued successfully. Job ID: {job.id}")
@@ -197,13 +226,13 @@ def get_analysis_status(job_id: str):
     """Retrieves the status and result of an RQ job."""
     if not redis_conn:
         raise HTTPException(status_code=503, detail="RQ/Redis service is unavailable.")
-
+        
     try:
-        # Fetch the job from Redis
         job = Job.fetch(job_id, connection=redis_conn)
         status = job.get_status()
-
-        # Create the base response
+        
+        logger.info(f"[API] Job {job_id} status: {status}")
+        
         response_data = AnalysisStatusResponse(
             job_id=job_id,
             status=status,
@@ -211,86 +240,46 @@ def get_analysis_status(job_id: str):
             started_at=job.started_at.isoformat() if job.started_at else None,
         )
 
-        # If job is finished, retrieve and validate the result
         if status == 'finished':
             response_data.ended_at = job.ended_at.isoformat() if job.ended_at else None
-
-            # Get the result from the job
             job_result = job.result
-
-            # Transform the worker result to match the AnalysisResult model
+            
             if job_result and isinstance(job_result, dict):
-                # Map the worker's result structure to the AnalysisResult model
-                analysis_result = AnalysisResult(
-                    confidence_score=job_result.get('confidence_score', 0.0),
-                    speaking_pace=int(job_result.get('audio_features', {}).get('speaking_pace_wpm', 0)),
-                    filler_word_count=job_result.get('filler_word_analysis', {}).get('filler_word_count', 0),
-                    repetition_count=job_result.get('repetition_count', 0),
-                    long_pause_count=float(job_result.get('long_pause_count', 0)),
-                    silence_ratio=float(job_result.get('audio_features', {}).get('silence_ratio', 0)),
-                    avg_amplitude=float(job_result.get('audio_features', {}).get('rms_mean', 0)),
-                    pitch_mean=float(job_result.get('audio_features', {}).get('pitch_mean', 0)),
-                    pitch_std=float(job_result.get('audio_features', {}).get('pitch_std', 0)),
-                    emotion=job_result.get('emotion', 'neutral'),
-                    energy_std=float(job_result.get('audio_features', {}).get('rms_std', 0)),
-                    recommendations=job_result.get('recommendations', []),
-                    transcript=job_result.get('transcript', ''),
-                    transcript_markers=job_result.get('transcript_markers', [])
-                )
-                response_data.result = analysis_result
+                
+                try:
+                    # Attempt to create the Pydantic model with the job result
+                    analysis_result = AnalysisResult(**job_result)
+                    response_data.result = analysis_result
+                
+                except ValidationError as e:
+                    error_message = f"{e.__class__.__name__} for AnalysisResult:\n{e.errors()}"
+                    logger.error(f"[API] ❌ FAILED to map job result to AnalysisResult model for job {job_id}:\n{error_message}", exc_info=True)
+                    
+                    response_data.status = 'failed'
+                    response_data.error = f"Result processing error (API): {str(e)}. Worker result keys/types are likely mismatched."
+                
+                except Exception as e:
+                    logger.error(f"[API] ❌ General error processing job result for job {job_id}: {e}", exc_info=True)
+                    response_data.status = 'failed'
+                    response_data.error = f"General result processing error (API): {str(e)}"
+            
+            elif status == 'finished' and not job_result:
+                logger.error(f"[API] Job {job_id} finished, but result was None.")
+                response_data.status = 'failed'
+                response_data.error = "Job finished successfully, but worker returned no result data."
 
-        elif status == 'failed':
+        # Explicitly handle 'failed' status from the worker
+        if status == 'failed' and job.exc_info:
             response_data.error = job.exc_info
-
+            logger.error(f"[API] Full exception info for worker job {job_id}:\n{job.exc_info}")
+            
         return response_data
-
+        
     except redis.exceptions.ConnectionError:
         raise HTTPException(status_code=500, detail="Could not connect to Redis.")
-    except Exception:
-        # Job.fetch throws an exception if the job ID is not found
-        raise HTTPException(status_code=404, detail=f"Job with ID {job_id} not found.")
-
-@app.get("/analytics/dashboard")
-def get_dashboard_data(user_id: str):
-    """Returns dashboard analytics data for a user."""
-    # TODO: Implement actual database queries to get real user data
-    # For now, return mock data that matches the expected structure
-
-    import random
-    from datetime import datetime, timedelta
-
-    # Generate mock weekly progress data
-    weekly_progress = []
-    base_date = datetime.now()
-
-    for i in range(8):
-        week_date = base_date - timedelta(weeks=i)
-        week_label = f"W{8-i}"
-        # Generate a score that trends upward
-        base_score = 60 + (i * 3) + random.randint(-5, 5)
-        score = min(100, max(0, base_score))
-
-        weekly_progress.append({
-            'week_label': week_label,
-            'score': score
-        })
-
-    # Reverse to show chronological order (oldest first)
-    weekly_progress.reverse()
-
-    # Mock data based on the progress screen requirements
-    mock_data = {
-        'average_pace': 152.5 + random.uniform(-10, 10),  # words per minute
-        'average_confidence': 0.75 + random.uniform(-0.1, 0.1),  # 0-1 scale
-        'average_pitch': 185.0 + random.uniform(-20, 20),  # Hz
-        'total_filler_words': random.randint(5, 25),
-        'weekly_progress': weekly_progress,
-        # Additional metrics that might be useful
-        'current_score': weekly_progress[-1]['score'] if weekly_progress else 72,
-        'personal_best': max([w['score'] for w in weekly_progress]) if weekly_progress else 85,
-        'total_sessions': random.randint(10, 50),
-        'improvement_rate': 0.12 + random.uniform(-0.05, 0.05),  # percentage
-    }
-
-    logger.info(f"[API] 📊 Dashboard data requested for user_id: {user_id}")
-    return JSONResponse(content=mock_data, status_code=200)
+    except Exception as e:
+        logger.error(f"[API] Error fetching job {job_id}: {e}", exc_info=True)
+        if 'No such job' in str(e) or 'NoneType' in str(e): 
+             raise HTTPException(status_code=404, detail=f"Job with ID {job_id} not found.")
+        else:
+             raise HTTPException(status_code=500, detail=f"Internal error fetching job status: {str(e)}")
