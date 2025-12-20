@@ -233,26 +233,35 @@ def perform_analysis_job(
             logger.error(f"❌ [STEP 3] FAILED: {e}", exc_info=True)
             raise
 
-        # STEP 4: FFmpeg Conversion
-        logger.info("[STEP 4] Converting audio with FFmpeg...")
+        # STEP 4: FFmpeg Conversion (M4A → WAV)
+        logger.info("[STEP 4] Converting audio with FFmpeg (M4A → WAV)...")
         try:
-            ffmpeg_command = ["ffmpeg", "-i", temp_audio_file, "-ac", "1", "-ar", str(TARGET_SR), "-y", temp_wav_file]
-            logger.info(f"[STEP 4] Running: {' '.join(ffmpeg_command)}")
+            # Use ffmpeg to convert M4A/MP3/etc to WAV with proper settings
+            ffmpeg_command = [
+                "ffmpeg",
+                "-i", temp_audio_file,      # Input: M4A file
+                "-ac", "1",                 # Convert to mono
+                "-ar", str(TARGET_SR),      # Resample to 16kHz
+                "-acodec", "pcm_s16le",     # PCM 16-bit encoding for best compatibility
+                "-y",                       # Overwrite output without asking
+                temp_wav_file               # Output: WAV file
+            ]
+            logger.info(f"[STEP 4] Running FFmpeg conversion...")
 
             result = subprocess.run(ffmpeg_command, capture_output=True, text=True, check=True)
-            logger.info(f"[STEP 4] FFmpeg stdout: {result.stdout[:200]}")
+            logger.info(f"[STEP 4] FFmpeg conversion completed successfully")
 
-            if os.path.exists(temp_wav_file):
-                wav_size = os.path.getsize(temp_wav_file)
-                logger.info(f"✅ [STEP 4] WAV file created: {wav_size} bytes")
-            else:
-                raise FileNotFoundError(f"WAV file not created at {temp_wav_file}")
+            if not os.path.exists(temp_wav_file):
+                raise FileNotFoundError(f"WAV file was not created at {temp_wav_file}")
+
+            wav_size = os.path.getsize(temp_wav_file)
+            logger.info(f"✅ [STEP 4] WAV file created successfully: {wav_size} bytes")
 
         except subprocess.CalledProcessError as e:
-            logger.error(f"❌ [STEP 4] FFmpeg failed: {e.stderr}", exc_info=True)
+            logger.error(f"❌ [STEP 4] FFmpeg conversion failed: {e.stderr}", exc_info=True)
             raise Exception(f"FFmpeg conversion failed: {e.stderr}")
-        except FileNotFoundError:
-            logger.error("❌ [STEP 4] FFmpeg command not found. Ensure FFmpeg is installed and in PATH.")
+        except FileNotFoundError as e:
+            logger.error(f"❌ [STEP 4] {e}", exc_info=True)
             raise
         except Exception as e:
             logger.error(f"❌ [STEP 4] FAILED: {e}", exc_info=True)
@@ -296,18 +305,42 @@ def perform_analysis_job(
             logger.error(f"❌ [STEP 6] FAILED: {e}", exc_info=True)
             raise
 
-        # STEP 7: Extract Audio Features
-        logger.info("[STEP 7] Extracting audio features from WAV...")
+        # STEP 7: Extract Audio Features from loaded WAV data
+        logger.info("[STEP 7] Extracting audio features from loaded WAV data...")
         try:
-            # Use NumPy/SciPy only features from the converted WAV file
-            audio_features = extract_audio_features(temp_wav_file)
+            # Calculate RMS energy and other features from the loaded audio data
+            # Frame-based feature extraction
+            frame_length_feat = int(0.025 * sr)  # 25ms frames
+            hop_length_feat = int(0.010 * sr)    # 10ms hop
 
-            # Validate that we got proper features
-            if audio_features['duration_s'] <= 0:
-                logger.error("❌ Audio feature extraction failed - invalid duration")
-                raise Exception("Audio feature extraction failed")
+            # Extract frames
+            frames = np.array([
+                y[i:i+frame_length_feat]
+                for i in range(0, len(y)-frame_length_feat, hop_length_feat)
+            ])
 
-            logger.info(f"✅ [STEP 7] Audio features extracted: duration={audio_features['duration_s']:.2f}s, RMS={audio_features['rms_mean']:.4f}")
+            if len(frames) == 0:
+                raise ValueError("No frames extracted for feature analysis")
+
+            # Calculate RMS energy per frame
+            rms_frames = np.sqrt(np.mean(frames**2, axis=1))
+            rms_mean = float(np.mean(rms_frames))
+            rms_std = float(np.std(rms_frames))
+
+            # Calculate zero-crossing rate per frame
+            zcr_frames = np.mean(np.abs(np.diff(np.sign(frames), axis=1)), axis=1) / 2
+            zcr_mean = float(np.mean(zcr_frames))
+
+            # Store features for later use
+            audio_features = {
+                'rms_mean': rms_mean,
+                'rms_std': rms_std,
+                'zcr_mean': zcr_mean,
+                'duration_s': duration_seconds,
+                'sample_rate': sr
+            }
+
+            logger.info(f"✅ [STEP 7] Audio features extracted: RMS={rms_mean:.4f}, std={rms_std:.4f}, ZCR={zcr_mean:.4f}")
 
         except Exception as e:
             logger.error(f"❌ [STEP 7] FAILED: {e}", exc_info=True)
