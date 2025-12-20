@@ -123,26 +123,27 @@ def generate_intelligent_feedback(transcript: str, metrics: Dict[str, Any]) -> L
     }
 
     try:
-        logger.info("[OPENAI] Calling Chat API manually using httpx...")
-        
-        with httpx.Client(trust_env=False) as client:
-            client.proxies = {} 
-            
+        logger.info("[OPENAI] Generating feedback with 30s timeout...")
+
+        # Use timeout on HTTP request to prevent hanging
+        with httpx.Client(trust_env=False, timeout=30.0) as client:
+            client.proxies = {}
+
             response = client.post(
                 api_url,
                 headers=headers,
                 json=payload,
-                timeout=60.0
+                timeout=30.0  # 30 second timeout
             )
-        
-        response.raise_for_status() 
-        
+
+        response.raise_for_status()
+
         feedback_data = response.json()
         feedback_json_str = feedback_data['choices'][0]['message']['content']
-        
+
         recommendation_data = json.loads(feedback_json_str)
-        recommendations = recommendation_data.get('recommendations', []) 
-        
+        recommendations = recommendation_data.get('recommendations', [])
+
         if isinstance(recommendations, list) and all(isinstance(r, str) for r in recommendations):
             logger.info(f"[OPENAI] Successfully generated {len(recommendations)} recommendations.")
             return recommendations
@@ -150,6 +151,13 @@ def generate_intelligent_feedback(transcript: str, metrics: Dict[str, Any]) -> L
             logger.error(f"[OPENAI] Generated feedback was not a list of strings: {recommendation_data}")
             return ["Feedback generation failed: Model returned incorrect format."]
 
+    except httpx.TimeoutException:
+        logger.warning("[OPENAI] Feedback generation timed out (30s). Using fallback.")
+        return [
+            "Great effort! Keep practicing to reduce filler words.",
+            "Work on maintaining a consistent speaking pace.",
+            "Your presentation is improving with practice!"
+        ]
     except httpx.RequestError as e:
         logger.error(f"[OPENAI] HTTP request error: {e}")
         return [f"An error occurred connecting to the feedback service: {e.__class__.__name__}"]
@@ -168,6 +176,16 @@ def perform_analysis_job(
     user_id: Optional[str] = None
 ) -> Dict[str, Any]:
     """Worker function to fetch audio, perform analysis, and return results."""
+
+    # Set 10-minute timeout for entire job
+    import signal
+
+    def timeout_handler(signum, frame):
+        raise TimeoutError("Analysis job exceeded maximum processing time (10 minutes)")
+
+    signal.signal(signal.SIGALRM, timeout_handler)
+    signal.alarm(600)  # 600 seconds = 10 minutes
+
     job_start_time = time.time()
     logger.info(f"🚀 [JOB START] file_id={file_id}, s3_key={s3_key}, user_id={user_id}")
 
@@ -535,6 +553,22 @@ def perform_analysis_job(
 
         return final_result
 
+    except TimeoutError as e:
+        logger.error(f"❌ [JOB TIMEOUT] Analysis took too long: {e}", exc_info=True)
+
+        # Cleanup on timeout
+        if os.path.exists(temp_audio_file):
+            try:
+                os.remove(temp_audio_file)
+            except:
+                pass
+        if os.path.exists(temp_wav_file):
+            try:
+                os.remove(temp_wav_file)
+            except:
+                pass
+
+        raise
     except Exception as e:
         logger.error(f"❌ [JOB FAILED] Fatal error: {e}", exc_info=True)
 
