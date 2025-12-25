@@ -21,23 +21,23 @@ class SubmissionResponse(BaseModel):
 class AnalysisResult(BaseModel):
     # Core metrics
     confidence_score: float
-    speaking_pace: int  # WPM
+    speaking_pace: int  # WPM - 🔥 Make sure this is int, not Optional
     total_words: int  # Word count
     duration_seconds: float  # Duration
 
     # Fluency metrics
-    filler_word_count: int  # Filler count
+    filler_word_count: int  # Filler count - 🔥 Add this (not Optional)
     repetition_count: int  # Repetition count
     apology_count: Optional[int] = 0
 
     # Acoustic metrics
-    long_pause_count: int  # Pause count
-    silence_ratio: float  # 0.0-1.0
+    long_pause_count: int  # Pause count - Must be int
+    silence_ratio: float  # 0.0-1.0 - 🔥 Add this (not Optional)
 
     # Audio features
     avg_amplitude: float
-    pitch_mean: float
-    pitch_std: float
+    pitch_mean: float  # 🔥 Add this (not Optional)
+    pitch_std: float  # 🔥 Add this (not Optional)
     energy_std: float
     emotion: str
 
