@@ -320,38 +320,61 @@ def perform_analysis_job(
         
         # 7. Compile Core Metrics for LLM (UPDATED)
         core_analysis_metrics = {
+            # Core metrics
             "confidence_score": round(confidence_score, 2),
-            "speaking_pace": int(round(speaking_pace_wpm)),
-            "filler_word_count": filler_word_count,
+            "speaking_pace": int(round(speaking_pace_wpm)),  # ✅ MUST be here
+            "total_words": total_words,  # ✅ MUST be here
+            "duration_seconds": round(duration_seconds, 2),
+
+            # Fluency metrics
+            "filler_word_count": filler_word_count,  # ✅ MUST be here
+            "repetition_count": repetition_count,  # ✅ MUST be here
             "apology_count": apology_count,
-            "repetition_count": repetition_count,
-            "acoustic_disfluencies": serializable_disfluencies,
-            "acoustic_disfluency_count": len(serializable_disfluencies), 
-            "long_pause_count": long_pause_count, # Changed to an int, as it is a count
-            "silence_ratio": round(silence_ratio, 2),
+
+            # Acoustic metrics
+            "long_pause_count": int(long_pause_count),  # ✅ MUST be int
+            "silence_ratio": round(silence_ratio, 4),
+
+            # Audio features
             "pitch_mean": round(float(pitch_mean), 2),
             "pitch_std": round(float(pitch_std), 2),
-            "emotion": emotion.lower(),
+            "avg_amplitude": round(float(rms), 6),
             "energy_std": round(float(energy_std), 4),
+
+            # Other
+            "emotion": emotion.lower(),
+            "acoustic_disfluency_count": len(serializable_disfluencies),
             "transcript": transcript,
-            "total_words": total_words,
-            "duration_seconds": round(duration_seconds, 2),
-            # CRITICAL NEW FIELD
-            "highlight_markers": [m._asdict() for m in all_text_markers], 
+
+            # 🔥 CRITICAL: Include transcript_markers for highlighting
+            "transcript_markers": [m._asdict() for m in all_text_markers],
         }
-        
+
         # 8. Generate Intelligent Feedback
         logger.info("🤖 Generating intelligent feedback using OpenAI...")
         llm_recommendations = generate_intelligent_feedback(
-            transcript=transcript, 
+            transcript=transcript,
             metrics=core_analysis_metrics
         )
-        
+
         # 9. Compile Final Result
         final_result = {
             **core_analysis_metrics,
             "recommendations": llm_recommendations,
         }
+
+        # 🔥 Add logging to verify metrics are being calculated
+        logger.info(
+            f"📊 Final metrics being returned:\n"
+            f"  - Confidence: {confidence_score:.1f}/100\n"
+            f"  - Speaking Pace: {speaking_pace_wpm:.1f} WPM\n"
+            f"  - Total Words: {total_words}\n"
+            f"  - Filler Words: {filler_word_count}\n"
+            f"  - Repetitions: {repetition_count}\n"
+            f"  - Long Pauses: {long_pause_count}\n"
+            f"  - Silence Ratio: {silence_ratio:.2%}\n"
+            f"  - Transcript Markers: {len(all_text_markers)}"
+        )
 
         logger.info(f"✅ Analysis complete in {round(time.time() - job_start_time, 2)}s.")
         
