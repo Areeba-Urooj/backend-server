@@ -1,3 +1,7 @@
+# ============================================================================
+# FILE 1: app/models.py
+# ============================================================================
+
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any, List
 
@@ -11,45 +15,53 @@ class UploadResponse(BaseModel):
     s3_key: str = Field(..., description="The S3 Key (path/filename) of the uploaded object. Use this for analysis submission.")
     message: str
 
+
 # --- 2. Analysis Submission Model (Output) ---
 class SubmissionResponse(BaseModel):
     file_id: str
     job_id: str
     message: str
 
+
 # --- 3. Analysis Result Model ---
 class AnalysisResult(BaseModel):
-    # Core metrics
-    confidence_score: float
-    speaking_pace: int  # WPM - 🔥 Make sure this is int, not Optional
-    total_words: int  # Word count
-    duration_seconds: float  # Duration
-
-    # Fluency metrics
-    filler_word_count: int  # Filler count - 🔥 Add this (not Optional)
-    repetition_count: int  # Repetition count
+    """Complete analysis result with all metrics - DO NOT make fields Optional unless necessary"""
+    
+    # ===== CORE METRICS =====
+    confidence_score: float  # 0-100 scale
+    speaking_pace: int  # WPM - 🔥 MUST be int, not Optional
+    total_words: int  # Word count - 🔥 MUST be int, not Optional
+    duration_seconds: float  # Duration in seconds
+    
+    # ===== FLUENCY METRICS =====
+    filler_word_count: int  # Filler count - 🔥 MUST be int, not Optional
+    repetition_count: int  # Repetition count - 🔥 MUST be int, not Optional
     apology_count: Optional[int] = 0
-
-    # Acoustic metrics
-    long_pause_count: int  # Pause count - Must be int
-    silence_ratio: float  # 0.0-1.0 - 🔥 Add this (not Optional)
-
-    # Audio features
-    avg_amplitude: float
-    pitch_mean: float  # 🔥 Add this (not Optional)
-    pitch_std: float  # 🔥 Add this (not Optional)
-    energy_std: float
-    emotion: str
-
-    # Content
-    recommendations: List[str]
-    transcript: str
-
-    # 🔥 CRITICAL: Add this field for transcript highlighting
+    
+    # ===== ACOUSTIC METRICS =====
+    long_pause_count: int  # Pause count - 🔥 MUST be int, not Optional
+    silence_ratio: float  # 0.0-1.0 - 🔥 MUST be float, not Optional
+    
+    # ===== AUDIO FEATURES =====
+    avg_amplitude: float  # RMS value - 🔥 MUST have value
+    pitch_mean: float  # Hz - 🔥 MUST be float, not Optional
+    pitch_std: float  # Hz std - 🔥 MUST be float, not Optional
+    energy_std: float  # Energy variation
+    emotion: str  # neutral, excited, etc.
+    
+    # ===== CONTENT =====
+    recommendations: List[str]  # AI recommendations
+    transcript: str  # Full transcription
+    
+    # ===== HIGHLIGHTING =====
     transcript_markers: List[Dict[str, Any]] = Field(
         default_factory=list,
         description="Text markers for highlighting (filler, repetition, apology, etc.)"
     )
+    
+    # ===== OPTIONAL/ADDITIONAL =====
+    acoustic_disfluency_count: Optional[int] = None
+
 
 # --- 4. Analysis Status/Result Model (Output) ---
 class AnalysisStatusResponse(BaseModel):
