@@ -29,37 +29,22 @@ class TextMarker(BaseModel):
     end_char_index: int
 
 class AnalysisResult(BaseModel):
-    # Core metrics
     confidence_score: float
-    speaking_pace: int  # WPM
-    total_words: int  # Word count
-    duration_seconds: float  # Duration
-
-    # Fluency metrics
-    filler_word_count: int  # Filler count
-    repetition_count: int  # Repetition count
-    apology_count: Optional[int] = 0
-
-    # Acoustic metrics
-    long_pause_count: int  # Pause count
-    silence_ratio: float  # 0.0-1.0
-
-    # Audio features
+    speaking_pace: int
+    filler_word_count: int
+    repetition_count: int
+    long_pause_count: int  # Change from float to int
+    silence_ratio: float
     avg_amplitude: float
     pitch_mean: float
     pitch_std: float
-    energy_std: float
     emotion: str
-
-    # Content
+    energy_std: float
     recommendations: List[str]
     transcript: str
-
-    # 🔥 CRITICAL: Add this field for transcript highlighting
-    transcript_markers: List[Dict[str, Any]] = Field(
-        default_factory=list,
-        description="Text markers for highlighting (filler, repetition, apology, etc.)"
-    )
+    total_words: Optional[int] = None
+    duration_seconds: Optional[float] = None
+    transcript_markers: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class AnalysisStatusResponse(BaseModel):
