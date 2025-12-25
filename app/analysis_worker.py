@@ -241,8 +241,10 @@ def perform_analysis_job(
         # FIX: Calculate WPM defensively
         if duration_seconds > 0:
             speaking_pace_wpm = (total_words / duration_seconds) * 60
+            logger.info(f"📊 Speaking pace calculated: {speaking_pace_wpm:.1f} WPM")
         else:
             speaking_pace_wpm = 0.0
+            logger.warning("⚠️ Duration is 0, cannot calculate speaking pace")
 
         # 6. Feature Extraction & Acoustic Analysis
         logger.info("📈 Extracting audio features and metrics...")
@@ -264,6 +266,7 @@ def perform_analysis_job(
         silence_frames = np.sum(rms_frames < rms_threshold)
         total_frames = len(rms_frames)
         silence_ratio = silence_frames / total_frames if total_frames > 0 else 0.0
+        logger.info(f"📊 Silence ratio: {silence_ratio:.2%} ({silence_frames}/{total_frames} frames)")
         
         # FIX for long_pause_count: Calculate the actual count of DISTINCT long pause events
         long_pause_duration_frames = int(0.5 / (hop_len / sr)) # 0.5 second pause minimum
@@ -292,6 +295,7 @@ def perform_analysis_job(
 
         # Uses the new NumPy/SciPy function
         pitch_mean, pitch_std = calculate_pitch_stats(y, sr)
+        logger.info(f"📊 Pitch stats: mean={pitch_mean:.1f}Hz, std={pitch_std:.1f}Hz")
         
         audio_features_for_score = {
             "rms_mean": float(rms),
@@ -357,23 +361,56 @@ def perform_analysis_job(
             metrics=core_analysis_metrics
         )
 
-        # 9. Compile Final Result
+        # 9. Compile COMPLETE Final Result with ALL metrics
         final_result = {
-            **core_analysis_metrics,
+            # ===== CORE METRICS =====
+            "confidence_score": round(confidence_score, 2),
+            "speaking_pace": int(round(speaking_pace_wpm)),  # 🔥 MUST be here
+            "total_words": total_words,  # ✅ Already working
+            "duration_seconds": round(duration_seconds, 2),
+
+            # ===== FLUENCY METRICS =====
+            "filler_word_count": filler_word_count,  # 🔥 MUST be here
+            "repetition_count": repetition_count,  # ✅ Already working (shows 3)
+            "apology_count": apology_count,
+
+            # ===== ACOUSTIC METRICS =====
+            "long_pause_count": int(long_pause_count),  # 🔥 MUST be here (convert to int)
+            "silence_ratio": round(float(silence_ratio), 4),  # 🔥 MUST be here
+
+            # ===== AUDIO FEATURES =====
+            "pitch_mean": round(float(pitch_mean), 2),  # 🔥 MUST be here
+            "pitch_std": round(float(pitch_std), 2),  # 🔥 MUST be here
+            "avg_amplitude": round(float(rms), 6),
+            "energy_std": round(float(energy_std), 6),
+
+            # ===== ANALYSIS DETAILS =====
+            "emotion": emotion.lower(),
+            "acoustic_disfluency_count": len(serializable_disfluencies),
+
+            # ===== TEXT & HIGHLIGHTING =====
+            "transcript": transcript,
+            "highlight_markers": [m._asdict() for m in all_text_markers],
+            "transcript_markers": [m._asdict() for m in all_text_markers],
+
+            # ===== RECOMMENDATIONS =====
             "recommendations": llm_recommendations,
         }
 
-        # 🔥 Add logging to verify metrics are being calculated
+        # 🔥 CRITICAL: Log ALL metrics before returning
         logger.info(
-            f"📊 Final metrics being returned:\n"
-            f"  - Confidence: {confidence_score:.1f}/100\n"
-            f"  - Speaking Pace: {speaking_pace_wpm:.1f} WPM\n"
+            f"✅ FINAL RESULT COMPILED with metrics:\n"
+            f"  - Confidence: {round(confidence_score, 2)}/100\n"
+            f"  - Speaking Pace: {int(round(speaking_pace_wpm))} WPM\n"
             f"  - Total Words: {total_words}\n"
             f"  - Filler Words: {filler_word_count}\n"
             f"  - Repetitions: {repetition_count}\n"
-            f"  - Long Pauses: {long_pause_count}\n"
-            f"  - Silence Ratio: {silence_ratio:.2%}\n"
-            f"  - Transcript Markers: {len(all_text_markers)}"
+            f"  - Long Pauses: {int(long_pause_count)}\n"
+            f"  - Silence Ratio: {round(float(silence_ratio), 4)}\n"
+            f"  - Pitch Mean: {round(float(pitch_mean), 2)} Hz\n"
+            f"  - Pitch Std: {round(float(pitch_std), 2)} Hz\n"
+            f"  - Markers: {len(all_text_markers)}\n"
+            f"  - Recommendations: {len(llm_recommendations)}"
         )
 
         logger.info(f"✅ Analysis complete in {round(time.time() - job_start_time, 2)}s.")
