@@ -33,18 +33,18 @@ class AnalysisResult(BaseModel):
     speaking_pace: int
     filler_word_count: int
     repetition_count: int
-    long_pause_count: int  # Change from float to int
+    long_pause_count: float
     silence_ratio: float
-    avg_amplitude: float
+    # 🔥 FINAL CRITICAL FIX: Make avg_amplitude optional to stop the validation error.
+    avg_amplitude: Optional[float] = None 
     pitch_mean: float
     pitch_std: float
     emotion: str
     energy_std: float
     recommendations: List[str]
     transcript: str
-    total_words: Optional[int] = None
+    highlight_markers: List[TextMarker] = Field(default_factory=list)
     duration_seconds: Optional[float] = None
-    transcript_markers: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class AnalysisStatusResponse(BaseModel):
