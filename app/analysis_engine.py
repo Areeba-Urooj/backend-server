@@ -4,32 +4,8 @@ import numpy as np
 import soundfile as sf
 import subprocess
 import json
-import logging
-import re
-from typing import Dict, Any, List, Tuple, NamedTuple, Optional
-from scipy.signal import find_peaks, butter, lfilter
 from scipy.stats import zscore
 from sklearn.preprocessing import StandardScaler 
-
-# --- Configuration & Constants ---
-TARGET_SR = 16000 
-MAX_DURATION_SECONDS = 120 
-logger = logging.getLogger(__name__)
-
-# --- NamedTuples for Analysis Markers ---
-
-# Time-based marker for acoustic/audio events
-class DisfluencyResult(NamedTuple):
-    type: str # 'block', 'prolongation'
-    start_time_s: float
-    duration_s: float
-
-# Index-based marker for textual events (CRITICAL for Flutter highlighting)
-class TextMarker(NamedTuple):
-    type: str # 'filler', 'repetition', 'apology', 'tangent', 'meta_commentary', 'self_correction'
-    word: str
-    start_char_index: int
-    end_char_index: int
 
 
 # --- 1. Core Feature Extraction (FFprobe/FFmpeg Safe) ---
@@ -145,22 +121,7 @@ def detect_fillers_and_apologies(transcript: str) -> List[TextMarker]:
 
     return markers
 
-def detect_repetitions_for_highlighting(transcript: str) -> List[TextMarker]:
-    """
-    Detects repeated adjacent words, returning TextMarkers.
-    """
-    markers: List[TextMarker] = []
-
-    # Tokenize the transcript while keeping track of original indices
-    token_matches = list(re.finditer(r'(\w+)(\W*)', transcript))
-
-    i = 0
-    while i < len(token_matches) - 1:
-        word1_lower = token_matches[i].group(1).lower()
-        word2_lower = token_matches[i+1].group(1).lower()
-
-        if word1_lower == word2_lower and len(word1_lower) > 2: # Ignore single letter repeats
-            # Repetition found: highlight the full phrase including the second instance.
+# Repetition found: highlight the full phrase including the second instance.
             start_char_index = token_matches[i].start(1)
             end_char_index = token_matches[i+1].end(1)
 
@@ -224,32 +185,6 @@ def detect_custom_markers(transcript: str) -> List[TextMarker]:
                 start_char_index=match.start(),
                 end_char_index=match.end()
             ))
-            
-    return markers
-
-# --- 3. Acoustic/Voice Analysis Functions (Unchanged) ---
-
-def initialize_emotion_model():
-    class MockModel:
-        def predict(self, features):
-            return np.array([0])  
-    class MockScaler:
-        def transform(self, data):
-            return data
-    return MockModel(), MockScaler(), ["neutral", "calm", "happy", "sad", "angry"]  
-
-def classify_emotion_simple(wav_file_path: str, model, scaler) -> str:
-    emotion_classes = ["neutral", "calm", "happy", "sad", "angry"]
-    try:
-        y, sr = sf.read(wav_file_path)
-        energy = np.mean(y**2)
-        if energy > 0.005:  
-            return "excited"
-        return "neutral"  
-    except Exception as e:
-        logger.warning(f"Emotion classification failed: {e}")
-        return "unknown"
-
 
 def butter_highpass(cutoff, fs, order=5):
     nyq = 0.5 * fs
@@ -366,30 +301,13 @@ def score_confidence(audio_features: Dict[str, Any], fluency_metrics: Dict[str, 
         'silence': 0.05,        # Silence ratio: 5%
     }
 
-    # 1. PACE SCORING (0-100)
-    pace_wpm = audio_features.get('speaking_pace_wpm', 0)
-    ideal_pace = 150  # WPM
-
-    if pace_wpm == 0:
-        pace_score = 0
-    elif pace_wpm < 80:
-        pace_score = (pace_wpm / 80) * 40  # 0-40 for too slow
-    elif pace_wpm > 200:
-        pace_score = max(0, 100 - ((pace_wpm - 200) / 100) * 40)  # Penalize too fast
-    else:
-        # 80-200 WPM: score based on distance from ideal
-        deviation = abs(pace_wpm - ideal_pace)
-        pace_score = 100 - (deviation / ideal_pace) * 30  # 70-100 for normal range
-
-    pace_score = np.clip(pace_score, 0, 100)
-
+ 
     # 2. FLUENCY SCORING (0-100)
     total_words = max(1, fluency_metrics.get('total_words', 1))
     fillers = fluency_metrics.get('filler_word_count', 0)
     reps = fluency_metrics.get('repetition_count', 0)
     acoustic = fluency_metrics.get('acoustic_disfluency_count', 0)
 
-    disfluency_rate = (fillers + reps + acoustic) / total_words
 
     # Realistic thresholds: average person has some fillers
     if disfluency_rate == 0:
@@ -397,10 +315,7 @@ def score_confidence(audio_features: Dict[str, Any], fluency_metrics: Dict[str, 
     elif disfluency_rate < 0.03:  # 3% is good
         fluency_score = 100 - (disfluency_rate / 0.03) * 10  # 90-100
     elif disfluency_rate < 0.08:  # 8% is acceptable
-        fluency_score = 90 - ((disfluency_rate - 0.03) / 0.05) * 20  # 70-90
-    elif disfluency_rate < 0.15:  # 15% is poor but not terrible
-        fluency_score = 70 - ((disfluency_rate - 0.08) / 0.07) * 30  # 40-70
-    else:
+        fluency_score = 
         fluency_score = max(20, 40 - (disfluency_rate - 0.15) * 100)  # 20-40
 
     fluency_score = np.clip(fluency_score, 20, 100)
