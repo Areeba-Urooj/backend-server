@@ -2,9 +2,6 @@
 
 import os
 import logging
-from typing import Dict, Any, Optional, List, Tuple
-import time
-import sys
 import subprocess
 import numpy as np
 import soundfile as sf
@@ -23,14 +20,6 @@ from rq import Worker
 from analysis_engine import ( 
     detect_fillers_and_apologies, # New function
     detect_repetitions_for_highlighting, # New function
-    detect_custom_markers, # New function
-    score_confidence, 
-    initialize_emotion_model,
-    classify_emotion_simple,
-    calculate_pitch_stats, 
-    detect_acoustic_disfluencies, 
-    extract_audio_features,      
-    MAX_DURATION_SECONDS,
     TextMarker # Import new NamedTuple
 )
 
@@ -115,45 +104,6 @@ def generate_intelligent_feedback(transcript: str, metrics: Dict[str, Any]) -> L
         "Content-Type": "application/json"
     }
     
-    payload = {
-        "model": "gpt-4o-mini",
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
-        ],
-        "response_format": {"type": "json_object"}, 
-        "temperature": 0.7
-    }
-
-    try:
-        logger.info("[OPENAI] Calling Chat API manually using httpx...")
-        
-        with httpx.Client(trust_env=False) as client:
-            client.proxies = {} 
-            
-            response = client.post(
-                api_url,
-                headers=headers,
-                json=payload,
-                timeout=60.0
-            )
-        
-        response.raise_for_status() 
-        
-        feedback_data = response.json()
-        feedback_json_str = feedback_data['choices'][0]['message']['content']
-        
-        recommendation_data = json.loads(feedback_json_str)
-        recommendations = recommendation_data.get('recommendations', []) 
-        
-        if isinstance(recommendations, list) and all(isinstance(r, str) for r in recommendations):
-            logger.info(f"[OPENAI] Successfully generated {len(recommendations)} recommendations.")
-            return recommendations
-        else:
-            logger.error(f"[OPENAI] Generated feedback was not a list of strings: {recommendation_data}")
-            return ["Feedback generation failed: Model returned incorrect format."]
-
-    except httpx.RequestError as e:
         logger.error(f"[OPENAI] HTTP request error: {e}")
         return [f"An error occurred connecting to the feedback service: {e.__class__.__name__}"]
     except httpx.HTTPStatusError as e:
@@ -231,39 +181,6 @@ def perform_analysis_job(
         if len(y.shape) > 1:
             y = np.mean(y, axis=1)
 
-        # Truncate 'y' (if conversion didn't handle duration limit, or for safety)
-        max_samples = sr * MAX_DURATION_SECONDS
-        if len(y) > max_samples:
-            y = y[:max_samples]
-            
-        duration_seconds = len(y) / sr
-        
-        # FIX: Calculate WPM defensively
-        if duration_seconds > 0:
-            speaking_pace_wpm = (total_words / duration_seconds) * 60
-            logger.info(f"📊 Speaking pace calculated: {speaking_pace_wpm:.1f} WPM")
-        else:
-            speaking_pace_wpm = 0.0
-            logger.warning("⚠️ Duration is 0, cannot calculate speaking pace")
-
-        # 6. Feature Extraction & Acoustic Analysis
-        logger.info("📈 Extracting audio features and metrics...")
-        
-        # --- Audio Feature Calculation (Numpy/SciPy based on 'y') ---
-        rms = np.sqrt(np.mean(y**2)) 
-        avg_amplitude = np.mean(np.abs(y))
-        energy_std = np.std(np.abs(y)) 
-        
-        # Simple silence calculation based on RMS frames
-        frame_len = int(sr * 0.05) 
-        hop_len = int(sr * 0.01)    
-        
-        num_frames = (len(y) - frame_len) // hop_len + 1
-        rms_frames = np.array([np.sqrt(np.mean(y[i*hop_len : i*hop_len + frame_len]**2)) for i in range(num_frames)])
-        
-        # FIX: Use a more robust threshold or ensure it's not too sensitive
-        rms_threshold = np.mean(rms_frames) * 0.2 # Adjusted from 0.1 to 0.2 for better robustness 
-        silence_frames = np.sum(rms_frames < rms_threshold)
         total_frames = len(rms_frames)
         silence_ratio = silence_frames / total_frames if total_frames > 0 else 0.0
         logger.info(f"📊 Silence ratio: {silence_ratio:.2%} ({silence_frames}/{total_frames} frames)")
@@ -369,20 +286,6 @@ def perform_analysis_job(
             "total_words": total_words,  # ✅ Already working
             "duration_seconds": round(duration_seconds, 2),
 
-            # ===== FLUENCY METRICS =====
-            "filler_word_count": filler_word_count,  # 🔥 MUST be here
-            "repetition_count": repetition_count,  # ✅ Already working (shows 3)
-            "apology_count": apology_count,
-
-            # ===== ACOUSTIC METRICS =====
-            "long_pause_count": int(long_pause_count),  # 🔥 MUST be here (convert to int)
-            "silence_ratio": round(float(silence_ratio), 4),  # 🔥 MUST be here
-
-            # ===== AUDIO FEATURES =====
-            "pitch_mean": round(float(pitch_mean), 2),  # 🔥 MUST be here
-            "pitch_std": round(float(pitch_std), 2),  # 🔥 MUST be here
-            "avg_amplitude": round(float(rms), 6),
-            "energy_std": round(float(energy_std), 6),
 
             # ===== ANALYSIS DETAILS =====
             "emotion": emotion.lower(),
@@ -392,26 +295,6 @@ def perform_analysis_job(
             "transcript": transcript,
             "highlight_markers": [m._asdict() for m in all_text_markers],
             "transcript_markers": [m._asdict() for m in all_text_markers],
-
-            # ===== RECOMMENDATIONS =====
-            "recommendations": llm_recommendations,
-        }
-
-        # 🔥 CRITICAL: Log ALL metrics before returning
-        logger.info(
-            f"✅ FINAL RESULT COMPILED with metrics:\n"
-            f"  - Confidence: {round(confidence_score, 2)}/100\n"
-            f"  - Speaking Pace: {int(round(speaking_pace_wpm))} WPM\n"
-            f"  - Total Words: {total_words}\n"
-            f"  - Filler Words: {filler_word_count}\n"
-            f"  - Repetitions: {repetition_count}\n"
-            f"  - Long Pauses: {int(long_pause_count)}\n"
-            f"  - Silence Ratio: {round(float(silence_ratio), 4)}\n"
-            f"  - Pitch Mean: {round(float(pitch_mean), 2)} Hz\n"
-            f"  - Pitch Std: {round(float(pitch_std), 2)} Hz\n"
-            f"  - Markers: {len(all_text_markers)}\n"
-            f"  - Recommendations: {len(llm_recommendations)}"
-        )
 
         logger.info(f"✅ Analysis complete in {round(time.time() - job_start_time, 2)}s.")
         
