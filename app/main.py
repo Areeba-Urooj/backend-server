@@ -33,18 +33,18 @@ class AnalysisResult(BaseModel):
     speaking_pace: int
     filler_word_count: int
     repetition_count: int
-    long_pause_count: float
+    long_pause_count: int  # Change from float to int
     silence_ratio: float
-    # 🔥 FINAL CRITICAL FIX: Make avg_amplitude optional to stop the validation error.
-    avg_amplitude: Optional[float] = None 
+    avg_amplitude: float
     pitch_mean: float
     pitch_std: float
     emotion: str
     energy_std: float
     recommendations: List[str]
     transcript: str
-    highlight_markers: List[TextMarker] = Field(default_factory=list)
+    total_words: Optional[int] = None
     duration_seconds: Optional[float] = None
+    transcript_markers: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class AnalysisStatusResponse(BaseModel):
@@ -179,6 +179,52 @@ async def upload_audio_file(
         raise HTTPException(
             status_code=500,
             detail=f"An error occurred while processing the upload: {str(e)}"
+        )
+
+@app.post("/upload/pdf", response_model=UploadResponse)
+async def upload_pdf_file(
+    file: UploadFile = File(...),
+    user_id: str = Form(...),
+    recording_id: str = Form(...)
+):
+    """Receives a PDF analysis report and uploads it to a specific S3 path."""
+    if not s3_client or not S3_BUCKET_NAME:
+        raise HTTPException(status_code=503, detail="S3 storage service is unavailable.")
+    
+    # Specific path requested by the client: pdfs/[userId]/[recordingId]_analysis.pdf
+    s3_key = f"pdfs/{user_id}/{recording_id}_analysis.pdf"
+
+    try:
+        logger.info(f"[API] ⬆️ Starting PDF S3 upload to key: {s3_key}")
+        
+        s3_client.upload_fileobj(
+            Fileobj=file.file,
+            Bucket=S3_BUCKET_NAME,
+            Key=s3_key,
+            ExtraArgs={
+                'ContentType': 'application/pdf'
+            }
+        )
+        
+        logger.info(f"[API] ✅ PDF S3 upload complete for S3 Key: {s3_key}")
+
+        return JSONResponse(content={
+            "file_id": recording_id,
+            "s3_key": s3_key,
+            "message": "PDF uploaded successfully."
+        }, status_code=200)
+
+    except ClientError as e:
+        logger.error(f"[API] ❌ S3 Error during PDF upload: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"S3 PDF Upload Failed: {e.response['Error'].get('Message', 'Unknown S3 error')}"
+        )
+    except Exception as e:
+        logger.error(f"[API] ❌ General Error during PDF upload: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"An error occurred while processing the PDF upload: {str(e)}"
         )
 
 @app.post("/api/v1/analysis/submit", response_model=SubmissionResponse)
