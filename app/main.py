@@ -6,13 +6,6 @@ import logging
 from uuid import uuid4
 from typing import Dict, Any, Optional, List 
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Form
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-
-import boto3
-from botocore.exceptions import ClientError
-
 import redis
 from rq import Queue
 from rq.job import Job
@@ -117,37 +110,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# --- Pydantic Models for Response ---
-class SubmissionResponse(BaseModel):
-    file_id: str
-    job_id: str
-    message: str
-
-class UploadResponse(BaseModel):
-    file_id: str
-    s3_key: str
-    message: str
-
-# --- API Endpoints ---
-
-@app.get("/")
-def health_check():
-    """Basic health check."""
-    return {"status": "ok", "message": "Audio Analysis API is running."}
-
-@app.post("/upload", response_model=UploadResponse)
-async def upload_audio_file(
-    file: UploadFile = File(...)
-):
-    """Receives an audio file and uploads it to S3."""
-    if not s3_client or not S3_BUCKET_NAME:
-        raise HTTPException(status_code=503, detail="S3 storage service is unavailable.")
-    
-    file_extension = os.path.splitext(file.filename)[1] or ".m4a"
-    file_uuid = str(uuid4())
-    s3_key = f"uploads/{file_uuid}{file_extension}"
-
     try:
         logger.info(f"[API] ⬆️ Starting S3 upload to key: {s3_key}")
         
@@ -167,19 +129,6 @@ async def upload_audio_file(
             "s3_key": s3_key,
             "message": "File uploaded successfully."
         }, status_code=200)
-
-    except ClientError as e:
-        logger.error(f"[API] ❌ S3 Error during upload: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"S3 Upload Failed: {e.response['Error'].get('Message', 'Unknown S3 error')}"
-        )
-    except Exception as e:
-        logger.error(f"[API] ❌ General Error during upload: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"An error occurred while processing the upload: {str(e)}"
-        )
 
 @app.post("/upload/pdf", response_model=UploadResponse)
 async def upload_pdf_file(
@@ -227,39 +176,6 @@ async def upload_pdf_file(
             detail=f"An error occurred while processing the PDF upload: {str(e)}"
         )
 
-@app.post("/api/v1/analysis/submit", response_model=SubmissionResponse)
-async def submit_analysis_job(
-    s3_key: str = Form(..., description="The S3 Key of the uploaded file."),
-    transcript: str = Form(..., description="The full transcription of the audio file."),
-    user_id: str = Form(..., description="The ID of the authenticated user.")
-):
-    """Queues an audio analysis job using s3_key and transcript."""
-    if not queue:
-        raise HTTPException(status_code=503, detail="RQ/Redis service is unavailable.")
-
-    file_id = os.path.splitext(os.path.basename(s3_key))[0]
-
-    try:
-        job = queue.enqueue(
-            'app.analysis_worker.perform_analysis_job', 
-            kwargs={
-                'file_id': file_id,
-                's3_key': s3_key,
-                'transcript': transcript,
-                'user_id': user_id,
-            },
-            job_timeout='30m', 
-            serializer='json' 
-        )
-        
-        logger.info(f"[API] 📝 Job enqueued successfully. Job ID: {job.id}")
-
-        return JSONResponse(content={
-            "file_id": file_id,
-            "job_id": job.id,
-            "message": "Analysis job queued."
-        }, status_code=200)
-
     except Exception as e:
         logger.error(f"[API] ❌ Error during job enqueue: {e}", exc_info=True)
         raise HTTPException(
@@ -290,36 +206,6 @@ def get_analysis_status(job_id: str):
             response_data.ended_at = job.ended_at.isoformat() if job.ended_at else None
             job_result = job.result
             
-            if job_result and isinstance(job_result, dict):
-                
-                try:
-                    # Attempt to create the Pydantic model with the job result
-                    analysis_result = AnalysisResult(**job_result)
-                    response_data.result = analysis_result
-                
-                except ValidationError as e:
-                    error_message = f"{e.__class__.__name__} for AnalysisResult:\n{e.errors()}"
-                    logger.error(f"[API] ❌ FAILED to map job result to AnalysisResult model for job {job_id}:\n{error_message}", exc_info=True)
-                    
-                    response_data.status = 'failed'
-                    response_data.error = f"Result processing error (API): {str(e)}. Worker result keys/types are likely mismatched."
-                
-                except Exception as e:
-                    logger.error(f"[API] ❌ General error processing job result for job {job_id}: {e}", exc_info=True)
-                    response_data.status = 'failed'
-                    response_data.error = f"General result processing error (API): {str(e)}"
-            
-            elif status == 'finished' and not job_result:
-                logger.error(f"[API] Job {job_id} finished, but result was None.")
-                response_data.status = 'failed'
-                response_data.error = "Job finished successfully, but worker returned no result data."
-
-        # Explicitly handle 'failed' status from the worker
-        if status == 'failed' and job.exc_info:
-            response_data.error = job.exc_info
-            logger.error(f"[API] Full exception info for worker job {job_id}:\n{job.exc_info}")
-            
-        return response_data
         
     except redis.exceptions.ConnectionError:
         raise HTTPException(status_code=500, detail="Could not connect to Redis.")
