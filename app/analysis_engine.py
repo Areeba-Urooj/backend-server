@@ -353,116 +353,54 @@ def detect_acoustic_disfluencies(y: np.ndarray, sr: int, frame_len_ms: int = 25,
 # --- 4. Scoring Logic (FIXED for Division by Zero) ---
 
 def score_confidence(audio_features: Dict[str, Any], fluency_metrics: Dict[str, Any]) -> float:
-    """
-    Calculate confidence score on 0-100 scale (not 0-1).
-    More realistic thresholds for average speakers.
-    """
-
+        
     WEIGHTS = {
-        'pace': 0.25,           # Speaking pace: 25%
-        'fluency': 0.35,        # Disfluency count: 35%
-        'pitch': 0.20,          # Pitch variation: 20%
-        'energy': 0.15,         # Energy consistency: 15%
-        'silence': 0.05,        # Silence ratio: 5%
+        'WPM_IDEAL': 0.35,  
+        'DISFLUENCY_COUNT': 0.40,  
+        'PITCH_STABILITY': 0.15,  
+        'ENERGY_STD': 0.10,  
     }
 
-    # 1. PACE SCORING (0-100)
     pace_wpm = audio_features.get('speaking_pace_wpm', 0)
-    ideal_pace = 150  # WPM
+    ideal_pace = 150.0
+    pace_deviation = min(0.5, abs(pace_wpm - ideal_pace) / ideal_pace)  
+    pace_score = max(0.0, 1.0 - (pace_deviation * 2))  
 
-    if pace_wpm == 0:
-        pace_score = 0
-    elif pace_wpm < 80:
-        pace_score = (pace_wpm / 80) * 40  # 0-40 for too slow
-    elif pace_wpm > 200:
-        pace_score = max(0, 100 - ((pace_wpm - 200) / 100) * 40)  # Penalize too fast
+    total_disfluencies = (
+        fluency_metrics.get('filler_word_count', 0) +  
+        fluency_metrics.get('repetition_count', 0) +
+        fluency_metrics.get('acoustic_disfluency_count', 0)
+    )
+    
+    # FIX: Use max(1, total_words) to prevent Division by Zero
+    total_words = fluency_metrics.get('total_words', 1)
+    
+    max_rate = 0.05  
+    
+    # Defensive division for disfluency rate
+    if total_words <= 0:
+        disfluency_rate = max_rate # Assume maximum disfluency if no words were detected
     else:
-        # 80-200 WPM: score based on distance from ideal
-        deviation = abs(pace_wpm - ideal_pace)
-        pace_score = 100 - (deviation / ideal_pace) * 30  # 70-100 for normal range
+        disfluency_rate = total_disfluencies / total_words
 
-    pace_score = np.clip(pace_score, 0, 100)
+    disfluency_score = max(0.0, 1.0 - (disfluency_rate / max_rate))
 
-    # 2. FLUENCY SCORING (0-100)
-    total_words = max(1, fluency_metrics.get('total_words', 1))
-    fillers = fluency_metrics.get('filler_word_count', 0)
-    reps = fluency_metrics.get('repetition_count', 0)
-    acoustic = fluency_metrics.get('acoustic_disfluency_count', 0)
+    pitch_std = audio_features.get('pitch_std', 50.0)
+    max_pitch_std = 40.0  
+    pitch_score = max(0.0, 1.0 - (pitch_std / max_pitch_std))
+    
+    energy_std = audio_features.get('energy_std', 0.0)
+    ideal_energy_std = 0.005  
+    energy_deviation = min(0.01, abs(energy_std - ideal_energy_std))
+    energy_score = max(0.0, 1.0 - (energy_deviation * 100))  
 
-    disfluency_rate = (fillers + reps + acoustic) / total_words
-
-    # Realistic thresholds: average person has some fillers
-    if disfluency_rate == 0:
-        fluency_score = 100
-    elif disfluency_rate < 0.03:  # 3% is good
-        fluency_score = 100 - (disfluency_rate / 0.03) * 10  # 90-100
-    elif disfluency_rate < 0.08:  # 8% is acceptable
-        fluency_score = 90 - ((disfluency_rate - 0.03) / 0.05) * 20  # 70-90
-    elif disfluency_rate < 0.15:  # 15% is poor but not terrible
-        fluency_score = 70 - ((disfluency_rate - 0.08) / 0.07) * 30  # 40-70
-    else:
-        fluency_score = max(20, 40 - (disfluency_rate - 0.15) * 100)  # 20-40
-
-    fluency_score = np.clip(fluency_score, 20, 100)
-
-    # 3. PITCH SCORING (0-100)
-    pitch_std = audio_features.get('pitch_std', 0)
-    pitch_mean = audio_features.get('pitch_mean', 0)
-
-    if pitch_std == 0 or pitch_mean == 0:
-        pitch_score = 50  # Neutral if no pitch detected
-    elif pitch_std < 5:
-        pitch_score = 40  # Too monotone
-    elif pitch_std < 15:
-        pitch_score = 60  # Low variation
-    elif pitch_std < 30:
-        pitch_score = 85  # Good variation
-    elif pitch_std < 50:
-        pitch_score = 70  # High but acceptable
-    else:
-        pitch_score = 50  # Too variable
-
-    pitch_score = np.clip(pitch_score, 0, 100)
-
-    # 4. ENERGY SCORING (0-100)
-    energy_std = audio_features.get('energy_std', 0)
-    rms_mean = audio_features.get('rms_mean', 0)
-
-    if rms_mean == 0:
-        energy_score = 30  # Too quiet
-    elif rms_mean < 0.01:
-        energy_score = 40  # Quiet
-    elif rms_mean > 0.3:
-        energy_score = 60  # Very loud
-    else:
-        energy_score = 75 + (energy_std / 0.02) * 15  # 75-90 with variation
-
-    energy_score = np.clip(energy_score, 0, 100)
-
-    # 5. SILENCE SCORING (0-100)
-    silence_ratio = audio_features.get('silence_ratio', 0)
-
-    if silence_ratio < 0.1:
-        silence_score = 100  # Little silence is good
-    elif silence_ratio < 0.3:
-        silence_score = 90  # Normal
-    elif silence_ratio < 0.5:
-        silence_score = 70  # Acceptable
-    else:
-        silence_score = max(40, 100 - silence_ratio * 100)  # Too much silence
-
-    silence_score = np.clip(silence_score, 0, 100)
-
-    # FINAL SCORE (weighted average, 0-100 scale)
     final_score = (
-        pace_score * WEIGHTS['pace'] +
-        fluency_score * WEIGHTS['fluency'] +
-        pitch_score * WEIGHTS['pitch'] +
-        energy_score * WEIGHTS['energy'] +
-        silence_score * WEIGHTS['silence']
+        (pace_score * WEIGHTS['WPM_IDEAL']) +
+        (disfluency_score * WEIGHTS['DISFLUENCY_COUNT']) +
+        (pitch_score * WEIGHTS['PITCH_STABILITY']) +
+        (energy_score * WEIGHTS['ENERGY_STD'])
     )
 
-    # Clamp between 20-100 (20 is lowest possible, 100 is perfect)
-    final_score = np.clip(final_score, 20, 100)
-
-    return round(final_score, 1)  # Return as 0-100 scale
+    # FIX: Return a default low score (0.3) only if all inputs were zero (highly unlikely now)
+    # The default score of 0.3 was likely a placeholder. Now it will calculate correctly.
+    return min(1.0, max(0.0, final_score))
