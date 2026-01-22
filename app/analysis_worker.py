@@ -445,3 +445,4 @@ if __name__ == '__main__':
         if 'redis' in str(e).lower():
             logger.critical("⚠️ Check your REDIS_URL and network configuration.")
         exit(1)
+
