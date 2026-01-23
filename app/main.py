@@ -7,8 +7,9 @@ from uuid import uuid4
 from typing import Dict, Any, Optional, List 
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+from io import BytesIO
 
 import boto3
 from botocore.exceptions import ClientError
@@ -179,6 +180,100 @@ async def upload_audio_file(
         raise HTTPException(
             status_code=500,
             detail=f"An error occurred while processing the upload: {str(e)}"
+        )
+
+@app.post("/upload/pdf", response_model=UploadResponse)
+async def upload_pdf_file(
+    file: UploadFile = File(...),
+    user_id: str = Form(...),
+    recording_id: str = Form(...)
+):
+    """Receives a PDF analysis report and uploads it to a specific S3 path."""
+    if not s3_client or not S3_BUCKET_NAME:
+        raise HTTPException(status_code=503, detail="S3 storage service is unavailable.")
+    
+    # Specific path requested by the client: pdfs/[userId]/[recordingId]_analysis.pdf
+    s3_key = f"pdfs/{user_id}/{recording_id}_analysis.pdf"
+
+    try:
+        logger.info(f"[API] ⬆️ Starting PDF S3 upload to key: {s3_key}")
+        
+        s3_client.upload_fileobj(
+            Fileobj=file.file,
+            Bucket=S3_BUCKET_NAME,
+            Key=s3_key,
+            ExtraArgs={
+                'ContentType': 'application/pdf'
+            }
+        )
+        
+        logger.info(f"[API] ✅ PDF S3 upload complete for S3 Key: {s3_key}")
+
+        return JSONResponse(content={
+            "file_id": recording_id,
+            "s3_key": s3_key,
+            "message": "PDF uploaded successfully."
+        }, status_code=200)
+
+    except ClientError as e:
+        logger.error(f"[API] ❌ S3 Error during PDF upload: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"S3 PDF Upload Failed: {e.response['Error'].get('Message', 'Unknown S3 error')}"
+        )
+    except Exception as e:
+        logger.error(f"[API] ❌ General Error during PDF upload: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"An error occurred while processing the PDF upload: {str(e)}"
+        )
+
+@app.get("/api/v1/pdf/download")
+async def download_pdf(s3_key: str):
+    """Downloads a PDF from S3 and returns it as a streaming response."""
+    if not s3_client or not S3_BUCKET_NAME:
+        raise HTTPException(status_code=503, detail="S3 storage service is unavailable.")
+    
+    try:
+        logger.info(f"[API] 📥 Downloading PDF from S3: {s3_key}")
+        
+        # Get object from S3
+        response = s3_client.get_object(
+            Bucket=S3_BUCKET_NAME,
+            Key=s3_key
+        )
+        
+        # Read the PDF data
+        pdf_data = response['Body'].read()
+        
+        logger.info(f"[API] ✅ PDF downloaded successfully: {s3_key} ({len(pdf_data)} bytes)")
+        
+        # Return as streaming response
+        return StreamingResponse(
+            BytesIO(pdf_data),
+            media_type='application/pdf',
+            headers={
+                'Content-Disposition': f'attachment; filename="{os.path.basename(s3_key)}"',
+                'Content-Length': str(len(pdf_data)),
+            }
+        )
+        
+    except ClientError as e:
+        error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+        if error_code == 'NoSuchKey':
+            logger.error(f"[API] ❌ PDF not found in S3: {s3_key}")
+            raise HTTPException(status_code=404, detail=f"PDF not found: {s3_key}")
+        else:
+            logger.error(f"[API] ❌ S3 Error during PDF download: {e}", exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail=f"S3 Download Failed: {e.response['Error'].get('Message', 'Unknown S3 error')}"
+            )
+    except Exception as e:
+        logger.error(f"[API] ❌ General Error during PDF download: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"An error occurred while downloading the PDF: {str(e)}"
         )
 
 @app.post("/api/v1/analysis/submit", response_model=SubmissionResponse)
