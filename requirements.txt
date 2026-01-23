@@ -4,25 +4,7 @@
 
 # FastAPI & Web
 fastapi==0.115.0
-uvicorn[standard]==0.32.0
-python-multipart==0.0.20
 
-# Data Validation
-pydantic==2.10.0
-
-# File Operations
-aiofiles==25.1.0
-
-# Logging
-loguru==0.7.3
-
-# AI/ML
-openai==1.35.13
-
-# Critical System
-setuptools>=69.0.3
-
-# Redis and Job Queue
 redis==5.2.0
 rq==2.3.0
 
@@ -40,8 +22,6 @@ decorator==5.1.1
 joblib==1.4.2
 
 # AWS S3
-boto3==1.34.137
-botocore==1.34.137
 jmespath==1.0.1
 s3transfer==0.10.1
 
