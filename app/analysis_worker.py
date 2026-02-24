@@ -4,13 +4,25 @@ import os
 import logging
 from typing import Dict, Any, Optional, List, Tuple
 import time
+import sys
+import subprocess
+import numpy as np
+import soundfile as sf
 import json
 
 # --- IMPORTS FOR OPENAI (MANUAL HTTP) ---
 import httpx
 # ------------------------------------
 
-import boto3 # New function
+import boto3
+from botocore.exceptions import ClientError
+from redis import Redis
+from rq import Worker 
+
+# Import ALL necessary functions and constants from the engine (UPDATED IMPORTS)
+from analysis_engine import ( 
+    detect_fillers_and_apologies, # New function
+    detect_repetitions_for_highlighting, # New function
     detect_custom_markers, # New function
     score_confidence, 
     initialize_emotion_model,
@@ -164,7 +176,12 @@ def perform_analysis_job(
 
     temp_audio_file = f"/tmp/{file_id}_{os.path.basename(s3_key)}"
     temp_wav_file = f"/tmp/{file_id}_converted.wav"
-
+    
+    # 1. Fluency analysis first
+    # FIX: Use a robust split method to avoid errors from punctuation/whitespace
+    import re
+    word_tokens = re.findall(r'\b\w+\b', transcript)
+    total_words = len(word_tokens) 
     
     # Collect all text markers from the updated functions
     filler_apology_markers: List[TextMarker] = detect_fillers_and_apologies(transcript)
@@ -173,6 +190,18 @@ def perform_analysis_job(
     
     all_text_markers = filler_apology_markers + repetition_markers + custom_markers
     
+    # Calculate counts for metrics based on the markers
+    filler_word_count = len([m for m in all_text_markers if m.type == 'filler'])
+    repetition_count = len([m for m in all_text_markers if m.type == 'repetition']) 
+    apology_count = len([m for m in all_text_markers if m.type == 'apology']) 
+    
+    # Initialize values
+    duration_seconds = 0.0
+    speaking_pace_wpm = 0.0
+    emotion = "Neutral"
+    confidence_score = 0.0
+    
+    try:
         # 2. Download (Original raw file)
         logger.info(f"⬇️ Downloading s3://{S3_BUCKET_NAME}/{s3_key}...")
         s3_client.download_file(S3_BUCKET_NAME, s3_key, temp_audio_file)
@@ -264,6 +293,22 @@ def perform_analysis_job(
              long_pause_count += 1
         # END FIX
 
+        # Uses the new NumPy/SciPy function
+        pitch_mean, pitch_std = calculate_pitch_stats(y, sr)
+        logger.info(f"📊 Pitch stats: mean={pitch_mean:.1f}Hz, std={pitch_std:.1f}Hz")
+        
+        audio_features_for_score = {
+            "rms_mean": float(rms),
+            "rms_std": float(energy_std), 
+            "speaking_pace_wpm": speaking_pace_wpm,
+            "pitch_std": float(pitch_std),
+            "pitch_mean": float(pitch_mean),
+        }
+        
+        # Uses the new NumPy/SciPy function
+        acoustic_disfluencies = detect_acoustic_disfluencies(y, sr)
+        serializable_disfluencies = [d._asdict() for d in acoustic_disfluencies]
+        
         # Recalculate fluency metrics for scoring
         fluency_metrics_for_score = {
             "filler_word_count": filler_word_count,
@@ -337,7 +382,36 @@ def perform_analysis_job(
             "pitch_mean": round(float(pitch_mean), 2),  # 🔥 MUST be here
             "pitch_std": round(float(pitch_std), 2),  # 🔥 MUST be here
             "avg_amplitude": round(float(rms), 6),
-            "energy_std": round(float(energy_std), 
+            "energy_std": round(float(energy_std), 6),
+
+            # ===== ANALYSIS DETAILS =====
+            "emotion": emotion.lower(),
+            "acoustic_disfluency_count": len(serializable_disfluencies),
+
+            # ===== TEXT & HIGHLIGHTING =====
+            "transcript": transcript,
+            "highlight_markers": [m._asdict() for m in all_text_markers],
+            "transcript_markers": [m._asdict() for m in all_text_markers],
+
+            # ===== RECOMMENDATIONS =====
+            "recommendations": llm_recommendations,
+        }
+
+        # 🔥 CRITICAL: Log ALL metrics before returning
+        logger.info(
+            f"✅ FINAL RESULT COMPILED with metrics:\n"
+            f"  - Confidence: {round(confidence_score, 2)}/100\n"
+            f"  - Speaking Pace: {int(round(speaking_pace_wpm))} WPM\n"
+            f"  - Total Words: {total_words}\n"
+            f"  - Filler Words: {filler_word_count}\n"
+            f"  - Repetitions: {repetition_count}\n"
+            f"  - Long Pauses: {int(long_pause_count)}\n"
+            f"  - Silence Ratio: {round(float(silence_ratio), 4)}\n"
+            f"  - Pitch Mean: {round(float(pitch_mean), 2)} Hz\n"
+            f"  - Pitch Std: {round(float(pitch_std), 2)} Hz\n"
+            f"  - Markers: {len(all_text_markers)}\n"
+            f"  - Recommendations: {len(llm_recommendations)}"
+        )
 
         logger.info(f"✅ Analysis complete in {round(time.time() - job_start_time, 2)}s.")
         
@@ -353,7 +427,17 @@ def perform_analysis_job(
         if os.path.exists(temp_wav_file): os.remove(temp_wav_file)
         raise
 
-fault'], connection=redis_conn)
+# --- Worker Entrypoint (Unchanged) ---
+if __name__ == '__main__':
+    redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379')
+    logger.info(f"Starting worker and connecting to Redis at: {redis_url}")
+    
+    try:
+        redis_conn = Redis.from_url(redis_url)
+        redis_conn.ping()
+        logger.info("✅ Redis connection established")
+        
+        worker = Worker(['default'], connection=redis_conn)
         worker.work()
 
     except Exception as e:
@@ -361,5 +445,3 @@ fault'], connection=redis_conn)
         if 'redis' in str(e).lower():
             logger.critical("⚠️ Check your REDIS_URL and network configuration.")
         exit(1)
-
-
