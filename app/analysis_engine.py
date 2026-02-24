@@ -3,7 +3,16 @@
 import numpy as np
 import soundfile as sf
 import subprocess
+import json
+import logging
+import re
+from typing import Dict, Any, List, Tuple, NamedTuple, Optional
+from scipy.signal import find_peaks, butter, lfilter
+from scipy.stats import zscore
+from sklearn.preprocessing import StandardScaler 
 
+# --- Configuration & Constants ---
+TARGET_SR = 16000 
 MAX_DURATION_SECONDS = 120 
 logger = logging.getLogger(__name__)
 
@@ -12,7 +21,50 @@ logger = logging.getLogger(__name__)
 # Time-based marker for acoustic/audio events
 class DisfluencyResult(NamedTuple):
     type: str # 'block', 'prolongation'
- 
+    start_time_s: float
+    duration_s: float
+
+# Index-based marker for textual events (CRITICAL for Flutter highlighting)
+class TextMarker(NamedTuple):
+    type: str # 'filler', 'repetition', 'apology', 'tangent', 'meta_commentary', 'self_correction'
+    word: str
+    start_char_index: int
+    end_char_index: int
+
+
+# --- 1. Core Feature Extraction (FFprobe/FFmpeg Safe) ---
+def extract_audio_features(file_path: str) -> Dict[str, Any]:
+    """
+    Safely extracts duration using ffprobe for any format (M4A/WAV).
+    """
+    features: Dict[str, Any] = {'duration_s': 0.0, 'sample_rate': 0}
+    try:
+        command = [
+            'ffprobe', '-v', 'error',
+            '-show_entries', 'format=duration:stream=sample_rate',
+            '-of', 'json', file_path
+        ]
+        result = subprocess.run(command, capture_output=True, text=True, check=True)
+        probe_data = json.loads(result.stdout)
+        duration = float(probe_data['format']['duration'])
+        features['duration_s'] = duration
+        if 'streams' in probe_data and probe_data['streams']:
+            sample_rate = int(probe_data['streams'][0].get('sample_rate', TARGET_SR))
+            features['sample_rate'] = sample_rate
+        else:
+            features['sample_rate'] = TARGET_SR
+        return features
+    except subprocess.CalledProcessError as e:
+        logger.error(f"FFprobe duration extraction failed: {e.stderr}")
+        raise RuntimeError(f"FFprobe duration extraction failed: {e.__class__.__name__}")
+    except Exception as e:
+        logger.error(f"Error during audio feature extraction (FFprobe): {e}")
+        raise RuntimeError(f"Error during audio feature extraction (FFprobe): {e.__class__.__name__}")
+
+# --- 2. Textual Analysis Functions (MODIFIED FOR HIGHLIGHTING) ---
+
+def detect_fillers_and_apologies(transcript: str) -> List[TextMarker]:
+    """
     Detects filler words, laughter, and common apologetic phrases, returning TextMarkers with indices.
     Uses comprehensive lists of common filler words and patterns that work for any speaker.
     """
@@ -198,6 +250,21 @@ def classify_emotion_simple(wav_file_path: str, model, scaler) -> str:
         logger.warning(f"Emotion classification failed: {e}")
         return "unknown"
 
+
+def butter_highpass(cutoff, fs, order=5):
+    nyq = 0.5 * fs
+    normal_cutoff = cutoff / nyq
+    b, a = butter(order, normal_cutoff, btype='high', analog=False)
+    return b, a
+    
+def calculate_pitch_stats(y: np.ndarray, sr: int) -> Tuple[float, float]:
+    cutoff_freq = 80  
+    b, a = butter_highpass(cutoff_freq, sr)
+    y_filtered = lfilter(b, a, y)
+    frame_size = int(0.02 * sr)
+    hop_size = int(0.01 * sr)
+    f0_estimates = []
+    
     for i in range(0, len(y_filtered) - frame_size, hop_size):
         frame = y_filtered[i:i + frame_size]
         if np.mean(frame**2) > 0.0001:
@@ -309,7 +376,20 @@ def score_confidence(audio_features: Dict[str, Any], fluency_metrics: Dict[str, 
         pace_score = (pace_wpm / 80) * 40  # 0-40 for too slow
     elif pace_wpm > 200:
         pace_score = max(0, 100 - ((pace_wpm - 200) / 100) * 40)  # Penalize too fast
+    else:
+        # 80-200 WPM: score based on distance from ideal
+        deviation = abs(pace_wpm - ideal_pace)
+        pace_score = 100 - (deviation / ideal_pace) * 30  # 70-100 for normal range
 
+    pace_score = np.clip(pace_score, 0, 100)
+
+    # 2. FLUENCY SCORING (0-100)
+    total_words = max(1, fluency_metrics.get('total_words', 1))
+    fillers = fluency_metrics.get('filler_word_count', 0)
+    reps = fluency_metrics.get('repetition_count', 0)
+    acoustic = fluency_metrics.get('acoustic_disfluency_count', 0)
+
+    disfluency_rate = (fillers + reps + acoustic) / total_words
 
     # Realistic thresholds: average person has some fillers
     if disfluency_rate == 0:
@@ -342,10 +422,47 @@ def score_confidence(audio_features: Dict[str, Any], fluency_metrics: Dict[str, 
     else:
         pitch_score = 50  # Too variable
 
+    pitch_score = np.clip(pitch_score, 0, 100)
+
+    # 4. ENERGY SCORING (0-100)
+    energy_std = audio_features.get('energy_std', 0)
+    rms_mean = audio_features.get('rms_mean', 0)
+
+    if rms_mean == 0:
+        energy_score = 30  # Too quiet
+    elif rms_mean < 0.01:
+        energy_score = 40  # Quiet
+    elif rms_mean > 0.3:
+        energy_score = 60  # Very loud
+    else:
+        energy_score = 75 + (energy_std / 0.02) * 15  # 75-90 with variation
+
+    energy_score = np.clip(energy_score, 0, 100)
+
+    # 5. SILENCE SCORING (0-100)
+    silence_ratio = audio_features.get('silence_ratio', 0)
+
+    if silence_ratio < 0.1:
+        silence_score = 100  # Little silence is good
+    elif silence_ratio < 0.3:
+        silence_score = 90  # Normal
+    elif silence_ratio < 0.5:
+        silence_score = 70  # Acceptable
+    else:
+        silence_score = max(40, 100 - silence_ratio * 100)  # Too much silence
+
+    silence_score = np.clip(silence_score, 0, 100)
+
+    # FINAL SCORE (weighted average, 0-100 scale)
+    final_score = (
+        pace_score * WEIGHTS['pace'] +
+        fluency_score * WEIGHTS['fluency'] +
+        pitch_score * WEIGHTS['pitch'] +
+        energy_score * WEIGHTS['energy'] +
+        silence_score * WEIGHTS['silence']
+    )
 
     # Clamp between 20-100 (20 is lowest possible, 100 is perfect)
     final_score = np.clip(final_score, 20, 100)
 
     return round(final_score, 1)  # Return as 0-100 scale
-
-
