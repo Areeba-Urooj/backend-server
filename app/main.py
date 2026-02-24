@@ -1,447 +1,380 @@
-# analysis_worker.py
+# app/main.py
 
 import os
-import logging
-from typing import Dict, Any, Optional, List, Tuple
-import time
 import sys
-import subprocess
-import numpy as np
-import soundfile as sf
-import json
+import logging
+from uuid import uuid4
+from typing import Dict, Any, Optional, List 
 
-# --- IMPORTS FOR OPENAI (MANUAL HTTP) ---
-import httpx
-# ------------------------------------
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from io import BytesIO
 
 import boto3
 from botocore.exceptions import ClientError
-from redis import Redis
-from rq import Worker 
 
-# Import ALL necessary functions and constants from the engine (UPDATED IMPORTS)
-from analysis_engine import ( 
-    detect_fillers_and_apologies, # New function
-    detect_repetitions_for_highlighting, # New function
-    detect_custom_markers, # New function
-    score_confidence, 
-    initialize_emotion_model,
-    classify_emotion_simple,
-    calculate_pitch_stats, 
-    detect_acoustic_disfluencies, 
-    extract_audio_features,      
-    MAX_DURATION_SECONDS,
-    TextMarker # Import new NamedTuple
-)
+import redis
+from rq import Queue
+from rq.job import Job
+from pydantic import BaseModel, Field, ValidationError 
+
+# Ensure app path is included
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# --- Pydantic Models for Data Structures ---
+class TextMarker(BaseModel):
+    type: str
+    word: str 
+    start_char_index: int
+    end_char_index: int
+
+class AnalysisResult(BaseModel):
+    confidence_score: float
+    speaking_pace: int
+    filler_word_count: int
+    repetition_count: int
+    long_pause_count: int  # Change from float to int
+    silence_ratio: float
+    avg_amplitude: float
+    pitch_mean: float
+    pitch_std: float
+    emotion: str
+    energy_std: float
+    recommendations: List[str]
+    transcript: str
+    total_words: Optional[int] = None
+    duration_seconds: Optional[float] = None
+    transcript_markers: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class AnalysisStatusResponse(BaseModel):
+    job_id: str
+    status: str
+    enqueued_at: Optional[str] = None
+    started_at: Optional[str] = None
+    ended_at: Optional[str] = None
+    result: Optional[AnalysisResult] = None 
+    error: Optional[str] = None
 
 # --- Configuration ---
 S3_BUCKET_NAME = os.environ.get('S3_BUCKET_NAME')
 AWS_REGION = os.environ.get('AWS_REGION', 'eu-north-1') 
-TARGET_SR = 16000 
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") 
 
 # --- Logging Setup ---
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s | %(levelname)s | [WORKER] - %(message)s'
+    format='%(asctime)s | %(levelname)s | %(name)s:%(lineno)d - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# --- S3 Client Initialization (Unchanged) ---
+# --- Redis & RQ Setup ---
+def get_redis_connection():
+    """Initializes and returns the Redis connection."""
+    redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379')
+    logger.info(f"[MAIN] Connecting to Redis at: {redis_url}")
+    try:
+        conn = redis.from_url(redis_url)
+        conn.ping()
+        logger.info("[MAIN] ✅ Successfully connected to Redis")
+        return conn
+    except Exception as e:
+        logger.error(f"[MAIN] ❌ Failed to connect to Redis: {e}", exc_info=True)
+        raise RuntimeError("Failed to connect to Redis for RQ.") from e
+
+try:
+    redis_conn = get_redis_connection()
+    queue = Queue('default', connection=redis_conn) 
+except RuntimeError:
+    redis_conn = None
+    queue = None
+
+# --- S3 Client Initialization ---
 def get_s3_client():
+    """Initializes and returns the S3 client."""
     if not S3_BUCKET_NAME:
-        logger.error("[WORKER] ❌ S3_BUCKET_NAME environment variable is not set.")
+        logger.error("[MAIN] ❌ S3_BUCKET_NAME environment variable is not set.")
         raise ValueError("S3_BUCKET_NAME is not configured.")
     return boto3.client('s3', region_name=AWS_REGION)
 
 try:
     s3_client = get_s3_client()
-    logger.info(f"[WORKER] ✅ S3 Client initialized for bucket: {S3_BUCKET_NAME} in region: {AWS_REGION}")
-except Exception as e:
-    logger.error(f"[WORKER] ❌ S3 Initialization failed: {e}")
-    raise
-    
-# --- Global ML Model/Scaler Initialization (Unchanged) ---
-try:
-    EMOTION_MODEL, EMOTION_SCALER, _ = initialize_emotion_model() 
-    logger.info("[WORKER] ✅ Emotion model and scaler initialized/loaded.")
-except Exception as e:
-    logger.error(f"[WORKER] ❌ Failed to initialize emotion model: {e}", exc_info=True)
-    EMOTION_MODEL, EMOTION_SCALER = None, None
+    logger.info(f"[MAIN] ✅ S3 Client initialized for bucket: {S3_BUCKET_NAME} in region: {AWS_REGION}")
+except ValueError:
+    s3_client = None
 
-# --- Intelligent Feedback Generation Function (Unchanged) ---
-def generate_intelligent_feedback(transcript: str, metrics: Dict[str, Any]) -> List[str]:
-    """Generates tailored feedback and recommendations using a direct HTTP request."""
-    # ... (function body remains unchanged) ...
-    if not OPENAI_API_KEY:
-        logger.warning("[OPENAI] Skipping feedback generation: OPENAI_API_KEY not set.")
-        return ["Error: Feedback service is unavailable (API key not configured)."]
-        
-    acoustic_count = metrics.get('acoustic_disfluency_count', 0)
-    
-    metrics_summary = json.dumps({
-        "Duration (Seconds)": metrics.get('duration_seconds', 0.0),
-        "Total Words": metrics.get('total_words', 0),
-        "Pace (Words per Minute)": metrics.get('speaking_pace', 0),
-        "Filler Word Count": metrics.get('filler_word_count', 0),
-        "Repetition Count": metrics.get('repetition_count', 0),
-        "Acoustic Disfluency Count (Blocks/Stutters)": acoustic_count, 
-        "Silence Ratio": f"{metrics.get('silence_ratio', 0.0) * 100:.2f}%",
-        "Emotion Detected": metrics.get('emotion'),
-        "Confidence Score": f"{metrics.get('confidence_score', 0.0):.2f}",
-    }, indent=2)
-    
-    system_prompt = (
-        "You are an expert speech coach and a genuine mentor. Your primary goal is to provide encouraging, "
-        "personalized, and highly actionable guidance, making the user feel seen and understood, not just analyzed. "
-        "Do not use generic phrases like 'great job' or 'keep practicing.' "
-        "Your feedback MUST directly reference a specific element from the **Transcript** or **Metrics** to justify the recommendation. "
-        "For example, instead of 'Improve pacing,' say 'Your pace was highly consistent for the first 30 seconds; let's maintain that control through the entire minute.' "
-        "Generate a structured list of exactly three specific recommendations. "
-        "The response MUST be a JSON array of strings wrapped in a single key called 'recommendations' "
-        "(e.g., {'recommendations': ['Tip 1', 'Tip 2', 'Tip 3']}). Do not include any introductory text, "
-        "closing remarks, or numbering outside the array."
-    )
-    
-    user_prompt = (
-        f"Transcript (First 1000 characters):\n---\n{transcript[:1000]}...\n---\n"
-        f"Analysis Metrics:\n---\n{metrics_summary}\n---\n"
-        "Based on these, generate a JSON object with a single key 'recommendations' containing a list of 3 specific recommendations."
-    )
+# --- FastAPI App Initialization ---
+app = FastAPI(
+    title="Audio Analysis API",
+    version="1.0.0",
+    description="API for uploading audio and queuing analysis jobs."
+)
 
-    api_url = "https://api.openai.com/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json"
-    }
+# CORS configuration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- Pydantic Models for Response ---
+class SubmissionResponse(BaseModel):
+    file_id: str
+    job_id: str
+    message: str
+
+class UploadResponse(BaseModel):
+    file_id: str
+    s3_key: str
+    message: str
+
+# --- API Endpoints ---
+
+@app.get("/")
+def health_check():
+    """Basic health check."""
+    return {"status": "ok", "message": "Audio Analysis API is running."}
+
+@app.post("/upload", response_model=UploadResponse)
+async def upload_audio_file(
+    file: UploadFile = File(...)
+):
+    """Receives an audio file and uploads it to S3."""
+    if not s3_client or not S3_BUCKET_NAME:
+        raise HTTPException(status_code=503, detail="S3 storage service is unavailable.")
     
-    payload = {
-        "model": "gpt-4o-mini",
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
-        ],
-        "response_format": {"type": "json_object"}, 
-        "temperature": 0.7
-    }
+    file_extension = os.path.splitext(file.filename)[1] or ".m4a"
+    file_uuid = str(uuid4())
+    s3_key = f"uploads/{file_uuid}{file_extension}"
 
     try:
-        logger.info("[OPENAI] Calling Chat API manually using httpx...")
+        logger.info(f"[API] ⬆️ Starting S3 upload to key: {s3_key}")
         
-        with httpx.Client(trust_env=False) as client:
-            client.proxies = {} 
-            
-            response = client.post(
-                api_url,
-                headers=headers,
-                json=payload,
-                timeout=60.0
+        s3_client.upload_fileobj(
+            Fileobj=file.file,
+            Bucket=S3_BUCKET_NAME,
+            Key=s3_key,
+            ExtraArgs={
+                'ContentType': file.content_type
+            }
+        )
+        
+        logger.info(f"[API] ✅ S3 upload complete for S3 Key: {s3_key}")
+
+        return JSONResponse(content={
+            "file_id": file_uuid,
+            "s3_key": s3_key,
+            "message": "File uploaded successfully."
+        }, status_code=200)
+
+    except ClientError as e:
+        logger.error(f"[API] ❌ S3 Error during upload: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"S3 Upload Failed: {e.response['Error'].get('Message', 'Unknown S3 error')}"
+        )
+    except Exception as e:
+        logger.error(f"[API] ❌ General Error during upload: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"An error occurred while processing the upload: {str(e)}"
+        )
+
+@app.post("/upload/pdf", response_model=UploadResponse)
+async def upload_pdf_file(
+    file: UploadFile = File(...),
+    user_id: str = Form(...),
+    recording_id: str = Form(...)
+):
+    """Receives a PDF analysis report and uploads it to a specific S3 path."""
+    if not s3_client or not S3_BUCKET_NAME:
+        raise HTTPException(status_code=503, detail="S3 storage service is unavailable.")
+    
+    # Specific path requested by the client: pdfs/[userId]/[recordingId]_analysis.pdf
+    s3_key = f"pdfs/{user_id}/{recording_id}_analysis.pdf"
+
+    try:
+        logger.info(f"[API] ⬆️ Starting PDF S3 upload to key: {s3_key}")
+        
+        s3_client.upload_fileobj(
+            Fileobj=file.file,
+            Bucket=S3_BUCKET_NAME,
+            Key=s3_key,
+            ExtraArgs={
+                'ContentType': 'application/pdf'
+            }
+        )
+        
+        logger.info(f"[API] ✅ PDF S3 upload complete for S3 Key: {s3_key}")
+
+        return JSONResponse(content={
+            "file_id": recording_id,
+            "s3_key": s3_key,
+            "message": "PDF uploaded successfully."
+        }, status_code=200)
+
+    except ClientError as e:
+        logger.error(f"[API] ❌ S3 Error during PDF upload: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"S3 PDF Upload Failed: {e.response['Error'].get('Message', 'Unknown S3 error')}"
+        )
+    except Exception as e:
+        logger.error(f"[API] ❌ General Error during PDF upload: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"An error occurred while processing the PDF upload: {str(e)}"
+        )
+
+@app.get("/api/v1/pdf/download")
+async def download_pdf(s3_key: str):
+    """Downloads a PDF from S3 and returns it as a streaming response."""
+    if not s3_client or not S3_BUCKET_NAME:
+        raise HTTPException(status_code=503, detail="S3 storage service is unavailable.")
+    
+    try:
+        logger.info(f"[API] 📥 Downloading PDF from S3: {s3_key}")
+        
+        # Get object from S3
+        response = s3_client.get_object(
+            Bucket=S3_BUCKET_NAME,
+            Key=s3_key
+        )
+        
+        # Read the PDF data
+        pdf_data = response['Body'].read()
+        
+        logger.info(f"[API] ✅ PDF downloaded successfully: {s3_key} ({len(pdf_data)} bytes)")
+        
+        # Return as streaming response
+        return StreamingResponse(
+            BytesIO(pdf_data),
+            media_type='application/pdf',
+            headers={
+                'Content-Disposition': f'attachment; filename="{os.path.basename(s3_key)}"',
+                'Content-Length': str(len(pdf_data)),
+            }
+        )
+        
+    except ClientError as e:
+        error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+        if error_code == 'NoSuchKey':
+            logger.error(f"[API] ❌ PDF not found in S3: {s3_key}")
+            raise HTTPException(status_code=404, detail=f"PDF not found: {s3_key}")
+        else:
+            logger.error(f"[API] ❌ S3 Error during PDF download: {e}", exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail=f"S3 Download Failed: {e.response['Error'].get('Message', 'Unknown S3 error')}"
             )
-        
-        response.raise_for_status() 
-        
-        feedback_data = response.json()
-        feedback_json_str = feedback_data['choices'][0]['message']['content']
-        
-        recommendation_data = json.loads(feedback_json_str)
-        recommendations = recommendation_data.get('recommendations', []) 
-        
-        if isinstance(recommendations, list) and all(isinstance(r, str) for r in recommendations):
-            logger.info(f"[OPENAI] Successfully generated {len(recommendations)} recommendations.")
-            return recommendations
-        else:
-            logger.error(f"[OPENAI] Generated feedback was not a list of strings: {recommendation_data}")
-            return ["Feedback generation failed: Model returned incorrect format."]
-
-    except httpx.RequestError as e:
-        logger.error(f"[OPENAI] HTTP request error: {e}")
-        return [f"An error occurred connecting to the feedback service: {e.__class__.__name__}"]
-    except httpx.HTTPStatusError as e:
-        logger.error(f"[OPENAI] HTTP status error: {e.response.status_code} - {e.response.text}")
-        return [f"Feedback service returned an error: {e.response.status_code}"]
-    except (json.JSONDecodeError, Exception) as e:
-        logger.error(f"[OPENAI] API call or JSON decoding failed: {e.__class__.__name__}: {e}")
-        return [f"An error occurred during intelligent feedback generation: {e.__class__.__name__}"]
-
-# --- Core Analysis Function (UPDATED) ---
-def perform_analysis_job(
-    file_id: str, 
-    s3_key: str, 
-    transcript: str, 
-    user_id: Optional[str] = None
-) -> Dict[str, Any]:
-    """Worker function to fetch audio, perform analysis, and return results."""
-    job_start_time = time.time()
-    logger.info(f"🚀 Starting analysis for file_id: {file_id}, s3_key: {s3_key}")
-
-    temp_audio_file = f"/tmp/{file_id}_{os.path.basename(s3_key)}"
-    temp_wav_file = f"/tmp/{file_id}_converted.wav"
-    
-    # 1. Fluency analysis first
-    # FIX: Use a robust split method to avoid errors from punctuation/whitespace
-    import re
-    word_tokens = re.findall(r'\b\w+\b', transcript)
-    total_words = len(word_tokens) 
-    
-    # Collect all text markers from the updated functions
-    filler_apology_markers: List[TextMarker] = detect_fillers_and_apologies(transcript)
-    repetition_markers: List[TextMarker] = detect_repetitions_for_highlighting(transcript)
-    custom_markers: List[TextMarker] = detect_custom_markers(transcript)
-    
-    all_text_markers = filler_apology_markers + repetition_markers + custom_markers
-    
-    # Calculate counts for metrics based on the markers
-    filler_word_count = len([m for m in all_text_markers if m.type == 'filler'])
-    repetition_count = len([m for m in all_text_markers if m.type == 'repetition']) 
-    apology_count = len([m for m in all_text_markers if m.type == 'apology']) 
-    
-    # Initialize values
-    duration_seconds = 0.0
-    speaking_pace_wpm = 0.0
-    emotion = "Neutral"
-    confidence_score = 0.0
-    
-    try:
-        # 2. Download (Original raw file)
-        logger.info(f"⬇️ Downloading s3://{S3_BUCKET_NAME}/{s3_key}...")
-        s3_client.download_file(S3_BUCKET_NAME, s3_key, temp_audio_file)
-        
-        # 3. Safe Duration Check on the raw file
-        audio_features_raw = extract_audio_features(temp_audio_file)
-        audio_duration = audio_features_raw.get('duration_s', 0.0)
-        
-        if audio_duration > MAX_DURATION_SECONDS:
-             logger.warning(f"⚠️ Audio duration {audio_duration:.2f}s exceeds limit of {MAX_DURATION_SECONDS}s.")
-        
-        # 4. Conversion to WAV 
-        ffmpeg_command = ["ffmpeg", "-i", temp_audio_file, "-ac", "1", "-ar", str(TARGET_SR), "-y", temp_wav_file]
-        
-        try:
-            subprocess.run(ffmpeg_command, capture_output=True, text=True, check=True)
-            logger.info("✅ FFmpeg conversion successful.")
-        except subprocess.CalledProcessError as e:
-            logger.error(f"❌ FFmpeg conversion failed: {e.stderr}", exc_info=True)
-            raise Exception("FFmpeg conversion failed.")
-        except FileNotFoundError:
-            logger.error("❌ FFmpeg command not found. Ensure FFmpeg is installed and in PATH.")
-            raise Exception("FFmpeg not available in the worker environment.")
-            
-        # 5. Load the converted WAV file 
-        y, sr = sf.read(temp_wav_file, dtype='float32', always_2d=False)
-        if len(y.shape) > 1:
-            y = np.mean(y, axis=1)
-
-        # Truncate 'y' (if conversion didn't handle duration limit, or for safety)
-        max_samples = sr * MAX_DURATION_SECONDS
-        if len(y) > max_samples:
-            y = y[:max_samples]
-            
-        duration_seconds = len(y) / sr
-        
-        # FIX: Calculate WPM defensively
-        if duration_seconds > 0:
-            speaking_pace_wpm = (total_words / duration_seconds) * 60
-            logger.info(f"📊 Speaking pace calculated: {speaking_pace_wpm:.1f} WPM")
-        else:
-            speaking_pace_wpm = 0.0
-            logger.warning("⚠️ Duration is 0, cannot calculate speaking pace")
-
-        # 6. Feature Extraction & Acoustic Analysis
-        logger.info("📈 Extracting audio features and metrics...")
-        
-        # --- Audio Feature Calculation (Numpy/SciPy based on 'y') ---
-        rms = np.sqrt(np.mean(y**2)) 
-        avg_amplitude = np.mean(np.abs(y))
-        energy_std = np.std(np.abs(y)) 
-        
-        # Simple silence calculation based on RMS frames
-        frame_len = int(sr * 0.05) 
-        hop_len = int(sr * 0.01)    
-        
-        num_frames = (len(y) - frame_len) // hop_len + 1
-        rms_frames = np.array([np.sqrt(np.mean(y[i*hop_len : i*hop_len + frame_len]**2)) for i in range(num_frames)])
-        
-        # FIX: Use a more robust threshold or ensure it's not too sensitive
-        rms_threshold = np.mean(rms_frames) * 0.2 # Adjusted from 0.1 to 0.2 for better robustness 
-        silence_frames = np.sum(rms_frames < rms_threshold)
-        total_frames = len(rms_frames)
-        silence_ratio = silence_frames / total_frames if total_frames > 0 else 0.0
-        logger.info(f"📊 Silence ratio: {silence_ratio:.2%} ({silence_frames}/{total_frames} frames)")
-        
-        # FIX for long_pause_count: Calculate the actual count of DISTINCT long pause events
-        long_pause_duration_frames = int(0.5 / (hop_len / sr)) # 0.5 second pause minimum
-        
-        is_silence = rms_frames < rms_threshold
-        long_pause_count = 0
-        in_long_pause = False
-        pause_start_frame = -1
-
-        for i in range(len(is_silence)):
-            if is_silence[i]:
-                if not in_long_pause:
-                    in_long_pause = True
-                    pause_start_frame = i
-            elif in_long_pause:
-                # End of silence segment
-                pause_duration_frames = i - pause_start_frame
-                if pause_duration_frames >= long_pause_duration_frames:
-                    long_pause_count += 1
-                in_long_pause = False
-
-        # Check for pause at the very end
-        if in_long_pause and (len(is_silence) - pause_start_frame) >= long_pause_duration_frames:
-             long_pause_count += 1
-        # END FIX
-
-        # Uses the new NumPy/SciPy function
-        pitch_mean, pitch_std = calculate_pitch_stats(y, sr)
-        logger.info(f"📊 Pitch stats: mean={pitch_mean:.1f}Hz, std={pitch_std:.1f}Hz")
-        
-        audio_features_for_score = {
-            "rms_mean": float(rms),
-            "rms_std": float(energy_std), 
-            "speaking_pace_wpm": speaking_pace_wpm,
-            "pitch_std": float(pitch_std),
-            "pitch_mean": float(pitch_mean),
-        }
-        
-        # Uses the new NumPy/SciPy function
-        acoustic_disfluencies = detect_acoustic_disfluencies(y, sr)
-        serializable_disfluencies = [d._asdict() for d in acoustic_disfluencies]
-        
-        # Recalculate fluency metrics for scoring
-        fluency_metrics_for_score = {
-            "filler_word_count": filler_word_count,
-            "repetition_count": repetition_count,
-            "acoustic_disfluency_count": len(serializable_disfluencies),
-            "total_words": total_words,
-        }
-        
-        confidence_score = score_confidence(audio_features_for_score, fluency_metrics_for_score)
-        
-        # Emotion Classification
-        emotion = classify_emotion_simple(temp_wav_file, EMOTION_MODEL, EMOTION_SCALER)
-        
-        # 7. Compile Core Metrics for LLM (UPDATED)
-        core_analysis_metrics = {
-            # Core metrics
-            "confidence_score": round(confidence_score, 2),
-            "speaking_pace": int(round(speaking_pace_wpm)),  # ✅ MUST be here
-            "total_words": total_words,  # ✅ MUST be here
-            "duration_seconds": round(duration_seconds, 2),
-
-            # Fluency metrics
-            "filler_word_count": filler_word_count,  # ✅ MUST be here
-            "repetition_count": repetition_count,  # ✅ MUST be here
-            "apology_count": apology_count,
-
-            # Acoustic metrics
-            "long_pause_count": int(long_pause_count),  # ✅ MUST be int
-            "silence_ratio": round(silence_ratio, 4),
-
-            # Audio features
-            "pitch_mean": round(float(pitch_mean), 2),
-            "pitch_std": round(float(pitch_std), 2),
-            "avg_amplitude": round(float(rms), 6),
-            "energy_std": round(float(energy_std), 4),
-
-            # Other
-            "emotion": emotion.lower(),
-            "acoustic_disfluency_count": len(serializable_disfluencies),
-            "transcript": transcript,
-
-            # 🔥 CRITICAL: Include transcript_markers for highlighting
-            "transcript_markers": [m._asdict() for m in all_text_markers],
-        }
-
-        # 8. Generate Intelligent Feedback
-        logger.info("🤖 Generating intelligent feedback using OpenAI...")
-        llm_recommendations = generate_intelligent_feedback(
-            transcript=transcript,
-            metrics=core_analysis_metrics
+    except Exception as e:
+        logger.error(f"[API] ❌ General Error during PDF download: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"An error occurred while downloading the PDF: {str(e)}"
         )
 
-        # 9. Compile COMPLETE Final Result with ALL metrics
-        final_result = {
-            # ===== CORE METRICS =====
-            "confidence_score": round(confidence_score, 2),
-            "speaking_pace": int(round(speaking_pace_wpm)),  # 🔥 MUST be here
-            "total_words": total_words,  # ✅ Already working
-            "duration_seconds": round(duration_seconds, 2),
+@app.post("/api/v1/analysis/submit", response_model=SubmissionResponse)
+async def submit_analysis_job(
+    s3_key: str = Form(..., description="The S3 Key of the uploaded file."),
+    transcript: str = Form(..., description="The full transcription of the audio file."),
+    user_id: str = Form(..., description="The ID of the authenticated user.")
+):
+    """Queues an audio analysis job using s3_key and transcript."""
+    if not queue:
+        raise HTTPException(status_code=503, detail="RQ/Redis service is unavailable.")
 
-            # ===== FLUENCY METRICS =====
-            "filler_word_count": filler_word_count,  # 🔥 MUST be here
-            "repetition_count": repetition_count,  # ✅ Already working (shows 3)
-            "apology_count": apology_count,
+    file_id = os.path.splitext(os.path.basename(s3_key))[0]
 
-            # ===== ACOUSTIC METRICS =====
-            "long_pause_count": int(long_pause_count),  # 🔥 MUST be here (convert to int)
-            "silence_ratio": round(float(silence_ratio), 4),  # 🔥 MUST be here
+    try:
+        job = queue.enqueue(
+            'app.analysis_worker.perform_analysis_job', 
+            kwargs={
+                'file_id': file_id,
+                's3_key': s3_key,
+                'transcript': transcript,
+                'user_id': user_id,
+            },
+            job_timeout='30m', 
+            serializer='json' 
+        )
+        
+        logger.info(f"[API] 📝 Job enqueued successfully. Job ID: {job.id}")
 
-            # ===== AUDIO FEATURES =====
-            "pitch_mean": round(float(pitch_mean), 2),  # 🔥 MUST be here
-            "pitch_std": round(float(pitch_std), 2),  # 🔥 MUST be here
-            "avg_amplitude": round(float(rms), 6),
-            "energy_std": round(float(energy_std), 6),
+        return JSONResponse(content={
+            "file_id": file_id,
+            "job_id": job.id,
+            "message": "Analysis job queued."
+        }, status_code=200)
 
-            # ===== ANALYSIS DETAILS =====
-            "emotion": emotion.lower(),
-            "acoustic_disfluency_count": len(serializable_disfluencies),
-
-            # ===== TEXT & HIGHLIGHTING =====
-            "transcript": transcript,
-            "highlight_markers": [m._asdict() for m in all_text_markers],
-            "transcript_markers": [m._asdict() for m in all_text_markers],
-
-            # ===== RECOMMENDATIONS =====
-            "recommendations": llm_recommendations,
-        }
-
-        # 🔥 CRITICAL: Log ALL metrics before returning
-        logger.info(
-            f"✅ FINAL RESULT COMPILED with metrics:\n"
-            f"  - Confidence: {round(confidence_score, 2)}/100\n"
-            f"  - Speaking Pace: {int(round(speaking_pace_wpm))} WPM\n"
-            f"  - Total Words: {total_words}\n"
-            f"  - Filler Words: {filler_word_count}\n"
-            f"  - Repetitions: {repetition_count}\n"
-            f"  - Long Pauses: {int(long_pause_count)}\n"
-            f"  - Silence Ratio: {round(float(silence_ratio), 4)}\n"
-            f"  - Pitch Mean: {round(float(pitch_mean), 2)} Hz\n"
-            f"  - Pitch Std: {round(float(pitch_std), 2)} Hz\n"
-            f"  - Markers: {len(all_text_markers)}\n"
-            f"  - Recommendations: {len(llm_recommendations)}"
+    except Exception as e:
+        logger.error(f"[API] ❌ Error during job enqueue: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to submit analysis job: {str(e)}"
         )
 
-        logger.info(f"✅ Analysis complete in {round(time.time() - job_start_time, 2)}s.")
+@app.get("/api/v1/analysis/status/{job_id}", response_model=AnalysisStatusResponse)
+def get_analysis_status(job_id: str):
+    """Retrieves the status and result of an RQ job."""
+    if not redis_conn:
+        raise HTTPException(status_code=503, detail="RQ/Redis service is unavailable.")
         
-        # 10. Cleanup
-        if os.path.exists(temp_audio_file): os.remove(temp_audio_file)
-        if os.path.exists(temp_wav_file): os.remove(temp_wav_file)
-        
-        return final_result
-
-    except Exception as e:
-        logger.error(f"❌ FATAL Analysis Error: {e}", exc_info=True)
-        if os.path.exists(temp_audio_file): os.remove(temp_audio_file)
-        if os.path.exists(temp_wav_file): os.remove(temp_wav_file)
-        raise
-
-# --- Worker Entrypoint (Unchanged) ---
-if __name__ == '__main__':
-    redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379')
-    logger.info(f"Starting worker and connecting to Redis at: {redis_url}")
-    
     try:
-        redis_conn = Redis.from_url(redis_url)
-        redis_conn.ping()
-        logger.info("✅ Redis connection established")
+        job = Job.fetch(job_id, connection=redis_conn)
+        status = job.get_status()
         
-        worker = Worker(['default'], connection=redis_conn)
-        worker.work()
+        logger.info(f"[API] Job {job_id} status: {status}")
+        
+        response_data = AnalysisStatusResponse(
+            job_id=job_id,
+            status=status,
+            enqueued_at=job.enqueued_at.isoformat() if job.enqueued_at else None,
+            started_at=job.started_at.isoformat() if job.started_at else None,
+        )
 
+        if status == 'finished':
+            response_data.ended_at = job.ended_at.isoformat() if job.ended_at else None
+            job_result = job.result
+            
+            if job_result and isinstance(job_result, dict):
+                
+                try:
+                    # Attempt to create the Pydantic model with the job result
+                    analysis_result = AnalysisResult(**job_result)
+                    response_data.result = analysis_result
+                
+                except ValidationError as e:
+                    error_message = f"{e.__class__.__name__} for AnalysisResult:\n{e.errors()}"
+                    logger.error(f"[API] ❌ FAILED to map job result to AnalysisResult model for job {job_id}:\n{error_message}", exc_info=True)
+                    
+                    response_data.status = 'failed'
+                    response_data.error = f"Result processing error (API): {str(e)}. Worker result keys/types are likely mismatched."
+                
+                except Exception as e:
+                    logger.error(f"[API] ❌ General error processing job result for job {job_id}: {e}", exc_info=True)
+                    response_data.status = 'failed'
+                    response_data.error = f"General result processing error (API): {str(e)}"
+            
+            elif status == 'finished' and not job_result:
+                logger.error(f"[API] Job {job_id} finished, but result was None.")
+                response_data.status = 'failed'
+                response_data.error = "Job finished successfully, but worker returned no result data."
+
+        # Explicitly handle 'failed' status from the worker
+        if status == 'failed' and job.exc_info:
+            response_data.error = job.exc_info
+            logger.error(f"[API] Full exception info for worker job {job_id}:\n{job.exc_info}")
+            
+        return response_data
+        
+    except redis.exceptions.ConnectionError:
+        raise HTTPException(status_code=500, detail="Could not connect to Redis.")
     except Exception as e:
-        logger.error(f"❌ Worker failed to start: {e}", exc_info=True)
-        if 'redis' in str(e).lower():
-            logger.critical("⚠️ Check your REDIS_URL and network configuration.")
-        exit(1)
+        logger.error(f"[API] Error fetching job {job_id}: {e}", exc_info=True)
+        if 'No such job' in str(e) or 'NoneType' in str(e): 
+             raise HTTPException(status_code=404, detail=f"Job with ID {job_id} not found.")
+        else:
+             raise HTTPException(status_code=500, detail=f"Internal error fetching job status: {str(e)}")
