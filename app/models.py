@@ -17,31 +17,6 @@ class UploadResponse(BaseModel):
 
 
 # --- 2. Analysis Submission Model (Output) ---
-class SubmissionResponse(BaseModel):
-    file_id: str
-    job_id: str
-    message: str
-
-
-# --- 3. Analysis Result Model ---
-class AnalysisResult(BaseModel):
-    """Complete analysis result with all metrics - DO NOT make fields Optional unless necessary"""
-    
-    # ===== CORE METRICS =====
-    confidence_score: float  # 0-100 scale
-    speaking_pace: int  # WPM - 🔥 MUST be int, not Optional
-    total_words: int  # Word count - 🔥 MUST be int, not Optional
-    duration_seconds: float  # Duration in seconds
-    
-    # ===== FLUENCY METRICS =====
-    filler_word_count: int  # Filler count - 🔥 MUST be int, not Optional
-    repetition_count: int  # Repetition count - 🔥 MUST be int, not Optional
-    apology_count: Optional[int] = 0
-    
-    # ===== ACOUSTIC METRICS =====
-    long_pause_count: int  # Pause count - 🔥 MUST be int, not Optional
-    silence_ratio: float  # 0.0-1.0 - 🔥 MUST be float, not Optional
-    
     # ===== AUDIO FEATURES =====
     avg_amplitude: float  # RMS value - 🔥 MUST have value
     pitch_mean: float  # Hz - 🔥 MUST be float, not Optional
@@ -62,13 +37,3 @@ class AnalysisResult(BaseModel):
     # ===== OPTIONAL/ADDITIONAL =====
     acoustic_disfluency_count: Optional[int] = None
 
-
-# --- 4. Analysis Status/Result Model (Output) ---
-class AnalysisStatusResponse(BaseModel):
-    job_id: str
-    status: str = Field(..., description="Job status: 'queued', 'started', 'finished', or 'failed'.")
-    enqueued_at: Optional[str] = None
-    started_at: Optional[str] = None
-    ended_at: Optional[str] = None
-    result: Optional[AnalysisResult] = None
-    error: Optional[str] = None
